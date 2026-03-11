@@ -8,8 +8,8 @@ export PATH="/home/loujieming.ljm/.conda/envs/sdpo_env/bin:$PATH"
 # export PATH="/opt/conda/envs/python3.10/bin:$PATH"
 # conda activate python3.10
 
-bash experiments/generalization/run_baseline_grpo_all_local.sh |tee logs/run_baseline_grpo_all_local.log
-bash experiments/generalization/run_sdpo_all_local.sh |tee logs/run_sdpo_all_local.log
+bash experiments/generalization/run_baseline_grpo_all_local.sh |tee logs/run_baseline_grpo_all_local_$(date +%Y-%m-%d_%H-%M-%S).log
+bash experiments/generalization/run_sdpo_all_local.sh |tee logs/run_sdpo_all_local_$(date +%Y-%m-%d_%H-%M-%S).log
 
 # pip cache purge
 

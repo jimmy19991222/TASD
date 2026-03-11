@@ -54,7 +54,7 @@ reward_model:
   use_reward_loop: False # disables experimental reward manager (which gives lower scores)
 
 trainer:
-  project_name: SDPO-${oc.env:USER}
+  project_name: SDPO
   group_name: ${oc.env:EXPERIMENT}
   experiment_name: ${oc.env:EXPERIMENT}
   n_gpus_per_node: 4
@@ -64,3 +64,4 @@ trainer:
   max_actor_ckpt_to_keep: 1
   total_epochs: 30
   default_local_dir: ${vars.ckpt_dir}/${trainer.experiment_name}  # experiment_name needs to be a unique identifier
+  logger: ["console", "tensorboard", "wandb"]

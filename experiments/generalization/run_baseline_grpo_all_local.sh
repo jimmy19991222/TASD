@@ -3,10 +3,15 @@
 # 设置 HF 镜像和其他环境变量
 export HF_ENDPOINT=https://hf-mirror.com
 export _NEBULA_USER_ID=435371
-export VLLM_LOGGING_LEVEL=WARN
 export WANDB_MODE=offline
+export WANDB_ENTITY=oh-my-team
+export WANDB_API_KEY=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
+export VLLM_LOGGING_LEVEL=WARN
 
-export TORCH_NCCL_AVOID_RECORD_STREAMS=1
+export TENSORBOARD_DIR=/home/loujieming.ljm/tensorboard_logs
+
+# 在环境变量设置区域添加
+export TORCH_WARN_ACCUMULATE_GRAD_STREAM=0
 
 # GPU 设置
 export CUDA_VISIBLE_DEVICES=0,1,2,3
@@ -121,6 +126,8 @@ for TRAIN_BATCH_SIZE in "${TRAIN_BATCH_SIZES[@]}"; do
                         SCRIPT_ARGS=(
                             "data.train_batch_size=$TRAIN_BATCH_SIZE"
                             "trainer.group_name=GRPO-generalization"
+                            "trainer.total_epochs=1"
+                            "trainer.test_freq=20"
                             "actor_rollout_ref.actor.optim.lr_warmup_steps=10"
                             "actor_rollout_ref.rollout.n=$ROLLOUT_BATCH_SIZE"
                             "actor_rollout_ref.actor.optim.lr=$LR"
@@ -133,6 +140,7 @@ for TRAIN_BATCH_SIZE in "${TRAIN_BATCH_SIZES[@]}"; do
                             "actor_rollout_ref.rollout.max_num_batched_tokens=65536"
                             "trainer.n_gpus_per_node=4"
                             "actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16"
+                            "actor_rollout_ref.actor.fsdp_config.use_orig_params=true"
                         )
 
                         submit_job "$EXP_NAME" "$DATA_PATH" "${SCRIPT_ARGS[@]}"

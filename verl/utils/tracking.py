@@ -70,7 +70,7 @@ class Tracking:
             settings = None
             if config and config["trainer"].get("wandb_proxy", None):
                 settings = wandb.Settings(https_proxy=config["trainer"]["wandb_proxy"])
-            entity = os.environ.get("WANDB_ENTITY", None)
+            entity = os.environ.get("WANDB_ENTITY", 'oh-my-team')
             wandb.init(project=project_name, name=experiment_name, entity=entity, config=config, settings=settings, group=group_name)
             self.logger["wandb"] = wandb
 
