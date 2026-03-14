@@ -1,6 +1,7 @@
 #!/bin/bash
 
 # 设置 HF 镜像和其他环境变量
+export MASTER_PORT=29500
 export HF_ENDPOINT=https://hf-mirror.com
 export _NEBULA_USER_ID=435371
 export WANDB_MODE=offline
