@@ -130,7 +130,7 @@ for TRAIN_BATCH_SIZE in "${TRAIN_BATCH_SIZES[@]}"; do
                                         | sed 's|-*$||')
 
                                     # EXP_NAME 加入 ew(entropy_weighting) 和 et(temperature) 标识
-                                    EXP_NAME="FINAL-SDPO-${DATASET_NAME}-train${TRAIN_BATCH_SIZE}-alpha${ALPHA}-rollout${ROLLOUT_BATCH_SIZE}-lr${LR}-dross${DONTS_REPROMPT_ON_SELF_SUCCESS}-ew${ENTROPY_WEIGHTING}-et${ENTROPY_TEMPERATURE}-${MODEL_NAME}-$(date +%Y-%m-%d_%H-%M-%S)"
+                                    EXP_NAME="FINAL-SDPO-${DATASET_NAME}-train${TRAIN_BATCH_SIZE}-alpha${ALPHA}-rollout${ROLLOUT_BATCH_SIZE}-lr${LR}-dross${DONTS_REPROMPT_ON_SELF_SUCCESS}-v2-ew${ENTROPY_WEIGHTING}-et${ENTROPY_TEMPERATURE}-${MODEL_NAME}-$(date +%Y-%m-%d_%H-%M-%S)"
 
                                     SCRIPT_ARGS=(
                                         # ── 基础参数 ──────────────────────────────────

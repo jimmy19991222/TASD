@@ -1082,16 +1082,25 @@ def agg_loss(
     return loss
 
 def apply_teacher_entropy_weighting(
-    per_token_loss: torch.Tensor,
-    teacher_topk_log_probs,
-    teacher_all_log_probs,
-    loss_mask: torch.Tensor,
+    per_token_loss: torch.Tensor,           # (B, T)
+    teacher_topk_log_probs,                 # (B, T, K)
+    teacher_all_log_probs,                  # (B, T, V)
+    teacher_log_prob_on_student: torch.Tensor,  # (B, T) ← 直接传teacher_log_probs
+    loss_mask: torch.Tensor,                # (B, T)
     temperature: float = 1.0,
     use_topk: bool = True,
 ):
-    """用教师熵对每个 token 位置的 loss 加权。"""
+    """
+    用 teacher熵 + teacher对student token的概率 联合加权。
+
+    weight_t = softmax(student_wrong_t * teacher_certainty_t / τ)
+
+    两个条件同时满足才高权重：
+      P_teacher(ŷ_t)低 → student选错了
+      H_teacher_t低    → teacher是确定的
+    """
     with torch.no_grad():
-        # 选择 logprobs 来源
+        # 选择logprobs来源（用于计算熵）
         if use_topk and teacher_topk_log_probs is not None:
             teacher_logp = teacher_topk_log_probs
         elif teacher_all_log_probs is not None:
@@ -1099,58 +1108,76 @@ def apply_teacher_entropy_weighting(
         else:
             return per_token_loss, {}
 
-        # 计算教师熵：H = -sum(p * log_p)
+        # ── 1. 计算teacher熵 ──────────────────────
         teacher_probs = teacher_logp.exp()
         safe_logp = torch.clamp(teacher_logp, min=-100.0)
         teacher_entropy = -(teacher_probs * safe_logp).sum(dim=-1)  # (B, T)
 
-        # 数值检查：若熵本身有nan/inf，跳过加权直接返回
         if torch.isnan(teacher_entropy).any() or torch.isinf(teacher_entropy).any():
             print("[EW] teacher_entropy has nan/inf, skipping weighting")
-            valid_entropy = teacher_entropy[loss_mask == 1]
-            ew_metrics = {
-                "sdpo/teacher_entropy_mean": valid_entropy.mean().item() if valid_entropy.numel() > 0 else 0.0,
-                "sdpo/teacher_entropy_std": valid_entropy.std().item() if valid_entropy.numel() > 1 else 0.0,
-            }
-            return per_token_loss, ew_metrics
+            return per_token_loss, _make_metrics(teacher_entropy, loss_mask)
 
-        # padding 位置熵设为 inf，权重趋近 0
-        masked_entropy = teacher_entropy.masked_fill(loss_mask == 0, 1e9)
+        # ── 2. teacher对student token的概率 ──────
+        # teacher_log_prob_on_student = log P_teacher(ŷ_t)，已经是(B,T)标量
+        teacher_prob_on_student = teacher_log_prob_on_student.exp()  # (B, T)
 
-        # 负熵 softmax：熵越低 → 权重越高
-        confidence_weights = torch.softmax(-masked_entropy / temperature, dim=-1)
+        # ── 3. 归一化entropy到[0,1] ──────────────
+        valid_entropy = teacher_entropy[loss_mask == 1]
+        H_max = valid_entropy.max().clamp(min=1e-6)
+        H_normalized = teacher_entropy / H_max  # (B, T)
 
-        # 乘有效长度，还原到 token-mean 尺度
+        # ── 4. 计算联合score ──────────────────────
+        # teacher确定程度：H低 → certainty高
+        teacher_certainty = 1.0 - H_normalized          # (B, T)，范围[0,1]
+
+        # student选错程度：P低 → wrong高
+        student_wrong = 1.0 - teacher_prob_on_student   # (B, T)，范围[0,1]
+
+        # 联合：两个条件都满足才高权重
+        joint_score = teacher_certainty * student_wrong  # (B, T)
+
+        # padding位置设为极小值
+        joint_score = joint_score.masked_fill(loss_mask == 0, -1e9)
+
+        # softmax加权
+        confidence_weights = torch.softmax(joint_score / temperature, dim=-1)
+
+        # 还原到token-mean尺度
         seq_lengths = loss_mask.sum(dim=-1, keepdim=True).clamp(min=1)
         confidence_weights = confidence_weights * seq_lengths
 
-        # clip极端权重，防止梯度爆炸
+        # clip极端权重
         confidence_weights = torch.clamp(confidence_weights, max=10.0)
 
-        # 最终nan检查：若权重有nan，跳过加权
         if torch.isnan(confidence_weights).any():
             print("[EW] confidence_weights has nan, skipping weighting")
-            valid_entropy = teacher_entropy[loss_mask == 1]
-            ew_metrics = {
-                "sdpo/teacher_entropy_mean": valid_entropy.mean().item() if valid_entropy.numel() > 0 else 0.0,
-                "sdpo/teacher_entropy_std": valid_entropy.std().item() if valid_entropy.numel() > 1 else 0.0,
-            }
-            return per_token_loss, ew_metrics
+            return per_token_loss, _make_metrics(
+                teacher_entropy, loss_mask, teacher_prob_on_student
+            )
 
-        # 监控指标（含空张量保护）
-        valid_entropy = teacher_entropy[loss_mask == 1]
-        if valid_entropy.numel() == 0:
-            ew_metrics = {
-                "sdpo/teacher_entropy_mean": 0.0,
-                "sdpo/teacher_entropy_std": 0.0,
-            }
-        else:
-            ew_metrics = {
-                "sdpo/teacher_entropy_mean": valid_entropy.mean().item(),
-                "sdpo/teacher_entropy_std": valid_entropy.std().item() if valid_entropy.numel() > 1 else 0.0,
-            }
+        ew_metrics = _make_metrics(
+            teacher_entropy, loss_mask, teacher_prob_on_student
+        )
 
     return per_token_loss * confidence_weights, ew_metrics
+
+
+def _make_metrics(teacher_entropy, loss_mask, teacher_prob_on_student=None):
+    valid_entropy = teacher_entropy[loss_mask == 1]
+    metrics = {
+        "sdpo/teacher_entropy_mean": (
+            valid_entropy.mean().item() if valid_entropy.numel() > 0 else 0.0
+        ),
+        "sdpo/teacher_entropy_std": (
+            valid_entropy.std().item() if valid_entropy.numel() > 1 else 0.0
+        ),
+    }
+    if teacher_prob_on_student is not None:
+        valid_prob = teacher_prob_on_student[loss_mask == 1]
+        metrics["sdpo/teacher_prob_on_student_mean"] = (
+            valid_prob.mean().item() if valid_prob.numel() > 0 else 0.0
+        )
+    return metrics
 
 
 def compute_self_distillation_loss(
@@ -1259,6 +1286,7 @@ def compute_self_distillation_loss(
             per_token_loss=per_token_loss,
             teacher_topk_log_probs=teacher_topk_log_probs,
             teacher_all_log_probs=teacher_all_log_probs,
+            teacher_log_prob_on_student=teacher_log_probs,  # ← 直接用现有变量，无需新增参数
             loss_mask=loss_mask,
             temperature=entropy_temperature,
             use_topk=use_topk,
