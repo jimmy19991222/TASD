@@ -1081,9 +1081,6 @@ def agg_loss(
 
     return loss
 
-
-
-
 def apply_teacher_entropy_weighting(
     per_token_loss: torch.Tensor,
     teacher_topk_log_probs,
@@ -1092,40 +1089,66 @@ def apply_teacher_entropy_weighting(
     temperature: float = 1.0,
     use_topk: bool = True,
 ):
-    """用教师熵对每个token位置的loss加权。
-    
-    教师在某位置越确定（熵低）→ 该位置权重越高 → 更信任该信号
-    教师在某位置越不确定（熵高）→ 该位置权重越低 → 减少噪声干扰
-    """
+    """用教师熵对每个 token 位置的 loss 加权。"""
     with torch.no_grad():
+        # 选择 logprobs 来源
         if use_topk and teacher_topk_log_probs is not None:
-            teacher_logp = teacher_topk_log_probs   # (B, T, K)
+            teacher_logp = teacher_topk_log_probs
         elif teacher_all_log_probs is not None:
-            teacher_logp = teacher_all_log_probs     # (B, T, V)
+            teacher_logp = teacher_all_log_probs
         else:
             return per_token_loss, {}
 
-        # 计算教师在每个位置的熵: H = -sum(p * log_p)
+        # 计算教师熵：H = -sum(p * log_p)
         teacher_probs = teacher_logp.exp()
-        safe_logp = torch.clamp(teacher_logp, min=-100.0)  # 避免 0*(-inf)=nan
+        safe_logp = torch.clamp(teacher_logp, min=-100.0)
         teacher_entropy = -(teacher_probs * safe_logp).sum(dim=-1)  # (B, T)
 
-        # padding位置的熵设为inf，让其权重趋近0
-        masked_entropy = teacher_entropy.masked_fill(loss_mask == 0, float("inf"))
+        # 数值检查：若熵本身有nan/inf，跳过加权直接返回
+        if torch.isnan(teacher_entropy).any() or torch.isinf(teacher_entropy).any():
+            print("[EW] teacher_entropy has nan/inf, skipping weighting")
+            valid_entropy = teacher_entropy[loss_mask == 1]
+            ew_metrics = {
+                "sdpo/teacher_entropy_mean": valid_entropy.mean().item() if valid_entropy.numel() > 0 else 0.0,
+                "sdpo/teacher_entropy_std": valid_entropy.std().item() if valid_entropy.numel() > 1 else 0.0,
+            }
+            return per_token_loss, ew_metrics
 
-        # 负熵做softmax：熵越低 → 权重越高
-        # 在sequence长度维度归一化
-        confidence_weights = torch.softmax(-masked_entropy / temperature, dim=-1)  # (B, T)
+        # padding 位置熵设为 inf，权重趋近 0
+        masked_entropy = teacher_entropy.masked_fill(loss_mask == 0, 1e9)
 
-        # 乘以有效长度，还原到token-mean尺度（避免短序列和长序列总权重相同）
+        # 负熵 softmax：熵越低 → 权重越高
+        confidence_weights = torch.softmax(-masked_entropy / temperature, dim=-1)
+
+        # 乘有效长度，还原到 token-mean 尺度
         seq_lengths = loss_mask.sum(dim=-1, keepdim=True).clamp(min=1)
-        confidence_weights = confidence_weights * seq_lengths  # (B, T)
+        confidence_weights = confidence_weights * seq_lengths
 
+        # clip极端权重，防止梯度爆炸
+        confidence_weights = torch.clamp(confidence_weights, max=10.0)
+
+        # 最终nan检查：若权重有nan，跳过加权
+        if torch.isnan(confidence_weights).any():
+            print("[EW] confidence_weights has nan, skipping weighting")
+            valid_entropy = teacher_entropy[loss_mask == 1]
+            ew_metrics = {
+                "sdpo/teacher_entropy_mean": valid_entropy.mean().item() if valid_entropy.numel() > 0 else 0.0,
+                "sdpo/teacher_entropy_std": valid_entropy.std().item() if valid_entropy.numel() > 1 else 0.0,
+            }
+            return per_token_loss, ew_metrics
+
+        # 监控指标（含空张量保护）
         valid_entropy = teacher_entropy[loss_mask == 1]
-        ew_metrics = {
-            "sdpo/teacher_entropy_mean": valid_entropy.mean().item(),
-            "sdpo/teacher_entropy_std": valid_entropy.std().item(),
-        }
+        if valid_entropy.numel() == 0:
+            ew_metrics = {
+                "sdpo/teacher_entropy_mean": 0.0,
+                "sdpo/teacher_entropy_std": 0.0,
+            }
+        else:
+            ew_metrics = {
+                "sdpo/teacher_entropy_mean": valid_entropy.mean().item(),
+                "sdpo/teacher_entropy_std": valid_entropy.std().item() if valid_entropy.numel() > 1 else 0.0,
+            }
 
     return per_token_loss * confidence_weights, ew_metrics
 

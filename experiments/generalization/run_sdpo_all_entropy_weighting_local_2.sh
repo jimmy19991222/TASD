@@ -19,7 +19,7 @@ export SWANLAB_LOG_DIR=/home/loujieming.ljm/SDPO/logs/swanlab_logs
 export TORCH_WARN_ACCUMULATE_GRAD_STREAM=0
 
 # GPU 设置
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=4,5,6,7
 N_GPUS_PER_NODE=4
 
 DRY_RUN=false
@@ -81,7 +81,7 @@ submit_job() {
 
     mkdir -p ./logs
     local log_file="./logs/job_${exp_name}_${dataset_name}_$(date +%Y-%m-%d_%H-%M-%S).log"
-    local run_cmd="CUDA_VISIBLE_DEVICES=0,1,2,3 bash /home/loujieming.ljm/SDPO/training/verl_training.sh '$exp_name' '$CONFIG_NAME' '$data_path' $args_string 2>&1 | tee -a $log_file"
+    local run_cmd="CUDA_VISIBLE_DEVICES=4,5,6,7 bash /home/loujieming.ljm/SDPO/training/verl_training.sh '$exp_name' '$CONFIG_NAME' '$data_path' $args_string 2>&1 | tee -a $log_file"
     local full_command="bash -c '$setup_cmds; $run_cmd'"
 
     if [ "$DRY_RUN" = true ]; then

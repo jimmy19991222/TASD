@@ -20,9 +20,11 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 bash experiments/generalization/run_sdpo_all_entrop
 
 swanlab watch -l /home/loujieming.ljm/swanlab_logs
 
+pip install transformer-engine[pytorch] --trusted-host mirrors.aliyun.com -i http://mirrors.aliyun.com/pypi/simple/
+
 # pip cache purge
 
-pip install torch==2.5.1 torchvision --index-url https://download.pytorch.org/whl/cu124 --trusted-host mirrors.aliyun.com -i http://mirrors.aliyun.com/pypi/simple/
+pip install torch==2.5.1 torchvision --index-url https://download.pytorch.org/whl/cu128 --trusted-host mirrors.aliyun.com -i http://mirrors.aliyun.com/pypi/simple/
 
 # pip install -r requirements.txt --trusted-host mirrors.aliyun.com -i http://mirrors.aliyun.com/pypi/simple/
 
