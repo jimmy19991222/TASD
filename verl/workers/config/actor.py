@@ -70,6 +70,7 @@ class SelfDistillationConfig(BaseConfig):
     distillation_topk: Optional[int] = None
     entropy_weighting: bool = False
     entropy_temperature: float = 1.0
+    entropy_weighting_version: str = "v4"
     distillation_add_tail: bool = True
     max_reprompt_len: int = 10240
     reprompt_truncation: str = "right"

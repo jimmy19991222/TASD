@@ -1089,6 +1089,8 @@ def apply_teacher_entropy_weighting(
     loss_mask: torch.Tensor,
     temperature: float = 1.0,
     use_topk: bool = True,
+    weighting_version: str = "v2sqrt",   # 新增：v2sqrt / v4
+    student_topk_log_probs=None,         # 新增：v4需要
 ):
     with torch.no_grad():
         if use_topk and teacher_topk_log_probs is not None:
@@ -1107,52 +1109,74 @@ def apply_teacher_entropy_weighting(
             print("[EW] teacher_entropy has nan/inf, skipping weighting")
             return per_token_loss, _make_metrics(teacher_entropy, loss_mask)
 
-        # ── 2. teacher对student token的概率 ──────
-        teacher_prob_on_student = teacher_log_prob_on_student.exp()  # (B, T)
+        # ── 2. 根据版本计算joint_score ────────────
+        if weighting_version == "v4":
+            # V4：信息增益 ΔH = H_student - H_teacher
+            if student_topk_log_probs is None:
+                print("[EW] v4 requires student_topk_log_probs, falling back to v2sqrt")
+                weighting_version = "v2sqrt"
+            else:
+                student_probs = student_topk_log_probs.exp()
+                safe_student_logp = torch.clamp(student_topk_log_probs, min=-100.0)
+                student_entropy = -(student_probs * safe_student_logp).sum(dim=-1)  # (B, T)
 
-        # ── 3. 归一化entropy到[0,1] ──────────────
-        # 用masked max，padding位置填0不影响max计算
-        H_max = teacher_entropy.masked_fill(
-            loss_mask == 0, 0.0
-        ).max().clamp(min=1e-6)
-        H_normalized = teacher_entropy / H_max  # (B, T)
+                # 信息增益：feedback让这个位置减少了多少不确定性
+                info_gain = student_entropy - teacher_entropy  # (B, T)
+                # 只保留正增益，负值clamp到0（feedback带来噪声的位置权重为0）
+                joint_score = info_gain.clamp(min=0)
 
-        # ── 4. 计算联合score ──────────────────────
-        teacher_certainty = 1.0 - H_normalized
-        student_wrong = 1.0 - teacher_prob_on_student
+        if weighting_version == "v2sqrt":
+            # 原V2-sqrt版本
+            teacher_prob_on_student = teacher_log_prob_on_student.exp()
+            H_max = teacher_entropy.masked_fill(
+                loss_mask == 0, 0.0
+            ).max().clamp(min=1e-6)
+            H_normalized = teacher_entropy / H_max
+            teacher_certainty = 1.0 - H_normalized
+            student_wrong = 1.0 - teacher_prob_on_student
+            joint_score = torch.sqrt(teacher_certainty * student_wrong + 1e-8)
 
-        # 原始：joint_score = teacher_certainty * student_wrong
-        # 改进：对乘积开平方根，减弱非线性，避免二次放大效应
-        joint_score = torch.sqrt(teacher_certainty * student_wrong + 1e-8)  # (B, T)
-
-        # padding位置设为极小值
+        # ── 3. 统一的softmax加权流程 ──────────────
         joint_score = joint_score.masked_fill(loss_mask == 0, -1e9)
-
-        # softmax加权
         confidence_weights = torch.softmax(joint_score / temperature, dim=-1)
 
-        # 还原到token-mean尺度
         seq_lengths = loss_mask.sum(dim=-1, keepdim=True).clamp(min=1)
         confidence_weights = confidence_weights * seq_lengths
-
-        # clip极端权重
         confidence_weights = torch.clamp(confidence_weights, max=10.0)
 
         if torch.isnan(confidence_weights).any():
             print("[EW] confidence_weights has nan, skipping weighting")
-            return per_token_loss, _make_metrics(
-                teacher_entropy, loss_mask, teacher_prob_on_student
-            )
+            return per_token_loss, _make_metrics(teacher_entropy, loss_mask)
 
+        # ── 4. 构建metrics ────────────────────────
         ew_metrics = _make_metrics(
-            teacher_entropy, loss_mask, teacher_prob_on_student
+            teacher_entropy=teacher_entropy,
+            loss_mask=loss_mask,
+            teacher_prob_on_student=(
+                teacher_log_prob_on_student.exp()
+                if weighting_version == "v2sqrt" else None
+            ),
+            student_entropy=(
+                student_entropy if weighting_version == "v4" else None
+            ),
+            info_gain=(
+                info_gain if weighting_version == "v4" else None
+            ),
         )
 
     return per_token_loss * confidence_weights, ew_metrics
 
 
-def _make_metrics(teacher_entropy, loss_mask, teacher_prob_on_student=None):
-    valid_entropy = teacher_entropy[loss_mask == 1]
+
+def _make_metrics(
+    teacher_entropy,
+    loss_mask,
+    teacher_prob_on_student=None,
+    student_entropy=None,      # V4新增
+    info_gain=None,            # V4新增
+):
+    valid_mask = loss_mask == 1
+    valid_entropy = teacher_entropy[valid_mask]
     metrics = {
         "sdpo/teacher_entropy_mean": (
             valid_entropy.mean().item() if valid_entropy.numel() > 0 else 0.0
@@ -1161,11 +1185,33 @@ def _make_metrics(teacher_entropy, loss_mask, teacher_prob_on_student=None):
             valid_entropy.std().item() if valid_entropy.numel() > 1 else 0.0
         ),
     }
+
     if teacher_prob_on_student is not None:
-        valid_prob = teacher_prob_on_student[loss_mask == 1]
+        valid_prob = teacher_prob_on_student[valid_mask]
         metrics["sdpo/teacher_prob_on_student_mean"] = (
             valid_prob.mean().item() if valid_prob.numel() > 0 else 0.0
         )
+
+    # V4专属指标
+    if student_entropy is not None:
+        valid_student_entropy = student_entropy[valid_mask]
+        metrics["sdpo/student_entropy_mean"] = (
+            valid_student_entropy.mean().item()
+            if valid_student_entropy.numel() > 0 else 0.0
+        )
+
+    if info_gain is not None:
+        valid_info_gain = info_gain[valid_mask]
+        if valid_info_gain.numel() > 0:
+            metrics["sdpo/info_gain_mean"] = valid_info_gain.mean().item()
+            # ΔH>0的token占比：诊断feedback有效性的关键指标
+            metrics["sdpo/info_gain_positive_ratio"] = (
+                (valid_info_gain > 0).float().mean().item()
+            )
+        else:
+            metrics["sdpo/info_gain_mean"] = 0.0
+            metrics["sdpo/info_gain_positive_ratio"] = 0.0
+
     return metrics
 
 
@@ -1267,18 +1313,24 @@ def compute_self_distillation_loss(
         per_token_loss = per_token_loss * rollout_is_weights
 
     # Apply teacher entropy weighting (optional)
+    # Apply teacher entropy weighting (optional)
     use_entropy_weighting = getattr(self_distillation_config, 'entropy_weighting', False)
     if use_entropy_weighting:
         entropy_temperature = getattr(self_distillation_config, 'entropy_temperature', 1.0)
+        entropy_weighting_version = getattr(
+            self_distillation_config, 'entropy_weighting_version', 'v4'
+        )  # 新增
         use_topk = getattr(self_distillation_config, 'distillation_topk', None) is not None
         per_token_loss, ew_metrics = apply_teacher_entropy_weighting(
             per_token_loss=per_token_loss,
             teacher_topk_log_probs=teacher_topk_log_probs,
             teacher_all_log_probs=teacher_all_log_probs,
-            teacher_log_prob_on_student=teacher_log_probs,  # ← 直接用现有变量，无需新增参数
+            teacher_log_prob_on_student=teacher_log_probs,
             loss_mask=loss_mask,
             temperature=entropy_temperature,
             use_topk=use_topk,
+            weighting_version=entropy_weighting_version,   # 新增
+            student_topk_log_probs=student_topk_log_probs, # 新增，V4需要
         )
         metrics.update(ew_metrics)
 

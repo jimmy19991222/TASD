@@ -20,6 +20,7 @@ actor_rollout_ref:
       is_clip: 2.0
       entropy_weighting: false
       entropy_temperature: 1.0
+      entropy_weighting_version: "v4"
     optim:
       lr: 1e-5
   rollout:

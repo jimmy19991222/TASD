@@ -51,6 +51,7 @@ ALPHAS=(0.5)
 # ── 新增：entropy weighting 超参扫描 ──────────────────────────
 ENTROPY_WEIGHTINGS=(True)          # 对比实验可改成 (True False)
 ENTROPY_TEMPERATURES=(1.0 2.0)        # 对比实验可改成 (0.5 1.0 2.0)
+ENTROPY_WEIGHTING_VERSIONS=(v4)
 
 MODEL_PATHS=(
     "Qwen/Qwen3-8B"
@@ -121,6 +122,7 @@ for TRAIN_BATCH_SIZE in "${TRAIN_BATCH_SIZES[@]}"; do
                     for ALPHA in "${ALPHAS[@]}"; do
                         for ENTROPY_WEIGHTING in "${ENTROPY_WEIGHTINGS[@]}"; do        # ← 新增
                             for ENTROPY_TEMPERATURE in "${ENTROPY_TEMPERATURES[@]}"; do # ← 新增
+                                for ENTROPY_WEIGHTING_VERSION in "${ENTROPY_WEIGHTING_VERSIONS[@]}"; do
                                 for DATA_PATH in "${DATA_PATHS[@]}"; do
 
                                     MODEL_NAME=$(echo "$MODEL_PATH" | tr '/' '-')
@@ -131,7 +133,7 @@ for TRAIN_BATCH_SIZE in "${TRAIN_BATCH_SIZES[@]}"; do
                                         | sed 's|-*$||')
 
                                     # EXP_NAME 加入 ew(entropy_weighting) 和 et(temperature) 标识
-                                    EXP_NAME="FINAL-SDPO-${DATASET_NAME}-train${TRAIN_BATCH_SIZE}-alpha${ALPHA}-rollout${ROLLOUT_BATCH_SIZE}-lr${LR}-dross${DONTS_REPROMPT_ON_SELF_SUCCESS}-v3-ew${ENTROPY_WEIGHTING}-et${ENTROPY_TEMPERATURE}-${MODEL_NAME}-$(date +%Y-%m-%d_%H-%M-%S)"
+                                    EXP_NAME="FINAL-SDPO-${DATASET_NAME}-train${TRAIN_BATCH_SIZE}-alpha${ALPHA}-rollout${ROLLOUT_BATCH_SIZE}-lr${LR}-dross${DONTS_REPROMPT_ON_SELF_SUCCESS}-${ENTROPY_WEIGHTING_VERSION}-ew${ENTROPY_WEIGHTING}-et${ENTROPY_TEMPERATURE}-${MODEL_NAME}-$(date +%Y-%m-%d_%H-%M-%S)"
 
                                     SCRIPT_ARGS=(
                                         # ── 基础参数 ──────────────────────────────────
@@ -166,6 +168,7 @@ for TRAIN_BATCH_SIZE in "${TRAIN_BATCH_SIZES[@]}"; do
 
                                     submit_job "$EXP_NAME" "$DATA_PATH" "${SCRIPT_ARGS[@]}"
 
+                                done
                                 done
                             done  # ← 新增
                         done      # ← 新增
