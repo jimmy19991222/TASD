@@ -676,6 +676,7 @@ class DataParallelPPOActor(BasePPOActor):
     def compute_teacher_log_probs(self, data: DataProto) -> dict[str, torch.Tensor]:
         """
         为TASD计算teacher log-probs。
+        按照SDPO论文Appendix A.3：topk基于student（而非teacher）。
         log_ratio模式：只返回teacher_log_probs_on_response
         forward_kl/reverse_kl/jsd模式：额外返回teacher和student的topk log-probs
         """
@@ -686,35 +687,17 @@ class DataParallelPPOActor(BasePPOActor):
         pad_token_id     = data.meta_info.get("pad_token_id", 0)
         distill_topk     = data.meta_info.get("distill_topk", None)
 
-        teacher_model        = self.teacher_module or self.actor_module
-        micro_batches        = data.split(micro_batch_size)
+        teacher_model         = self.teacher_module or self.actor_module
+        micro_batches         = data.split(micro_batch_size)
         teacher_log_probs_lst = []
-        teacher_topk_lst     = []
-        student_topk_lst     = []
+        teacher_topk_lst      = []
+        student_topk_lst      = []
 
         for micro_batch in micro_batches:
-            micro_batch  = micro_batch.to(get_device_id())
-
-            # teacher forward
-            teacher_inputs = {
-                "input_ids":      micro_batch.batch["teacher_input_ids"],
-                "attention_mask": micro_batch.batch["teacher_attention_mask"],
-                "position_ids":   micro_batch.batch["teacher_position_ids"],
-                "responses":      micro_batch.batch["responses"],
-                "pad_token_id":   pad_token_id,
-            }
-            with torch.no_grad():
-                teacher_outputs = self._forward_micro_batch(
-                    teacher_inputs,
-                    temperature=temperature,
-                    distill_topk=distill_topk,
-                    module=teacher_model,
-                )
-            teacher_log_probs_lst.append(teacher_outputs["log_probs"])
+            micro_batch = micro_batch.to(get_device_id())
 
             if distill_topk is not None:
-                teacher_topk_lst.append(teacher_outputs["topk_logps"])
-                # student forward用teacher的topk_indices，保证在相同位置比较
+                # ── Step1: student forward，得到student topk indices ──────
                 student_inputs = {
                     "input_ids":      micro_batch.batch["input_ids"],
                     "attention_mask": micro_batch.batch["attention_mask"],
@@ -727,10 +710,46 @@ class DataParallelPPOActor(BasePPOActor):
                         student_inputs,
                         temperature=temperature,
                         distill_topk=distill_topk,
-                        topk_indices=teacher_outputs["topk_indices"],
                         module=self.actor_module,
                     )
                 student_topk_lst.append(student_outputs["topk_logps"])
+                student_topk_indices = student_outputs["topk_indices"]
+
+                # ── Step2: teacher在student topk位置gather ───────────────
+                teacher_inputs = {
+                    "input_ids":      micro_batch.batch["teacher_input_ids"],
+                    "attention_mask": micro_batch.batch["teacher_attention_mask"],
+                    "position_ids":   micro_batch.batch["teacher_position_ids"],
+                    "responses":      micro_batch.batch["responses"],
+                    "pad_token_id":   pad_token_id,
+                }
+                with torch.no_grad():
+                    teacher_outputs = self._forward_micro_batch(
+                        teacher_inputs,
+                        temperature=temperature,
+                        distill_topk=None,
+                        topk_indices=student_topk_indices,
+                        module=teacher_model,
+                    )
+                teacher_log_probs_lst.append(teacher_outputs["log_probs"])
+                teacher_topk_lst.append(teacher_outputs["topk_logps"])
+
+            else:
+                # ── log_ratio模式：只需teacher token log-prob ─────────────
+                teacher_inputs = {
+                    "input_ids":      micro_batch.batch["teacher_input_ids"],
+                    "attention_mask": micro_batch.batch["teacher_attention_mask"],
+                    "position_ids":   micro_batch.batch["teacher_position_ids"],
+                    "responses":      micro_batch.batch["responses"],
+                    "pad_token_id":   pad_token_id,
+                }
+                with torch.no_grad():
+                    teacher_outputs = self._forward_micro_batch(
+                        teacher_inputs,
+                        temperature=temperature,
+                        module=teacher_model,
+                    )
+                teacher_log_probs_lst.append(teacher_outputs["log_probs"])
 
         result = {
             "teacher_log_probs_on_response": torch.cat(teacher_log_probs_lst, dim=0)

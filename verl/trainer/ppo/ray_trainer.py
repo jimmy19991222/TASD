@@ -265,6 +265,7 @@ def compute_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
             response_mask=data.batch["response_mask"],
             self_distillation_mask=sdist_mask,
+            index=data.non_tensor_batch["uid"],
             config=config,
         )
         data.batch["advantages"] = advantages
@@ -1879,9 +1880,9 @@ class RayPPOTrainer:
 
                             token_rewards = core_algos.compute_tasd_token_rewards(
                                 student_log_probs=batch.batch["old_log_probs"],
-                                teacher_log_probs=teacher_result["teacher_log_probs_on_response"],
-                                student_topk_log_probs=teacher_result.get("student_topk_log_probs"),
-                                teacher_topk_log_probs=teacher_result.get("teacher_topk_log_probs"),
+                                teacher_log_probs=teacher_result.batch["teacher_log_probs_on_response"],
+                                student_topk_log_probs=teacher_result.batch.get("student_topk_log_probs"),
+                                teacher_topk_log_probs=teacher_result.batch.get("teacher_topk_log_probs"),
                                 reward_type=reward_type,
                             )
 

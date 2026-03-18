@@ -2552,8 +2552,8 @@ def compute_tasd_advantage(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     TASD Advantage Estimator。
-    token级reward在batch内所有有效token上归一化。
-    loss和GRPO完全相同，区别只是advantages是token级的。
+    和GRPO完全一致：group内对sequence-level reward归一化，再broadcast回token级。
+    唯一区别：token_level_rewards来自teacher-student divergence而非verifier reward。
     """
     with torch.no_grad():
         if self_distillation_mask is not None:
@@ -2564,16 +2564,36 @@ def compute_tasd_advantage(
         else:
             effective_mask = response_mask
 
-        valid = token_level_rewards[effective_mask.bool()]
-
-        if valid.numel() == 0:
+        if index is None or len(index) == 0:
             advantages = torch.zeros_like(token_level_rewards)
-        else:
-            mu    = valid.mean()
-            sigma = valid.std() if valid.numel() > 1 \
-                    else torch.tensor(0.0, device=token_level_rewards.device)
-            advantages = (token_level_rewards - mu) / (sigma + epsilon)
+            return advantages, advantages
 
-        advantages = advantages * effective_mask
+        # Step1: sum成sequence-level score（和GRPO完全一致）
+        scores = token_level_rewards.sum(dim=-1)  # (B,)
+
+        # Step2: group内归一化（和GRPO完全一致）
+        id2score = defaultdict(list)
+        id2mean  = {}
+        id2std   = {}
+
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            id2score[index[i]].append(scores[i])
+        for idx in id2score:
+            if len(id2score[idx]) == 1:
+                id2mean[idx] = torch.tensor(0.0, device=token_level_rewards.device)
+                id2std[idx]  = torch.tensor(1.0, device=token_level_rewards.device)
+            elif len(id2score[idx]) > 1:
+                scores_tensor = torch.stack(id2score[idx])
+                id2mean[idx]  = torch.mean(scores_tensor)
+                id2std[idx]   = torch.std(scores_tensor)
+            else:
+                raise ValueError(f"no score in prompt index: {idx}")
+
+        for i in range(bsz):
+            scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+
+        # Step3: broadcast回token级，乘effective_mask
+        advantages = scores.unsqueeze(-1) * effective_mask
 
     return advantages, advantages
