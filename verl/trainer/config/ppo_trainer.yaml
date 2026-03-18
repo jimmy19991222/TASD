@@ -211,6 +211,8 @@ trainer:
   #  mode: "auto", "enable", or "disable"
   use_legacy_worker_impl: auto
 
+  seed: 42
+
 # profiler configs
 global_profiler:
 

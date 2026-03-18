@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import random
 import os
 import re
 import time
@@ -1596,6 +1597,11 @@ class RayPPOTrainer:
         from omegaconf import OmegaConf
 
         from verl.utils.tracking import Tracking
+
+        seed = self.config.trainer.get("seed", 42)
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
 
         logger = Tracking(
             project_name=self.config.trainer.project_name,
