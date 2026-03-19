@@ -2496,94 +2496,115 @@ def compute_tasd_token_rewards(
     reward_type: str = "log_ratio",
     alpha: float = 0.5,
     tail_correction: bool = False,
+    reward_transform: str = "tanh",   # ← 新增
+    reward_scale: float = 1.0,        # ← 新增
 ) -> torch.Tensor:
 
     if reward_type == "log_ratio":
-        return teacher_log_probs - student_log_probs
+        reward = teacher_log_probs - student_log_probs  # (B, T)
 
-    assert student_topk_log_probs is not None and \
-           teacher_topk_log_probs is not None
+    elif reward_type == "vocab_log_ratio":
+        # ← 新增：vocab粒度的log_ratio
+        assert student_topk_log_probs is not None and \
+               teacher_topk_log_probs is not None
+        # teacher在student top-K位置的log概率可能很负，做截断保证数值稳定
+        teacher_topk_clamped = teacher_topk_log_probs.clamp(min=-20.0)
+        log_ratio_topk = teacher_topk_clamped - student_topk_log_probs  # (B, T, K)
+        reward = log_ratio_topk.mean(dim=-1)  # (B, T)
 
-    alpha_t = torch.tensor(
-        alpha,
-        dtype=student_topk_log_probs.dtype,
-        device=student_topk_log_probs.device,
-    )
-
-    if alpha == 0.0:
-        kl_loss = F.kl_div(
-            teacher_topk_log_probs,
-            student_topk_log_probs,
-            reduction="none",
-            log_target=True,
-        )
-    elif alpha == 1.0:
-        kl_loss = F.kl_div(
-            student_topk_log_probs,
-            teacher_topk_log_probs,
-            reduction="none",
-            log_target=True,
-        )
     else:
-        mixture_log_probs = torch.logsumexp(
-            torch.stack([
-                student_topk_log_probs + torch.log(1.0 - alpha_t),
-                teacher_topk_log_probs + torch.log(alpha_t),
-            ]),
-            dim=0,
-        )
-        kl_teacher = F.kl_div(
-            mixture_log_probs, teacher_topk_log_probs,
-            reduction="none", log_target=True,
-        )
-        kl_student = F.kl_div(
-            mixture_log_probs, student_topk_log_probs,
-            reduction="none", log_target=True,
-        )
-        kl_loss = torch.lerp(kl_student, kl_teacher, alpha_t)
+        assert student_topk_log_probs is not None and \
+               teacher_topk_log_probs is not None
 
-    reward = -kl_loss.sum(dim=-1)  # (B, T)
-
-    if tail_correction:
-        student_tail_prob = (
-            1.0 - student_topk_log_probs.exp().sum(dim=-1)
-        ).clamp(min=1e-9, max=1.0)
-        teacher_tail_prob = (
-            1.0 - teacher_topk_log_probs.exp().sum(dim=-1)
-        ).clamp(min=1e-9, max=1.0)
-
-        student_tail_log = student_tail_prob.log()
-        teacher_tail_log = teacher_tail_prob.log()
+        alpha_t = torch.tensor(
+            alpha,
+            dtype=student_topk_log_probs.dtype,
+            device=student_topk_log_probs.device,
+        )
 
         if alpha == 0.0:
-            tail_kl = F.kl_div(
-                teacher_tail_log, student_tail_log,
-                reduction="none", log_target=True,
+            kl_loss = F.kl_div(
+                teacher_topk_log_probs,
+                student_topk_log_probs,
+                reduction="none",
+                log_target=True,
             )
         elif alpha == 1.0:
-            tail_kl = F.kl_div(
-                student_tail_log, teacher_tail_log,
-                reduction="none", log_target=True,
+            kl_loss = F.kl_div(
+                student_topk_log_probs,
+                teacher_topk_log_probs,
+                reduction="none",
+                log_target=True,
             )
         else:
-            mixture_tail_log = torch.logsumexp(
+            mixture_log_probs = torch.logsumexp(
                 torch.stack([
-                    student_tail_log + torch.log(1.0 - alpha_t),
-                    teacher_tail_log + torch.log(alpha_t),
+                    student_topk_log_probs + torch.log(1.0 - alpha_t),
+                    teacher_topk_log_probs + torch.log(alpha_t),
                 ]),
                 dim=0,
             )
-            kl_t_tail = F.kl_div(
-                mixture_tail_log, teacher_tail_log,
+            kl_teacher = F.kl_div(
+                mixture_log_probs, teacher_topk_log_probs,
                 reduction="none", log_target=True,
             )
-            kl_s_tail = F.kl_div(
-                mixture_tail_log, student_tail_log,
+            kl_student = F.kl_div(
+                mixture_log_probs, student_topk_log_probs,
                 reduction="none", log_target=True,
             )
-            tail_kl = torch.lerp(kl_s_tail, kl_t_tail, alpha_t)
+            kl_loss = torch.lerp(kl_student, kl_teacher, alpha_t)
 
-        reward = reward - tail_kl
+        reward = -kl_loss.sum(dim=-1)  # (B, T)
+
+        if tail_correction:
+            student_tail_prob = (
+                1.0 - student_topk_log_probs.exp().sum(dim=-1)
+            ).clamp(min=1e-9, max=1.0)
+            teacher_tail_prob = (
+                1.0 - teacher_topk_log_probs.exp().sum(dim=-1)
+            ).clamp(min=1e-9, max=1.0)
+
+            student_tail_log = student_tail_prob.log()
+            teacher_tail_log = teacher_tail_prob.log()
+
+            if alpha == 0.0:
+                tail_kl = F.kl_div(
+                    teacher_tail_log, student_tail_log,
+                    reduction="none", log_target=True,
+                )
+            elif alpha == 1.0:
+                tail_kl = F.kl_div(
+                    student_tail_log, teacher_tail_log,
+                    reduction="none", log_target=True,
+                )
+            else:
+                mixture_tail_log = torch.logsumexp(
+                    torch.stack([
+                        student_tail_log + torch.log(1.0 - alpha_t),
+                        teacher_tail_log + torch.log(alpha_t),
+                    ]),
+                    dim=0,
+                )
+                kl_t_tail = F.kl_div(
+                    mixture_tail_log, teacher_tail_log,
+                    reduction="none", log_target=True,
+                )
+                kl_s_tail = F.kl_div(
+                    mixture_tail_log, student_tail_log,
+                    reduction="none", log_target=True,
+                )
+                tail_kl = torch.lerp(kl_s_tail, kl_t_tail, alpha_t)
+
+            reward = reward - tail_kl
+
+    # ── reward transform ──────────────────────────────────────
+    if reward_transform == "tanh":
+        reward = torch.tanh(reward / reward_scale)        # → (-1, 1)
+    elif reward_transform == "tanh01":
+        reward = (torch.tanh(reward / reward_scale) + 1.0) / 2.0  # → (0, 1)
+    elif reward_transform == "sigmoid":
+        reward = torch.sigmoid(reward / reward_scale)     # → (0, 1)
+    # "none"：不做变换
 
     return reward
 

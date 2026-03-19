@@ -9,7 +9,7 @@ actor_rollout_ref:
   actor:
     ppo_mini_batch_size: 32
     policy_loss:
-      loss_mode: vanilla        # 保持sdpo，复用teacher前向的计算
+      loss_mode: vanilla
     self_distillation:
       max_reprompt_len: 10240
       is_clip: 2.0
@@ -17,9 +17,9 @@ actor_rollout_ref:
       entropy_temperature: 1.0
       entropy_weighting_version: "v4"
 
-      include_environment_feedback: false   # TASD不依赖环境feedback，只用solution
-      success_reward_threshold: 1.0        # reward>=1.0视为成功
-      dont_reprompt_on_self_success: false  # TASD场景下保持false
+      include_environment_feedback: false
+      success_reward_threshold: 1.0
+      dont_reprompt_on_self_success: false
     optim:
       lr: 1e-5
   rollout:
@@ -27,20 +27,18 @@ actor_rollout_ref:
     calculate_log_probs: True
 
 algorithm:
-  adv_estimator: tasd        # ← 从grpo改为tasd
+  adv_estimator: tasd
   norm_adv_by_std_in_grpo: False
   tasd:
-    # reward_type: log_ratio   # 候选B：log T(y_t) - log S(y_t)
-    # reward_type: kl
-    # reward_type: jsd
-    reward_type: "jsd"   # log_ratio | forward_kl | reverse_kl | jsd
-    alpha: 0.5           # 0.0=reverse_kl, 0.5=jsd, 1.0=forward_kl；reward_type=jsd时生效
-    tail_correction: false  # K足够大时false，K较小时建议true
-    distill_topk: 100 
-    include_successful_rollouts: True
-  # rollout_correction:
-  #   rollout_is: token
-  #   rollout_is_threshold: 2.0
+    reward_type: "log_ratio"       # log_ratio | vocab_log_ratio | forward_kl | reverse_kl | jsd
+    alpha: 0.5                     # jsd/kl类时生效：0.0=reverse_kl, 0.5=jsd, 1.0=forward_kl
+    tail_correction: false         # K足够大时false，K较小时建议true
+    distill_topk: 100              # vocab_log_ratio/jsd/kl类需要topk
+    include_successful_rollouts: true  # true=成功rollout也走TASD；false=成功rollout不走TASD
+    grpo_weight: 0.0             # 成功rollout用verifier reward的权重
+    success_reward_threshold: 1.0  # reward>=1.0视为成功，与self_distillation保持一致
+    reward_transform: "tanh"       # tanh→(-1,1) | tanh01→(0,1) | sigmoid→(0,1) | none
+    reward_scale: 1.0              # tanh(x/scale)的scale，控制敏感度
 
 data:
   train_batch_size: 32

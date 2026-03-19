@@ -1650,6 +1650,29 @@ class RayPPOTrainer:
         )
         next_step_profile = False
 
+        # ── 循环外提前解析，避免每step重复读取 ──────────────────
+        is_tasd = self.config.algorithm.adv_estimator == AdvantageEstimator.TASD
+        if is_tasd:
+            _tasd_cfg              = self.config.algorithm.get("tasd", {})
+            tasd_reward_type       = _tasd_cfg.get("reward_type", "log_ratio")
+            tasd_alpha             = _tasd_cfg.get("alpha", 0.5)
+            tasd_tail_correction   = _tasd_cfg.get("tail_correction", False)
+            tasd_grpo_weight       = _tasd_cfg.get("grpo_weight", 0.0)
+            tasd_success_threshold = _tasd_cfg.get("success_reward_threshold", 1.0)
+            tasd_reward_transform  = _tasd_cfg.get("reward_transform", "tanh")
+            tasd_reward_scale      = _tasd_cfg.get("reward_scale", 1.0)
+            tasd_need_topk         = tasd_reward_type in (
+                "forward_kl", "reverse_kl", "jsd", "vocab_log_ratio"
+            )
+            tasd_distill_topk      = _tasd_cfg.get("distill_topk", 100) if tasd_need_topk else None
+            tasd_temperature       = self.config.actor_rollout_ref.rollout.temperature
+            tasd_micro_batch_size  = self.config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu
+
+        rollout_corr_config     = self.config.algorithm.get("rollout_correction", None)
+        norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
+        rollout_data_dir        = self.config.trainer.get("rollout_data_dir", None)
+        # ────────────────────────────────────────────────────────
+
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
@@ -1772,7 +1795,7 @@ class RayPPOTrainer:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
                     # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
                     #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
-                    rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+                   
                     bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
                     if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
                         from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
@@ -1848,19 +1871,7 @@ class RayPPOTrainer:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
                         # Step2: TASD覆盖token_level_rewards（必须在Step1之后）
-                        if (
-                            self.config.algorithm.adv_estimator == AdvantageEstimator.TASD
-                            and "teacher_input_ids" in batch.batch
-                        ):
-                            tasd_cfg        = self.config.algorithm.get("tasd", {})
-                            reward_type     = tasd_cfg.get("reward_type", "log_ratio")
-                            alpha           = tasd_cfg.get("alpha", 0.5)
-                            tail_correction = tasd_cfg.get("tail_correction", False)
-                            grpo_weight     = tasd_cfg.get("grpo_weight", 0.0)
-                            success_threshold = tasd_cfg.get("success_reward_threshold", 1.0)
-                            need_topk       = reward_type in ("forward_kl", "reverse_kl", "jsd")
-                            distill_topk    = tasd_cfg.get("distill_topk", 100) if need_topk else None
-
+                        if is_tasd and "teacher_input_ids" in batch.batch:
                             teacher_fwd_batch = DataProto.from_dict(
                                 tensors={
                                     "teacher_input_ids":      batch.batch["teacher_input_ids"],
@@ -1873,10 +1884,10 @@ class RayPPOTrainer:
                                 }
                             )
                             teacher_fwd_batch.meta_info = {
-                                "temperature":      self.config.actor_rollout_ref.rollout.temperature,
-                                "micro_batch_size": self.config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu,
+                                "temperature":      tasd_temperature,
+                                "micro_batch_size": tasd_micro_batch_size,
                                 "pad_token_id":     self.tokenizer.pad_token_id,
-                                "distill_topk":     distill_topk,
+                                "distill_topk":     tasd_distill_topk,
                             }
 
                             with marked_timer("tasd_teacher_fwd", timing_raw, color="cyan"):
@@ -1889,24 +1900,24 @@ class RayPPOTrainer:
                                 teacher_log_probs=teacher_result.batch["teacher_log_probs_on_response"],
                                 student_topk_log_probs=teacher_result.batch.get("student_topk_log_probs"),
                                 teacher_topk_log_probs=teacher_result.batch.get("teacher_topk_log_probs"),
-                                reward_type=reward_type,
-                                alpha=alpha,
-                                tail_correction=tail_correction,
+                                reward_type=tasd_reward_type,
+                                alpha=tasd_alpha,
+                                tail_correction=tasd_tail_correction,
+                                reward_transform=tasd_reward_transform,
+                                reward_scale=tasd_reward_scale,
                             )
 
-                            # 此时token_level_rewards已经是verifier reward（Step1设置的）
                             verifier_rewards = batch.batch["token_level_rewards"].clone()
                             batch.batch["verifier_token_rewards"] = verifier_rewards
 
-                            if grpo_weight > 0.0:
+                            if tasd_grpo_weight > 0.0:
                                 batch.batch["token_level_rewards"] = (
-                                    grpo_weight * verifier_rewards
-                                    + (1.0 - grpo_weight) * token_rewards
+                                    tasd_grpo_weight * verifier_rewards
+                                    + (1.0 - tasd_grpo_weight) * token_rewards
                                 )
                             else:
                                 batch.batch["token_level_rewards"] = token_rewards
 
-                            # metrics
                             response_mask  = batch.batch["response_mask"]
                             valid_tasd     = token_rewards[response_mask.bool()]
                             valid_verifier = verifier_rewards[response_mask.bool()]
@@ -1916,7 +1927,6 @@ class RayPPOTrainer:
                             metrics["tasd/token_reward_pos_rate"] = (valid_tasd > 0).float().mean().item()
                             metrics["tasd/verifier_reward_mean"]  = valid_verifier.mean().item()
 
-                            # acc分组统计
                             acc = None
                             if "acc" in batch.batch:
                                 acc = batch.batch["acc"]
@@ -1928,7 +1938,7 @@ class RayPPOTrainer:
                                 )
 
                             if acc is not None:
-                                success_mask_1d = acc >= success_threshold
+                                success_mask_1d = acc >= tasd_success_threshold
                                 fail_mask_1d    = ~success_mask_1d
 
                                 def _masked_valid_tokens(tensor_2d, seq_mask_1d):
@@ -1962,7 +1972,6 @@ class RayPPOTrainer:
                             metrics.update(is_metrics)
 
                         # Step4: compute advantage
-                        norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
@@ -1974,7 +1983,7 @@ class RayPPOTrainer:
                         )
 
                         # advantage分布监控
-                        if self.config.algorithm.adv_estimator == AdvantageEstimator.TASD:
+                        if is_tasd:
                             valid_adv = batch.batch["advantages"][batch.batch["response_mask"].bool()]
                             metrics["tasd/advantage_mean"]     = valid_adv.mean().item()
                             metrics["tasd/advantage_std"]      = valid_adv.std().item()
@@ -1996,7 +2005,6 @@ class RayPPOTrainer:
                         metrics.update(actor_output_metrics)
 
                     # Log rollout generations if enabled
-                    rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
