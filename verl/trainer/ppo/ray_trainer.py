@@ -251,28 +251,30 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+        
     elif adv_estimator == AdvantageEstimator.TASD:
         sdist_mask = None
-        if "self_distillation_mask" in batch.batch:
-            sdist_mask = batch.batch["self_distillation_mask"]
+        if "self_distillation_mask" in data.batch:      # batch → data
+            sdist_mask = data.batch["self_distillation_mask"]
 
-        # 新增：构建success_mask
+        # 构建success_mask
         success_mask = None
-        if "token_level_scores" in batch.batch:
-            seq_scores = batch.batch["token_level_scores"].sum(dim=-1)
-            threshold = self.config.algorithm.get("tasd", {}).get(
-                "success_reward_threshold", 1.0
-            )
-            success_mask = (seq_scores >= threshold)  # (B,) bool tensor
+        if "token_level_scores" in data.batch:           # batch → data
+            seq_scores = data.batch["token_level_scores"].sum(dim=-1)
+            threshold = config.get("tasd", {}).get("success_reward_threshold", 1.0)
+            success_mask = (seq_scores >= threshold)
 
         advantages, returns = core_algos.compute_tasd_advantage(
-            token_level_rewards=data.batch["token_level_rewards"],
-            response_mask=data.batch["response_mask"],
+            token_level_rewards=data.batch["token_level_rewards"],  # batch → data
+            response_mask=data.batch["response_mask"],              # batch → data
             self_distillation_mask=sdist_mask,
             index=data.non_tensor_batch["uid"],
-            success_mask=success_mask,   # 新增
+            success_mask=success_mask,
             config=config,
         )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
+
 
     else:
         # handle all other adv estimator type other than GAE and GRPO

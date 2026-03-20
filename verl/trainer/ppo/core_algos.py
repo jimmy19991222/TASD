@@ -2503,6 +2503,9 @@ def compute_tasd_token_rewards(
     if reward_type == "log_ratio":
         reward = teacher_log_probs - student_log_probs  # (B, T)
 
+    elif reward_type == "prob_diff":
+        reward = teacher_log_probs.exp() - student_log_probs.exp()
+        
     elif reward_type == "vocab_log_ratio":
         # ← 新增：vocab粒度的log_ratio
         assert student_topk_log_probs is not None and \
@@ -2604,6 +2607,8 @@ def compute_tasd_token_rewards(
         reward = (torch.tanh(reward / reward_scale) + 1.0) / 2.0  # → (0, 1)
     elif reward_transform == "sigmoid":
         reward = torch.sigmoid(reward / reward_scale)     # → (0, 1)
+    elif reward_transform == "clip":
+        reward = torch.clamp(reward, min=-reward_scale, max=reward_scale) # → (-1, 1)
     # "none"：不做变换
 
     return reward
@@ -2656,10 +2661,11 @@ def compute_tasd_advantage(
 
             all_rewards = torch.cat(group_token_rewards)
             group_mean = all_rewards.mean()
-            group_std = all_rewards.std(unbiased=False).clamp(min=epsilon)
+            # group_std = all_rewards.std(unbiased=False).clamp(min=epsilon)
 
             for i in valid_indices:
-                adv_i = (token_level_rewards[i] - group_mean) / group_std
+                # adv_i = (token_level_rewards[i] - group_mean) / group_std
+                adv_i = (token_level_rewards[i] - group_mean)
                 advantages[i] = adv_i * effective_mask[i]
 
     return advantages, advantages
