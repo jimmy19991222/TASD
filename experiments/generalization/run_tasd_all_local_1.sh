@@ -41,12 +41,12 @@ MINI_BATCH_SIZES=(32)
 LRS=(1e-5)
 
 # ── TASD 超参扫描 ──────────────────────────────────────────────
-REWARD_TYPES=("prob_diff")
+REWARD_TYPES=("teacher_prob")
 REWARD_TRANSFORMS=("none")
 REWARD_SCALES=(1.0)
 DISTILL_TOPKS=(100)
 USE_SELF_AS_TEACHER_LIST=(True)        # True=成功rollout用自己；False=成功rollout用别人
-INCLUDE_SUCCESSFUL_ROLLOUTS_LIST=(False)
+INCLUDE_SUCCESSFUL_ROLLOUTS_LIST=(True)
 
 MODEL_PATHS=(
     "Qwen/Qwen3-8B"

@@ -38,14 +38,14 @@ DATA_PATHS=(
 TRAIN_BATCH_SIZES=(32)
 ROLLOUT_BATCH_SIZES=(8)
 MINI_BATCH_SIZES=(32)
-LRS=(1e-6)
+LRS=(1e-5)
 
 # ── TASD 超参扫描 ──────────────────────────────────────────────
-REWARD_TYPES=("prob_diff")
+REWARD_TYPES=("teacher_prob")
 REWARD_TRANSFORMS=("none")
 REWARD_SCALES=(1.0)
 DISTILL_TOPKS=(100)
-USE_SELF_AS_TEACHER_LIST=(True)        # True=成功rollout用自己；False=成功rollout用别人
+USE_SELF_AS_TEACHER_LIST=(False)        # True=成功rollout用自己；False=成功rollout用别人
 INCLUDE_SUCCESSFUL_ROLLOUTS_LIST=(True)
 
 MODEL_PATHS=(
@@ -130,7 +130,7 @@ for DATA_PATH in "${DATA_PATHS[@]}"; do
                                                     | tr '/' '-'          \
                                                     | sed 's|-*$||')
 
-                                                EXP_NAME="TASD-${DATASET_NAME}-mbs${MINI_BATCH_SIZE}-train${TRAIN_BATCH_SIZE}-rollout${ROLLOUT_BATCH_SIZE}-lr${LR}-rt${REWARD_TYPE}-tf${REWARD_TRANSFORM}-topk${DISTILL_TOPK}-usat${USE_SELF_AS_TEACHER}-isr${INCLUDE_SUCCESSFUL_ROLLOUTS}-${MODEL_NAME}-$(date +%Y-%m-%d_%H-%M-%S)"
+                                                EXP_NAME="TASD-notSkipAllFailed-${DATASET_NAME}-mbs${MINI_BATCH_SIZE}-train${TRAIN_BATCH_SIZE}-rollout${ROLLOUT_BATCH_SIZE}-lr${LR}-rt${REWARD_TYPE}-tf${REWARD_TRANSFORM}-topk${DISTILL_TOPK}-usat${USE_SELF_AS_TEACHER}-isr${INCLUDE_SUCCESSFUL_ROLLOUTS}-${MODEL_NAME}-$(date +%Y-%m-%d_%H-%M-%S)"
 
                                                 SCRIPT_ARGS=(
                                                     # ── 基础参数 ──────────────────────────

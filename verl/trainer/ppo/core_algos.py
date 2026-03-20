@@ -2524,6 +2524,9 @@ def compute_tasd_token_rewards(
         log_ratio_topk = teacher_topk_clamped - student_topk_log_probs  # (B, T, K)
         reward = log_ratio_topk.mean(dim=-1)  # (B, T)
 
+    elif reward_type == "teacher_prob":
+        reward = teacher_log_probs.exp()  # (B, T) ∈ (0,1)
+
     else:
         assert student_topk_log_probs is not None and \
                teacher_topk_log_probs is not None
@@ -2653,18 +2656,18 @@ def compute_tasd_advantage(
         
         for uid, indices in uid_to_indices.items():
 
-            # 检查group内是否有成功rollout，没有则跳过整个group
-            if success_mask is not None:
-                has_success = any(success_mask[i] for i in indices)
-                if not has_success:
-                    skipped_groups += 1
-                    if skipped_groups <= 3:  # 只打印前3个跳过的group
-                        print(f"[TASD Debug] Skip group {uid}: no success in {len(indices)} responses")
-                    continue
-                else:
-                    processed_groups += 1
-                    if processed_groups <= 3:  # 只打印前3个处理的group
-                        print(f"[TASD Debug] Process group {uid}: {len(indices)} responses, has_success={has_success}")
+            # # 检查group内是否有成功rollout，没有则跳过整个group
+            # if success_mask is not None:
+            #     has_success = any(success_mask[i] for i in indices)
+            #     if not has_success:
+            #         skipped_groups += 1
+            #         if skipped_groups <= 3:  # 只打印前3个跳过的group
+            #             print(f"[TASD Debug] Skip group {uid}: no success in {len(indices)} responses")
+            #         continue
+            #     else:
+            #         processed_groups += 1
+            #         if processed_groups <= 3:  # 只打印前3个处理的group
+            #             print(f"[TASD Debug] Process group {uid}: {len(indices)} responses, has_success={has_success}")
 
             # 只收集有teacher context的response（effective_mask非零）
             valid_indices = []
