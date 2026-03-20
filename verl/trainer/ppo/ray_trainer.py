@@ -263,6 +263,15 @@ def compute_advantage(
             seq_scores = data.batch["token_level_scores"].sum(dim=-1)
             threshold = config.get("tasd", {}).get("success_reward_threshold", 1.0)
             success_mask = (seq_scores >= threshold)
+            
+            # Debug: TASD success_mask 诊断
+            print(f"[TASD Debug] token_level_scores shape: {data.batch['token_level_scores'].shape}")
+            print(f"[TASD Debug] token_level_scores[0]: {data.batch['token_level_scores'][0][:10]}...")  # 前10个值
+            print(f"[TASD Debug] seq_scores[:5]: {seq_scores[:5]}")
+            print(f"[TASD Debug] threshold: {threshold}")
+            print(f"[TASD Debug] success_mask[:5]: {success_mask[:5]}")
+            print(f"[TASD Debug] success_rate: {success_mask.float().mean():.3f}")
+            print(f"[TASD Debug] num_success: {success_mask.sum().item()}/{len(success_mask)}")
 
         advantages, returns = core_algos.compute_tasd_advantage(
             token_level_rewards=data.batch["token_level_rewards"],  # batch → data

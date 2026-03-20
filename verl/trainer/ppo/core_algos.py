@@ -2648,13 +2648,23 @@ def compute_tasd_advantage(
         for i in range(token_level_rewards.shape[0]):
             uid_to_indices[index[i]].append(i)
 
+        skipped_groups = 0
+        processed_groups = 0
+        
         for uid, indices in uid_to_indices.items():
 
             # 检查group内是否有成功rollout，没有则跳过整个group
             if success_mask is not None:
                 has_success = any(success_mask[i] for i in indices)
                 if not has_success:
+                    skipped_groups += 1
+                    if skipped_groups <= 3:  # 只打印前3个跳过的group
+                        print(f"[TASD Debug] Skip group {uid}: no success in {len(indices)} responses")
                     continue
+                else:
+                    processed_groups += 1
+                    if processed_groups <= 3:  # 只打印前3个处理的group
+                        print(f"[TASD Debug] Process group {uid}: {len(indices)} responses, has_success={has_success}")
 
             # 只收集有teacher context的response（effective_mask非零）
             valid_indices = []
@@ -2667,15 +2677,27 @@ def compute_tasd_advantage(
                 valid_indices.append(i)
 
             if len(valid_indices) == 0:
+                skipped_groups += 1
+                print(f"[TASD Debug] Skip group {uid}: no valid indices (all responses lack teacher context)")
                 continue  # group内无任何有teacher context的response，跳过
 
             all_rewards = torch.cat(group_token_rewards)
             group_mean = all_rewards.mean()
             # 注意：此处故意不做std归一化，因为reward已经过tanh压缩到(-1,1)量级
             # group_std = all_rewards.std(unbiased=False).clamp(min=epsilon)
+            
+            if processed_groups <= 3:
+                print(f"[TASD Debug] Group {uid} stats: {len(valid_indices)}/{len(indices)} valid, "
+                      f"reward_mean={group_mean:.4f}, reward_min={all_rewards.min():.4f}, "
+                      f"reward_max={all_rewards.max():.4f}")
 
             for i in valid_indices:
                 adv_i = token_level_rewards[i] - group_mean
                 advantages[i] = adv_i * effective_mask[i]
+        
+        # 打印汇总统计
+        total_groups = len(uid_to_indices)
+        print(f"[TASD Debug] Summary: {processed_groups}/{total_groups} groups processed, "
+              f"{skipped_groups}/{total_groups} groups skipped")
 
     return advantages, advantages
