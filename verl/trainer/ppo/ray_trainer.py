@@ -1934,6 +1934,10 @@ class RayPPOTrainer:
                                 reward_scale=tasd_reward_scale,
                             )
 
+                            # Mask out padding positions: teacher_log_probs=0 at pad → exp(0)=1.0 (wrong!)
+                            response_mask_float = batch.batch["response_mask"].float()
+                            token_rewards = token_rewards * response_mask_float
+
                             verifier_rewards = batch.batch["token_level_rewards"].clone()
                             batch.batch["verifier_token_rewards"] = verifier_rewards
 
