@@ -1131,9 +1131,10 @@ def apply_teacher_entropy_weighting(
         elif weighting_version == "v2":
             # V2：teacher确定程度 × student选错程度
             teacher_prob_on_student = teacher_log_prob_on_student.exp()
-            H_max = teacher_entropy.masked_fill(
-                loss_mask == 0, 0.0
-            ).max().clamp(min=1e-6)
+            K = teacher_logp.shape[-1]
+            H_max = torch.log(torch.tensor(
+                K, dtype=teacher_entropy.dtype, device=teacher_entropy.device
+            )).clamp(min=1e-6)
             H_normalized = teacher_entropy / H_max
             teacher_certainty = 1.0 - H_normalized
             student_wrong = 1.0 - teacher_prob_on_student
@@ -1142,9 +1143,10 @@ def apply_teacher_entropy_weighting(
         elif weighting_version == "v2sqrt":
             # V2-sqrt版本：几何平均，缓和两个因子的极端值
             teacher_prob_on_student = teacher_log_prob_on_student.exp()
-            H_max = teacher_entropy.masked_fill(
-                loss_mask == 0, 0.0
-            ).max().clamp(min=1e-6)
+            K = teacher_logp.shape[-1]
+            H_max = torch.log(torch.tensor(
+                K, dtype=teacher_entropy.dtype, device=teacher_entropy.device
+            )).clamp(min=1e-6)
             H_normalized = teacher_entropy / H_max
             teacher_certainty = 1.0 - H_normalized
             student_wrong = 1.0 - teacher_prob_on_student
@@ -1157,9 +1159,10 @@ def apply_teacher_entropy_weighting(
                 print("[EW] v4 requires student_topk_log_probs, falling back to v2sqrt")
                 weighting_version = "v2sqrt"
                 teacher_prob_on_student = teacher_log_prob_on_student.exp()
-                H_max = teacher_entropy.masked_fill(
-                    loss_mask == 0, 0.0
-                ).max().clamp(min=1e-6)
+                K = teacher_logp.shape[-1]
+                H_max = torch.log(torch.tensor(
+                    K, dtype=teacher_entropy.dtype, device=teacher_entropy.device
+                )).clamp(min=1e-6)
                 H_normalized = teacher_entropy / H_max
                 teacher_certainty = 1.0 - H_normalized
                 student_wrong = 1.0 - teacher_prob_on_student
@@ -1346,7 +1349,6 @@ def compute_self_distillation_loss(
     if rollout_is_weights is not None:
         per_token_loss = per_token_loss * rollout_is_weights
 
-    # Apply teacher entropy weighting (optional)
     # Apply teacher entropy weighting (optional)
     use_entropy_weighting = getattr(self_distillation_config, 'entropy_weighting', False)
     if use_entropy_weighting:
