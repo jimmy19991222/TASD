@@ -2742,21 +2742,23 @@ def compute_tasd_advantage(
 
             if len(valid_indices) == 0:
                 skipped_groups += 1
-                print(f"[TASD Debug] Skip group {uid}: no valid indices (all responses lack teacher context)")
+                if skipped_groups <= 3:  # 只打印前3个跳过的group
+                    print(f"[TASD Debug] Skip group {uid}: no valid indices (all responses lack teacher context)")
                 continue  # group内无任何有teacher context的response，跳过
+
+            processed_groups += 1
 
             all_rewards = torch.cat(group_token_rewards)
             group_mean = all_rewards.mean()
-            # 注意：此处故意不做std归一化，因为reward已经过tanh压缩到(-1,1)量级
-            # group_std = all_rewards.std(unbiased=False).clamp(min=epsilon)
+            group_std = all_rewards.std(unbiased=False).clamp(min=epsilon)
             
             if processed_groups <= 3:
                 print(f"[TASD Debug] Group {uid} stats: {len(valid_indices)}/{len(indices)} valid, "
-                      f"reward_mean={group_mean:.4f}, reward_min={all_rewards.min():.4f}, "
-                      f"reward_max={all_rewards.max():.4f}")
+                      f"reward_mean={group_mean:.4f}, reward_std={group_std:.4f}, "
+                      f"reward_min={all_rewards.min():.4f}, reward_max={all_rewards.max():.4f}")
 
             for i in valid_indices:
-                adv_i = token_level_rewards[i] - group_mean
+                adv_i = (token_level_rewards[i] - group_mean) / group_std
                 advantages[i] = adv_i * effective_mask[i]
         
         # 打印汇总统计
