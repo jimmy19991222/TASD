@@ -15,7 +15,7 @@ export SWANLAB_LOG_DIR=/home/loujieming.ljm/SDPO/logs/swanlab_logs
 export TORCH_WARN_ACCUMULATE_GRAD_STREAM=0
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 
-# ── Dry-run模式 ───────────────────────────────────────────────
+# ── Dry-run 模式 ───────────────────────────────────────────────
 DRY_RUN=false
 if [ $# -gt 0 ] && [[ "$1" == "--dry-run" ]]; then
     DRY_RUN=true
@@ -29,9 +29,6 @@ CONFIG_NAME="tasd"
 
 DATA_PATHS=(
     "datasets/sciknoweval/biology/"
-    # "datasets/sciknoweval/chemistry/"
-    # "datasets/sciknoweval/material/"
-    # "datasets/sciknoweval/physics/"
 )
 
 TRAIN_BATCH_SIZES=(32)
@@ -45,7 +42,7 @@ REWARD_TYPES=(
     "log_teacher_prob"
 )
 
-R"teacher_prob_certainty"EWARD_TRANSFORMS=("none")
+REWARD_TRANSFORMS=("none")
 REWARD_SCALES=(1.0)
 DISTILL_TOPKS=(100)
 
@@ -53,19 +50,24 @@ USE_SELF_AS_TEACHER_LIST=(True)
 INCLUDE_SUCCESSFUL_ROLLOUTS_LIST=(True)
 
 # ── advantage 配置扫描 ──────────────────────────────────────
-# norm_adv_by_std: False=不除std(teacher_prob∈[0,1]天然有界), True=除std
+# norm_adv_by_std: False=不除 std(teacher_prob∈[0,1] 天然有界), True=除 std
 NORM_ADV_BY_STD_LIST=(False)
-# clip_adv: True=开启clipping
+# clip_adv: True=开启 clipping
 CLIP_ADV_LIST=(True)
 CLIP_ADV_VALUES=(5.0)
 
 # ── entropy bonus ─────────────────────────────────────────
-# entropy_coeff: >0 时在PG loss上减去 β*H(π)，鼓励探索，对抗entropy崩塌
-ENTROPY_COEFF_LIST=(0.01)
+# entropy_coeff: >0 时在 PG loss 上减去 β*H(π)，鼓励探索，对抗 entropy 崩塌
+ENTROPY_COEFF_LIST=(0.0 0.01 0.03 0.05)
 
 # ── rollout correction ───────────────────────────────────
-# rollout_is: token级IS权重修正off-policy偏差（与GRPO baseline对齐）
+# rollout_is: token 级 IS 权重修正 off-policy 偏差（与 GRPO baseline 对齐）
 ROLLOUT_IS_LIST=("token")
+
+# ── EMA teacher ─────────────────────────────────────────
+# teacher_regularization: "none"=用当前 step 模型，"ema"=用历史平滑版本（对抗 entropy 崩塌）
+TEACHER_REGULARIZATION_LIST=("ema" "none")
+TEACHER_UPDATE_RATE_LIST=(0.05 0.1)
 
 MODEL_PATHS=(
     "Qwen/Qwen3-8B"
@@ -144,6 +146,8 @@ for DATA_PATH in "${DATA_PATHS[@]}"; do
                                                         for CLIP_ADV_VALUE in "${CLIP_ADV_VALUES[@]}"; do
                                                             for ENTROPY_COEFF in "${ENTROPY_COEFF_LIST[@]}"; do
                                                                 for ROLLOUT_IS in "${ROLLOUT_IS_LIST[@]}"; do
+                                                                    for TEACHER_REG in "${TEACHER_REGULARIZATION_LIST[@]}"; do
+                                                                        for TEACHER_UPDATE_RATE in "${TEACHER_UPDATE_RATE_LIST[@]}"; do
 
                                                 MODEL_NAME=$(echo "$MODEL_PATH" | tr '/' '-')
                                                 DATASET_NAME=$(echo "$DATA_PATH" \
@@ -168,15 +172,19 @@ for DATA_PATH in "${DATA_PATHS[@]}"; do
                                                 if [ -n "$ROLLOUT_IS" ] && [ "$ROLLOUT_IS" != "none" ]; then
                                                     RC_TAG="-rc${ROLLOUT_IS}"
                                                 fi
+                                                EMA_TAG=""
+                                                if [ "$TEACHER_REG" = "ema" ]; then
+                                                    EMA_TAG="-ema${TEACHER_UPDATE_RATE}"
+                                                fi
 
-                                                EXP_NAME="TASD-${DATASET_NAME}-mbs${MINI_BATCH_SIZE}-train${TRAIN_BATCH_SIZE}-rollout${ROLLOUT_BATCH_SIZE}-lr${LR}-rt${REWARD_TYPE}-tf${REWARD_TRANSFORM}-topk${DISTILL_TOPK}-usat${USE_SELF_AS_TEACHER}-isr${INCLUDE_SUCCESSFUL_ROLLOUTS}-${NORM_TAG}-${CLIP_TAG}${ENT_TAG}${RC_TAG}-${MODEL_NAME}-$(date +%Y-%m-%d_%H-%M-%S)"
+                                                EXP_NAME="TASD-${DATASET_NAME}-mbs${MINI_BATCH_SIZE}-train${TRAIN_BATCH_SIZE}-rollout${ROLLOUT_BATCH_SIZE}-lr${LR}-rt${REWARD_TYPE}-tf${REWARD_TRANSFORM}-topk${DISTILL_TOPK}-usat${USE_SELF_AS_TEACHER}-isr${INCLUDE_SUCCESSFUL_ROLLOUTS}-${NORM_TAG}-${CLIP_TAG}${ENT_TAG}${RC_TAG}${EMA_TAG}-${MODEL_NAME}-$(date +%Y-%m-%d_%H-%M-%S)"
 
                                                 SCRIPT_ARGS=(
                                                     # ── 基础参数 ──────────────────────────
                                                     "data.train_batch_size=$TRAIN_BATCH_SIZE"
                                                     "trainer.total_epochs=30"
                                                     "trainer.total_training_steps=250"
-                                                    "trainer.group_name=TASD-teacher-prob"
+                                                    "trainer.group_name=TASD-ema-teacher"
                                                     "actor_rollout_ref.actor.optim.lr_warmup_steps=10"
                                                     "actor_rollout_ref.rollout.n=$ROLLOUT_BATCH_SIZE"
                                                     "actor_rollout_ref.actor.optim.lr=$LR"
@@ -204,7 +212,11 @@ for DATA_PATH in "${DATA_PATHS[@]}"; do
                                                     # ── rollout correction ────────────────
                                                     "algorithm.rollout_correction.rollout_is=$ROLLOUT_IS"
 
-                                                    # ── teacher_input_ids构建 ──────────────
+                                                    # ── EMA teacher ───────────────────────
+                                                    "actor_rollout_ref.actor.self_distillation.teacher_regularization=$TEACHER_REG"
+                                                    "actor_rollout_ref.actor.self_distillation.teacher_update_rate=$TEACHER_UPDATE_RATE"
+
+                                                    # ── teacher_input_ids 构建 ──────────────
                                                     "actor_rollout_ref.actor.self_distillation.include_environment_feedback=False"
 
                                                     # ── 本地运行参数 ───────────────────────
@@ -216,6 +228,8 @@ for DATA_PATH in "${DATA_PATHS[@]}"; do
 
                                                 submit_job "$EXP_NAME" "$DATA_PATH" "${SCRIPT_ARGS[@]}"
 
+                                                                        done  # TEACHER_UPDATE_RATE
+                                                                    done  # TEACHER_REG
                                                                 done  # ROLLOUT_IS
                                                             done  # ENTROPY_COEFF
                                                         done  # CLIP_ADV_VALUE

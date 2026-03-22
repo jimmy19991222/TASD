@@ -18,6 +18,10 @@ actor_rollout_ref:
       entropy_temperature: 1.0
       entropy_weighting_version: "v4"
 
+      # EMA teacher 配置（用于 TASD）
+      teacher_regularization: "none"   # "none"=用当前 step 模型，"ema"=用历史平滑版本
+      teacher_update_rate: 0.05        # EMA 更新率 α: θ_teacher ← (1-α)*θ_teacher + α*θ_student
+
       include_environment_feedback: false
       success_reward_threshold: 1.0
       dont_reprompt_on_self_success: false  # TASD场景下无效，由use_self_as_teacher_on_success控制

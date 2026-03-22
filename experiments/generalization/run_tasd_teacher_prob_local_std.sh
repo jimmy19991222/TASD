@@ -43,10 +43,9 @@ LRS=(1e-5 5e-6)
 REWARD_TYPES=(
     "teacher_prob"
     "log_teacher_prob"
-    "teacher_prob_certainty"
 )
 
-REWARD_TRANSFORMS=("none")
+R"teacher_prob_certainty"EWARD_TRANSFORMS=("none")
 REWARD_SCALES=(1.0)
 DISTILL_TOPKS=(100)
 
