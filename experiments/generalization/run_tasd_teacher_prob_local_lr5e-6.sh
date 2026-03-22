@@ -13,7 +13,7 @@ export SWANLAB_MODE=cloud
 export SWANLAB_API_KEY=M5oC00EEt8G1wC0XaHkal
 export SWANLAB_LOG_DIR=/home/loujieming.ljm/SDPO/logs/swanlab_logs
 export TORCH_WARN_ACCUMULATE_GRAD_STREAM=0
-export CUDA_VISIBLE_DEVICES=4,5,6,7
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 
 # ── Dry-run模式 ───────────────────────────────────────────────
 DRY_RUN=false
@@ -37,7 +37,7 @@ DATA_PATHS=(
 TRAIN_BATCH_SIZES=(32)
 ROLLOUT_BATCH_SIZES=(8)
 MINI_BATCH_SIZES=(32)
-LRS=(1e-5)
+LRS=(5e-6)
 
 # ── reward 类型 ─────────────────────────────────────────────
 REWARD_TYPES=(
@@ -96,7 +96,7 @@ submit_job() {
 
     mkdir -p ./logs
     local log_file="./logs/job_${exp_name}_${dataset_name}_$(date +%Y-%m-%d_%H-%M-%S).log"
-    local run_cmd="CUDA_VISIBLE_DEVICES=4,5,6,7 bash /home/loujieming.ljm/SDPO/training/verl_training.sh '$exp_name' '$CONFIG_NAME' '$data_path' $args_string 2>&1 | tee -a $log_file"
+    local run_cmd="CUDA_VISIBLE_DEVICES=0,1,2,3 bash /home/loujieming.ljm/SDPO/training/verl_training.sh '$exp_name' '$CONFIG_NAME' '$data_path' $args_string 2>&1 | tee -a $log_file"
     local full_command="bash -c '$setup_cmds; $run_cmd'"
 
     if [ "$DRY_RUN" = true ]; then
