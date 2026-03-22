@@ -2695,9 +2695,23 @@ def compute_tasd_advantage(
     index,
     success_mask=None,          # (B,) bool，是否是成功rollout
     epsilon=1e-6,
-    config=None,                # AlgoConfig，当前仅用于兼容 compute_advantage 调用接口
+    config=None,                # AlgoConfig
     **kwargs,
 ):
+    """
+    TASD token-level advantage estimation.
+    
+    可配置项（通过 config.tasd）：
+    - norm_adv_by_std (bool, default=False): 是否除以 group std 归一化
+    - clip_adv (bool, default=True): 是否对 advantage 做 clipping
+    - clip_adv_value (float, default=5.0): clipping 范围 [-v, v]
+    """
+    # 读取配置
+    tasd_cfg = config.get("tasd", {}) if config else {}
+    norm_adv_by_std = tasd_cfg.get("norm_adv_by_std", False)
+    clip_adv = tasd_cfg.get("clip_adv", True)
+    clip_adv_value = tasd_cfg.get("clip_adv_value", 5.0)
+
     with torch.no_grad():
         effective_mask = response_mask
         if self_distillation_mask is not None:
@@ -2717,19 +2731,6 @@ def compute_tasd_advantage(
         
         for uid, indices in uid_to_indices.items():
 
-            # # 检查group内是否有成功rollout，没有则跳过整个group
-            # if success_mask is not None:
-            #     has_success = any(success_mask[i] for i in indices)
-            #     if not has_success:
-            #         skipped_groups += 1
-            #         if skipped_groups <= 3:  # 只打印前3个跳过的group
-            #             print(f"[TASD Debug] Skip group {uid}: no success in {len(indices)} responses")
-            #         continue
-            #     else:
-            #         processed_groups += 1
-            #         if processed_groups <= 3:  # 只打印前3个处理的group
-            #             print(f"[TASD Debug] Process group {uid}: {len(indices)} responses, has_success={has_success}")
-
             # 只收集有teacher context的response（effective_mask非零）
             valid_indices = []
             group_token_rewards = []
@@ -2742,28 +2743,36 @@ def compute_tasd_advantage(
 
             if len(valid_indices) == 0:
                 skipped_groups += 1
-                if skipped_groups <= 3:  # 只打印前3个跳过的group
-                    print(f"[TASD Debug] Skip group {uid}: no valid indices (all responses lack teacher context)")
-                continue  # group内无任何有teacher context的response，跳过
+                continue
 
             processed_groups += 1
 
             all_rewards = torch.cat(group_token_rewards)
             group_mean = all_rewards.mean()
-            group_std = all_rewards.std(unbiased=False).clamp(min=epsilon)
-            
-            if processed_groups <= 3:
-                print(f"[TASD Debug] Group {uid} stats: {len(valid_indices)}/{len(indices)} valid, "
-                      f"reward_mean={group_mean:.4f}, reward_std={group_std:.4f}, "
-                      f"reward_min={all_rewards.min():.4f}, reward_max={all_rewards.max():.4f}")
+            group_std = all_rewards.std(unbiased=False).clamp(min=epsilon) if norm_adv_by_std else None
 
             for i in valid_indices:
-                adv_i = (token_level_rewards[i] - group_mean) / group_std
+                adv_i = token_level_rewards[i] - group_mean
+                if group_std is not None:
+                    adv_i = adv_i / group_std
                 advantages[i] = adv_i * effective_mask[i]
+        
+        # Advantage clipping
+        adv_nonzero = advantages[advantages != 0]
+        adv_before_clip_min = adv_nonzero.min().item() if adv_nonzero.numel() > 0 else 0.0
+        adv_before_clip_max = adv_nonzero.max().item() if adv_nonzero.numel() > 0 else 0.0
+        if clip_adv:
+            advantages = torch.clamp(advantages, min=-clip_adv_value, max=clip_adv_value)
         
         # 打印汇总统计
         total_groups = len(uid_to_indices)
+        adv_final = advantages[advantages != 0]
         print(f"[TASD Debug] Summary: {processed_groups}/{total_groups} groups processed, "
-              f"{skipped_groups}/{total_groups} groups skipped")
+              f"{skipped_groups}/{total_groups} groups skipped | "
+              f"norm_adv_by_std={norm_adv_by_std}, clip_adv={clip_adv}({clip_adv_value})")
+        print(f"[TASD Debug] Advantage before clip: min={adv_before_clip_min:.4f}, max={adv_before_clip_max:.4f}")
+        if adv_final.numel() > 0:
+            print(f"[TASD Debug] Advantage final: min={adv_final.min():.4f}, max={adv_final.max():.4f}, "
+                  f"mean={adv_final.mean():.4f}, std={adv_final.std():.4f}")
 
     return advantages, advantages

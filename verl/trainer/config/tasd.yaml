@@ -30,15 +30,19 @@ algorithm:
   adv_estimator: tasd
   norm_adv_by_std_in_grpo: False
   tasd:
-    reward_type: "log_ratio"       # log_ratio | vocab_log_ratio | forward_kl | reverse_kl | jsd
+    reward_type: "teacher_prob"     # teacher_prob | log_ratio | vocab_log_ratio | forward_kl | reverse_kl | jsd | teacher_prob_relative | teacher_prob_certainty | top1_match | topk_match
     alpha: 0.5                     # jsd/kl类时生效：0.0=reverse_kl, 0.5=jsd, 1.0=forward_kl
     tail_correction: false         # K足够大时false，K较小时建议true
     distill_topk: 100              # vocab_log_ratio/jsd/kl类需要topk
     include_successful_rollouts: true      # true=成功rollout也走TASD；false=成功rollout不走TASD
-    use_self_as_teacher_on_success: true   # ← 新增：成功rollout用自己的response作为teacher context
+    use_self_as_teacher_on_success: true   # 成功rollout用自己的response作为teacher context
     success_reward_threshold: 1.0          # reward>=1.0视为成功，与self_distillation保持一致
-    reward_transform: "tanh"               # tanh→(-1,1) | tanh01→(0,1) | sigmoid→(0,1) | none
+    reward_transform: "none"               # tanh→(-1,1) | tanh01→(0,1) | sigmoid→(0,1) | none
     reward_scale: 1.0                      # tanh(x/scale)的scale，控制敏感度
+    # ── advantage 计算 ──
+    norm_adv_by_std: false                 # 是否除以group std归一化（teacher_prob∈[0,1]时建议false）
+    clip_adv: true                         # 是否对advantage做clipping
+    clip_adv_value: 5.0                    # clipping范围 [-v, v]
 
 data:
   train_batch_size: 32
