@@ -15,7 +15,7 @@ TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
 MODEL_NAME="${MODEL_NAME:-Qwen3-8B}"         # OSS base_models 下的目录名
 
-train_data_path="${OSS_ROOT}/datasets/${DATASET}"
+train_data_path="${OSS_ROOT}/datasets/${DATASET}/train.parquet"
 model_path="${OSS_ROOT}/base_models/${MODEL_NAME}"
 save_path="${OSS_ROOT}/models/${JOB_NAME:-grpo_sweep}"
 

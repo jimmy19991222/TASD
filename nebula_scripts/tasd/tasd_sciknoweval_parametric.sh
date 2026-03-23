@@ -23,7 +23,7 @@ MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-32}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
 
 # ── 路径 ────────────────────────────────────────────────────────────────
-train_data_path="${OSS_ROOT}/datasets/sciknoweval/biology"
+train_data_path="${OSS_ROOT}/datasets/sciknoweval/biology/train.parquet"
 model_path="${OSS_ROOT}/base_models/Qwen3-8B"
 save_path="${OSS_ROOT}/models/${JOB_NAME:-tasd_sweep}"
 

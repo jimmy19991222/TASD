@@ -18,7 +18,7 @@ OSS_ROOT="/data/oss_bucket_0/ad/loujieming.ljm"
 
 # 数据集：sciknoweval biology（已提前上传到 OSS）
 # 本地对应：datasets/sciknoweval/biology/
-train_data_path="${OSS_ROOT}/datasets/sciknoweval/biology"
+train_data_path="${OSS_ROOT}/datasets/sciknoweval/biology/train.parquet"
 
 # 基底模型
 model_path="${OSS_ROOT}/base_models/Qwen3-8B"
