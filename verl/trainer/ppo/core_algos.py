@@ -2761,16 +2761,21 @@ def compute_tasd_advantage(
                     adv_i = adv_i / group_std
                 advantages[i] = adv_i * effective_mask[i]
         
-        # Advantage clipping
-        adv_nonzero = advantages[advantages != 0]
-        adv_before_clip_min = adv_nonzero.min().item() if adv_nonzero.numel() > 0 else 0.0
-        adv_before_clip_max = adv_nonzero.max().item() if adv_nonzero.numel() > 0 else 0.0
-        if clip_adv:
-            advantages = torch.clamp(advantages, min=-clip_adv_value, max=clip_adv_value)
-        
+        # 用 effective_mask 精确标识有效 token（而非 advantages != 0）
+        valid_mask = effective_mask.bool()
+        valid_adv = advantages[valid_mask]
+
+        # Advantage clipping：只对有效 token 做 clip，padding/skipped 保持 0
+        adv_before_clip_min = valid_adv.min().item() if valid_adv.numel() > 0 else 0.0
+        adv_before_clip_max = valid_adv.max().item() if valid_adv.numel() > 0 else 0.0
+        if clip_adv and valid_adv.numel() > 0:
+            clipped = torch.clamp(advantages, min=-clip_adv_value, max=clip_adv_value)
+            # 只替换有效位置，padding 保持 0
+            advantages = torch.where(valid_mask, clipped, advantages)
+
         # 打印汇总统计
         total_groups = len(uid_to_indices)
-        adv_final = advantages[advantages != 0]
+        adv_final = advantages[valid_mask]
         print(f"[TASD Debug] Summary: {processed_groups}/{total_groups} groups processed, "
               f"{skipped_groups}/{total_groups} groups skipped | "
               f"norm_adv_by_std={norm_adv_by_std}, clip_adv={clip_adv}({clip_adv_value})")
