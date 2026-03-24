@@ -18,7 +18,7 @@ CLUSTER_FILE="nebula_scripts/cluster_gpu_4.json"
 SCRIPT_PATH="nebula_scripts/grpo/grpo_sciknoweval_parametric.sh"
 # 自定义镜像（留空则使用 --algo_name=pytorch260 默认镜像）
 CUSTOM_DOCKER_IMAGE="${CUSTOM_DOCKER_IMAGE:-hub.docker.alibaba-inc.com/mdl/notebook_saved:loujieming.ljm_yueqiu_sdpo_env_torch260_20260324155942}"
-PROJECT_NAME="TASD"
+PROJECT_NAME="TASD_para_search"
 
 DRY_RUN=false
 if [ $# -gt 0 ] && [[ "$1" == "--dry-run" ]]; then

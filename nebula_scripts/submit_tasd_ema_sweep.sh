@@ -21,7 +21,7 @@ OSS_BUCKET="lazada-ai-model"
 CUSTOM_DOCKER_IMAGE="${CUSTOM_DOCKER_IMAGE:-hub.docker.alibaba-inc.com/mdl/notebook_saved:loujieming.ljm_yueqiu_sdpo_env_torch260_20260324155942}"
 CLUSTER_FILE="nebula_scripts/cluster_gpu_4.json"    # 4 GPU
 SCRIPT_PATH="nebula_scripts/tasd/tasd_sciknoweval_parametric.sh"
-PROJECT_NAME="TASD"
+PROJECT_NAME="TASD_para_search"
 
 # ── dry-run 模式 ─────────────────────────────────────────────────────────
 DRY_RUN=false
@@ -49,7 +49,7 @@ ENTROPY_COEFF_LIST=(
 )
 TEACHER_REGULARIZATION_LIST=(
     "ema" 
-    # "none"
+    "none"
 )
 TEACHER_UPDATE_RATE_LIST=(
     "0.0" 
