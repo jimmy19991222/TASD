@@ -27,6 +27,8 @@ OSS_ACCESS_ID="${OSS_ACCESS_ID:?OSS_ACCESS_ID not set}"
 OSS_ACCESS_KEY="${OSS_ACCESS_KEY:?OSS_ACCESS_KEY not set}"
 OSS_ENDPOINT="oss-cn-hangzhou-zmf.aliyuncs.com"
 OSS_BUCKET="lazada-ai-model"
+# 自定义镜像（留空则使用 --algo_name=pytorch260 默认镜像）
+CUSTOM_DOCKER_IMAGE="${CUSTOM_DOCKER_IMAGE:-hub.docker.alibaba-inc.com/mdl/notebook_saved:loujieming.ljm_yueqiu_sdpo_env_torch260_20260324105345}"
 
 # ── 训练脚本路径 ───────────────────────────────────────────────────────────
 script_dir_path="${1:-nebula_scripts/tasd/tasd_sciknoweval_qwen3_8B.sh}"
@@ -54,6 +56,7 @@ echo "  节点数     : $WORLD_SIZE"
 echo "  队列       : $QUEUE"
 echo "  任务名     : $JOB_NAME"
 echo "  Cluster    : $CLUSTER_FILE"
+[ -n "$CUSTOM_DOCKER_IMAGE" ] && echo "  镜像       : $CUSTOM_DOCKER_IMAGE"
 echo "============================================================"
 
 SUBMIT_OUTPUT=$(nebulactl run mdl \
@@ -68,7 +71,7 @@ SUBMIT_OUTPUT=$(nebulactl run mdl \
     --access_id=${access_id} \
     --access_key=${access_key} \
     --env=OPENLM_TOKEN=${OPENLM_TOKEN} \
-    --algo_name=pytorch260 \
+    $([ -n "$CUSTOM_DOCKER_IMAGE" ] && echo "--custom_docker_image=${CUSTOM_DOCKER_IMAGE}" || echo "--algo_name=pytorch260") \
     --requirements_file_name=requirements_nebula.txt \
     --oss_access_id=${OSS_ACCESS_ID} \
     --oss_access_key=${OSS_ACCESS_KEY} \

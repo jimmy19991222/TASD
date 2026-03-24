@@ -44,6 +44,7 @@ python -m verl.trainer.main_ppo \
     data.val_files="${val_data_path}" \
     custom_reward_function.path="$(pwd)/verl/utils/reward_score/feedback/__init__.py" \
     actor_rollout_ref.model.path="${model_path}" \
+    ++actor_rollout_ref.model.override_config.attn_implementation=flash_attention_3 \
     actor_rollout_ref.actor.optim.lr=${LR} \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     actor_rollout_ref.actor.ppo_mini_batch_size=32 \

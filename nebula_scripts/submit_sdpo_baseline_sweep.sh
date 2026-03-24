@@ -16,6 +16,8 @@ OSS_ENDPOINT="oss-cn-hangzhou-zmf.aliyuncs.com"
 OSS_BUCKET="lazada-ai-model"
 CLUSTER_FILE="nebula_scripts/cluster_gpu_4.json"
 SCRIPT_PATH="nebula_scripts/sdpo/sdpo_sciknoweval_parametric.sh"
+# 自定义镜像（留空则使用 --algo_name=pytorch260 默认镜像）
+CUSTOM_DOCKER_IMAGE="${CUSTOM_DOCKER_IMAGE:-hub.docker.alibaba-inc.com/mdl/notebook_saved:loujieming.ljm_yueqiu_sdpo_env_torch260_20260324105345}"
 
 DRY_RUN=false
 if [ $# -gt 0 ] && [[ "$1" == "--dry-run" ]]; then
@@ -90,7 +92,7 @@ for DONT_REPROMPT in "${DONT_REPROMPT_LIST[@]}"; do
             --env=DONT_REPROMPT_ON_SELF_SUCCESS=${DONT_REPROMPT} \
             --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} \
             --env=ROLLOUT_N=${ROLLOUT_N} \
-            --algo_name=pytorch260 \
+            $([ -n "$CUSTOM_DOCKER_IMAGE" ] && echo "--custom_docker_image=${CUSTOM_DOCKER_IMAGE}" || echo "--algo_name=pytorch260") \
             --requirements_file_name=requirements_nebula.txt \
             --oss_access_id=${OSS_ACCESS_ID} \
             --oss_access_key=${OSS_ACCESS_KEY} \

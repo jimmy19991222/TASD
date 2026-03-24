@@ -17,6 +17,8 @@ OSS_ACCESS_ID="${OSS_ACCESS_ID:?OSS_ACCESS_ID not set}"
 OSS_ACCESS_KEY="${OSS_ACCESS_KEY:?OSS_ACCESS_KEY not set}"
 OSS_ENDPOINT="oss-cn-hangzhou-zmf.aliyuncs.com"
 OSS_BUCKET="lazada-ai-model"
+# 自定义镜像（留空则使用 --algo_name=pytorch260 默认镜像）
+CUSTOM_DOCKER_IMAGE="${CUSTOM_DOCKER_IMAGE:-hub.docker.alibaba-inc.com/mdl/notebook_saved:loujieming.ljm_yueqiu_sdpo_env_torch260_20260324105345}"
 CLUSTER_FILE="nebula_scripts/cluster_gpu_4.json"    # 4 GPU
 SCRIPT_PATH="nebula_scripts/tasd/tasd_sciknoweval_parametric.sh"
 
@@ -129,7 +131,7 @@ for TEACHER_UPDATE_RATE in "${TEACHER_UPDATE_RATE_LIST[@]}"; do
             --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} \
             --env=MINI_BATCH_SIZE=${MINI_BATCH_SIZE} \
             --env=ROLLOUT_N=${ROLLOUT_N} \
-            --algo_name=pytorch260 \
+            $([ -n "$CUSTOM_DOCKER_IMAGE" ] && echo "--custom_docker_image=${CUSTOM_DOCKER_IMAGE}" || echo "--algo_name=pytorch260") \
             --requirements_file_name=requirements_nebula.txt \
             --oss_access_id=${OSS_ACCESS_ID} \
             --oss_access_key=${OSS_ACCESS_KEY} \

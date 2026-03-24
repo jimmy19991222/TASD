@@ -24,6 +24,19 @@ echo "SCRIPT_PATH = $SCRIPT_PATH"
 echo "WORLD_SIZE  = $WORLD_SIZE"
 echo "JOB_NAME    = $JOB_NAME"
 
+# ── 激活自定义 conda 环境（若存在）───────────────────────────────
+# 必须在 Ray start 之前激活，让 Ray worker 继承正确的 Python 环境
+CONDA_ENV_NAME="sdpo_env"
+CONDA_ENV_BIN="${HOME}/.conda/envs/${CONDA_ENV_NAME}/bin"
+if [ -d "${CONDA_ENV_BIN}" ]; then
+    source /opt/conda/bin/activate 2>/dev/null || true
+    conda activate "${CONDA_ENV_NAME}" 2>/dev/null || true
+    export PATH="${CONDA_ENV_BIN}:${PATH}"
+    echo "Activated conda env: ${CONDA_ENV_NAME} (${CONDA_ENV_BIN})"
+else
+    echo "[WARN] conda env '${CONDA_ENV_NAME}' not found at ${CONDA_ENV_BIN}, using system Python"
+fi
+
 # ── 在 ray start 之前设置环境变量 ──
 # Ray worker 进程从 ray daemon 继承环境变量，必须在 ray start 前设置
 
