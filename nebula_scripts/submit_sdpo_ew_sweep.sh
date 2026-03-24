@@ -104,6 +104,7 @@ for EW_VER in "${ENTROPY_WEIGHTING_VERSION_LIST[@]}"; do
             --access_id=${access_id} \
             --access_key=${access_key} \
             --env=OPENLM_TOKEN=${OPENLM_TOKEN} \
+            --env=SWANLAB_API_KEY=${SWANLAB_API_KEY:?SWANLAB_API_KEY not set} \
             --env=JOB_NAME=${JOB_NAME} \
             --env=DATASET=${DATASET} \
             --env=MODEL_NAME=${MODEL_NAME} \

@@ -35,7 +35,7 @@ export VLLM_LOGGING_LEVEL=WARN
 export WANDB_MODE=offline
 export WANDB_ENTITY=oh-my-team
 export SWANLAB_MODE=cloud
-export SWANLAB_API_KEY=M5oC00EEt8G1wC0XaHkal
+export SWANLAB_API_KEY="${SWANLAB_API_KEY:?SWANLAB_API_KEY not set}"
 export SWANLAB_LOG_DIR="${OSS_ROOT}/logs/swanlab_logs"
 export TORCH_WARN_ACCUMULATE_GRAD_STREAM=0
 
