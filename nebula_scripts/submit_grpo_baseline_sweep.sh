@@ -91,7 +91,7 @@ for MINI_BATCH_SIZE in "${MINI_BATCH_SIZES[@]}"; do
             --access_id=${access_id} \
             --access_key=${access_key} \
             --env=OPENLM_TOKEN=${OPENLM_TOKEN} \
-            --env=SWANLAB_API_KEY=${SWANLAB_API_KEY:?SWANLAB_API_KEY not set} \
+            --env=SWANLAB_API_KEY=${SWANLAB_API_KEY} \
             --env=PROJECT_NAME=${PROJECT_NAME} \
             --env=JOB_NAME=${JOB_NAME} \
             --env=DATASET=${DATASET} \
