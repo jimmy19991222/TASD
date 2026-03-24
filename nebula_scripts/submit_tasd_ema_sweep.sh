@@ -50,7 +50,7 @@ ENTROPY_COEFF_LIST=(
 )
 TEACHER_REGULARIZATION_LIST=(
     "ema" 
-    # "none"
+    "none"
 )
 TEACHER_UPDATE_RATE_LIST=(
     "0.0" 

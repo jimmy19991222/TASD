@@ -67,10 +67,8 @@ export VLLM_USE_V1=1
 export VLLM_LOGGING_LEVEL=WARN
 export TORCH_WARN_ACCUMULATE_GRAD_STREAM=0
 
-# 5. SwanLab 配置（SWANLAB_API_KEY 由 nebulactl --env 注入，此处显式 export 确保子进程继承）
-if [ -n "${SWANLAB_API_KEY:-}" ]; then
-    export SWANLAB_API_KEY="${SWANLAB_API_KEY}"
-fi
+# 5. SwanLab 配置（fallback 到硬编码 key，确保 Ray worker 进程继承）
+export SWANLAB_API_KEY="${SWANLAB_API_KEY:-M5oC00EEt8G1wC0XaHkal}"
 
 echo "PYTHONPATH = $PYTHONPATH"
 
