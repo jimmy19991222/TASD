@@ -2637,6 +2637,37 @@ def compute_tasd_token_rewards(
         teacher_prob_t = teacher_log_probs.exp()                                   # (B, T) ∈ (0,1)
         reward = teacher_prob_t * kl_per_token                                     # (B, T) ≥ 0
 
+    elif reward_type == "teacher_prob_jsd_weighted":
+        # teacher_prob[sampled_token] × JSD(teacher, student)，在 topk 子空间上近似
+        # 语义：teacher 认可度 × 对称分歧程度
+        # 优势：JSD 天然有界 [0, log2≈0.693]，量级稳定，无需额外压缩
+        # 平衡点：student=teacher 时 JSD=0，reward→0，防止 collapse
+        assert student_topk_log_probs is not None, \
+            "teacher_prob_jsd_weighted requires student_topk_log_probs (set distill_topk)"
+        assert teacher_topk_log_probs is not None, \
+            "teacher_prob_jsd_weighted requires teacher_topk_log_probs (set distill_topk)"
+        teacher_topk_probs = teacher_topk_log_probs.exp()                         # (B, T, K)
+        student_topk_probs = student_topk_log_probs.exp()                         # (B, T, K)
+        # mixture M = 0.5 * (p_teacher + p_student)
+        mixture_probs = 0.5 * (teacher_topk_probs + student_topk_probs)           # (B, T, K)
+        log_mixture  = torch.log(mixture_probs.clamp(min=1e-10))                  # (B, T, K)
+        kl_t = (teacher_topk_probs * (teacher_topk_log_probs - log_mixture)).sum(dim=-1)  # (B, T)
+        kl_s = (student_topk_probs * (student_topk_log_probs - log_mixture)).sum(dim=-1)  # (B, T)
+        jsd_per_token = (0.5 * kl_t + 0.5 * kl_s).clamp(min=0.0)                # (B, T) ∈ [0, log2]
+        teacher_prob_t = teacher_log_probs.exp()                                   # (B, T) ∈ (0,1)
+        reward = teacher_prob_t * jsd_per_token                                    # (B, T) ∈ [0, log2]
+
+    elif reward_type == "teacher_prob_diff_weighted":
+        # teacher_prob[sampled_token] × (teacher_prob - student_prob).clamp(0)
+        # 语义：teacher 认可度 × teacher 比 student 更倾向该 token 的程度
+        # 优势：无需 topk，只用 token-level 概率，计算最简单
+        # 平衡点：teacher_prob == student_prob 时权重=0，reward→0
+        # teacher 更认可但 student 没跟上的位置 → 权重高 → 有效纠正
+        teacher_prob_t  = teacher_log_probs.exp()                                  # (B, T) ∈ (0,1)
+        student_prob_t  = student_log_probs.exp()                                  # (B, T) ∈ (0,1)
+        prob_diff = (teacher_prob_t - student_prob_t).clamp(min=0.0)              # (B, T) ≥ 0
+        reward = teacher_prob_t * prob_diff                                        # (B, T) ≥ 0
+
     else:
         assert student_topk_log_probs is not None and \
                teacher_topk_log_probs is not None

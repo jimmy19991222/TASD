@@ -41,7 +41,9 @@ REWARD_TYPES=(
     # "top1_match"
     # "student_topk_teacher_prob"           # student topk 位置上 teacher prob 均值，更平滑
     # "student_topk_teacher_prob_weighted"  # student prob 加权的 teacher prob，双向对称
-    "teacher_prob_kl_weighted"            # teacher认可度 × KL(teacher∥student)，分歧大才给强信号，有平衡点
+    # "teacher_prob_kl_weighted"            # teacher认可度 × KL(teacher∥student)，分歧大才给强信号，有平衡点
+    "teacher_prob_jsd_weighted"           # teacher认可度 × JSD(teacher,student)，对称分歧，天然有界[0,log2]
+    "teacher_prob_diff_weighted"          # teacher认可度 × (teacher_prob-student_prob).clamp(0)，最简单，无需topk
 )
 LRS=(
     "1e-5"
