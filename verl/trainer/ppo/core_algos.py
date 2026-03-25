@@ -2617,6 +2617,26 @@ def compute_tasd_token_rewards(
         teacher_topk_probs = teacher_topk_log_probs.exp()                         # (B, T, K)
         reward = (student_topk_probs * teacher_topk_probs).sum(dim=-1)            # (B, T) ∈ (0,1)
 
+    elif reward_type == "teacher_prob_kl_weighted":
+        # teacher_prob[sampled_token] × KL(teacher ∥ student)，在 topk 子空间上近似
+        # 语义：teacher 认可度 × teacher-student 分歧程度
+        # 分歧大（student 还没学到 teacher 的判断）→ 权重高 → 有效纠正信号
+        # 分歧小（已对齐）→ 权重趋近 0 → 自然平衡，防止 collapse
+        # 关键优势：student 确定但方向错误时（KL 高），依然给予强信号
+        assert student_topk_log_probs is not None, \
+            "teacher_prob_kl_weighted requires student_topk_log_probs (set distill_topk)"
+        assert teacher_topk_log_probs is not None, \
+            "teacher_prob_kl_weighted requires teacher_topk_log_probs (set distill_topk)"
+        teacher_topk_probs = teacher_topk_log_probs.exp()                         # (B, T, K)
+        # KL(teacher ∥ student) = Σ p_teacher × (log p_teacher - log p_student)
+        # 在 student topk 子空间上近似计算，天然截断尾部保证数值稳定
+        kl_per_token = (teacher_topk_probs * (
+            teacher_topk_log_probs - student_topk_log_probs
+        )).sum(dim=-1).clamp(min=0.0)                                              # (B, T) ≥ 0
+        # teacher 在采样 token 上的认可度
+        teacher_prob_t = teacher_log_probs.exp()                                   # (B, T) ∈ (0,1)
+        reward = teacher_prob_t * kl_per_token                                     # (B, T) ≥ 0
+
     else:
         assert student_topk_log_probs is not None and \
                teacher_topk_log_probs is not None

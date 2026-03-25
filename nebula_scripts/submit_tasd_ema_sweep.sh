@@ -39,8 +39,9 @@ REWARD_TYPES=(
     # "teacher_prob"
     # "log_teacher_prob"
     # "top1_match"
-    "student_topk_teacher_prob"           # 新增：student topk 位置上 teacher prob 均值，更平滑
-    "student_topk_teacher_prob_weighted"  # 新增：student prob 加权的 teacher prob，双向对称
+    # "student_topk_teacher_prob"           # student topk 位置上 teacher prob 均值，更平滑
+    # "student_topk_teacher_prob_weighted"  # student prob 加权的 teacher prob，双向对称
+    "teacher_prob_kl_weighted"            # teacher认可度 × KL(teacher∥student)，分歧大才给强信号，有平衡点
 )
 LRS=(
     "1e-5"
@@ -50,10 +51,10 @@ ENTROPY_COEFF_LIST=(
     # "0.0"
     # "0.01"
     # "0.03"
-    # "0.05"
+    "0.05"
     # "0.1"   # 上轮实验：entropy 早期崩溃（~0.016），val mean@16 < 0.41，效果差
     # "0.5"    # 本轮：大幅提升，防止早期 entropy 崩溃
-    "1.0"    # 本轮：激进版，进一步抑制坍缩
+    # "1.0"    # 本轮：激进版，进一步抑制坍缩
 )
 TEACHER_REGULARIZATION_LIST=(
     # "none"   # 先跑无 EMA 的干净基线，排除 EMA 的影响
