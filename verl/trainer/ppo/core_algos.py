@@ -2543,6 +2543,13 @@ def compute_tasd_token_rewards(
         teacher_prob_t = teacher_log_probs.exp().clamp(min=1e-6, max=1 - 1e-6)    # (B, T) 防止边界
         reward = torch.log(teacher_prob_t / (1.0 - teacher_prob_t))               # (B, T) ∈ (-∞, +∞)
 
+    elif reward_type == "teacher_log_prob":
+        # Token-level reward：直接使用 teacher 对每个 token 的 log_prob
+        # 语义：teacher 对该 token 的认可度（log 域），值域 (-∞, 0]
+        # 与 teacher_seq_log_prob 的区别：保留 token 粒度差异，不做 seq 聚合
+        # advantage 走 TASD 路径（token-level group 归一化），group mean 来自所有 token 的 log_prob 均值
+        reward = teacher_log_probs  # (B, T)
+
     elif reward_type == "teacher_seq_log_prob":
         # Sequence-level reward：每条 response 的平均 teacher log_prob，广播回 token 维度
         # 语义：teacher 对整条 response 的平均认可度（log 域），避免连乘导致数值下溢

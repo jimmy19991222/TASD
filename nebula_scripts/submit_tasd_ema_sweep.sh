@@ -32,24 +32,22 @@ fi
 
 # =============================================================================
 # 超参配置
-# 尝试 teacher_prob + NORM_ADV_BY_STD=True，对比之前 nostd 版本
-# 目标：验证 std 归一化能否改善 entropy 崩溃
+# 尝试 teacher_log_prob（token-level log_prob），对比 teacher_seq_log_prob（seq-level）
 # =============================================================================
 REWARD_TYPES=(
-    "teacher_prob"                        # 历史最优 reward type
-    # "teacher_seq_log_prob"              # seq-level 方案
+    "teacher_log_prob"              # token-level log_prob，新增类型
 )
 LRS=(
     "1e-5"
 )
 ENTROPY_COEFF_LIST=(
-    "1.0"    # 历史最优 entropy_coeff
+    "0.05"   # 与 seqlp 实验保持一致，方便对比
 )
 TEACHER_REGULARIZATION_LIST=(
     "ema"
 )
 TEACHER_UPDATE_RATE_LIST=(
-    "0.1"    # 历史最优 update_rate
+    "0.1"
 )
 
 # 固定参数（不扫描）
