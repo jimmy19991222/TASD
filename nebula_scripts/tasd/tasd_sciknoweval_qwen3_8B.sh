@@ -99,6 +99,8 @@ python -m verl.trainer.main_ppo \
     algorithm.rollout_correction.rollout_is=token \
     trainer.total_epochs=30 \
     trainer.total_training_steps=${total_training_steps} \
+    trainer.save_freq=-1 \
+    trainer.save_best_metric="val-core/sciknoweval/acc/mean@16" \
     trainer.n_gpus_per_node=${n_gpus_per_node} \
     trainer.val_before_train=False \
     trainer.default_local_dir="${save_path}" \

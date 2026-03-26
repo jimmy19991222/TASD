@@ -1242,6 +1242,61 @@ class RayPPOTrainer:
             rm_resource_pool=rm_resource_pool,
         )
 
+    def _get_best_metric_value(self, val_metrics: dict):
+        """Extract the metric value used for best checkpoint tracking.
+
+        Priority:
+        1. trainer.save_best_metric (explicit config)
+        2. First key containing 'mean@' in val-core namespace
+        3. First key containing 'mean@' in any namespace
+        Returns None if no suitable metric found.
+        """
+        explicit = self.config.trainer.get("save_best_metric", None)
+        if explicit:
+            return val_metrics.get(explicit, None), explicit
+        # auto-detect: prefer val-core/*mean@*
+        for k, v in val_metrics.items():
+            if "val-core" in k and "mean@" in k:
+                return v, k
+        for k, v in val_metrics.items():
+            if "mean@" in k:
+                return v, k
+        return None, None
+
+    def _maybe_save_best_checkpoint(self, val_metrics: dict):
+        """Save best checkpoint when the monitored metric improves."""
+        metric_val, metric_key = self._get_best_metric_value(val_metrics)
+        if metric_val is None:
+            return
+        if self._best_val_metric is None or metric_val > self._best_val_metric:
+            self._best_val_metric = metric_val
+            print(
+                f"[BestCkpt] New best {metric_key}={metric_val:.4f} at step {self.global_steps}, saving best checkpoint."
+            )
+            self._save_best_checkpoint()
+
+    def _save_best_checkpoint(self):
+        """Save actor checkpoint to <default_local_dir>/best/actor, always overwriting."""
+        from verl.utils.fs import local_mkdir_safe
+
+        best_folder = os.path.join(self.config.trainer.default_local_dir, "best")
+        actor_local_path = os.path.join(best_folder, "actor")
+        actor_remote_path = (
+            None
+            if self.config.trainer.default_hdfs_dir is None
+            else os.path.join(self.config.trainer.default_hdfs_dir, "best", "actor")
+        )
+        # max_ckpt_to_keep=1 ensures old best is removed when a new best arrives
+        self.actor_rollout_wg.save_checkpoint(
+            actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=1
+        )
+        # write a metadata file so we know which step the best is from
+        local_mkdir_safe(best_folder)
+        best_meta_path = os.path.join(best_folder, "best_step.txt")
+        with open(best_meta_path, "w") as f:
+            f.write(f"step={self.global_steps}\nbest_metric={self._best_val_metric}\n")
+        print(f"[BestCkpt] Best checkpoint saved to {best_folder}")
+
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
 
@@ -1640,6 +1695,7 @@ class RayPPOTrainer:
         )
 
         self.global_steps = 0
+        self._best_val_metric = None  # track best val metric for best checkpoint saving
 
         # load checkpoint before doing anything
         self._load_checkpoint()
@@ -2053,6 +2109,8 @@ class RayPPOTrainer:
                         if is_last_step:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
+                    # save best checkpoint if val metric improved
+                    self._maybe_save_best_checkpoint(val_metrics)
 
                 # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                 esi_close_to_expiration = should_save_ckpt_esi(

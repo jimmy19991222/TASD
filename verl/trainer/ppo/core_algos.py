@@ -2534,6 +2534,15 @@ def compute_tasd_token_rewards(
     elif reward_type == "teacher_prob":
         reward = teacher_log_probs.exp()  # (B, T) ∈ (0,1)
 
+    elif reward_type == "teacher_logit":
+        # logit(teacher_prob) = log(p / (1-p))
+        # 将 teacher_prob 从 [0,1] 映射到 (-∞, +∞)，在 p→1 区间大幅拉伸差异
+        # p=0.90 → 2.20, p=0.95 → 2.94, p=0.99 → 4.60
+        # 相比 teacher_prob 直接使用，group 内方差扩大约 20 倍
+        # 配合 compute_tasd_advantage 的 group_mean 归一化后有正有负，缓解 collapse
+        teacher_prob_t = teacher_log_probs.exp().clamp(min=1e-6, max=1 - 1e-6)    # (B, T) 防止边界
+        reward = torch.log(teacher_prob_t / (1.0 - teacher_prob_t))               # (B, T) ∈ (-∞, +∞)
+
     elif reward_type == "log_teacher_prob":
         # log空间的teacher认可度，∈ (-∞, 0]，在接近1.0时放大微小差异，抗饱和
         reward = teacher_log_probs  # (B, T)
