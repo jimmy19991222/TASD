@@ -2543,9 +2543,19 @@ def compute_tasd_token_rewards(
         teacher_prob_t = teacher_log_probs.exp().clamp(min=1e-6, max=1 - 1e-6)    # (B, T) 防止边界
         reward = torch.log(teacher_prob_t / (1.0 - teacher_prob_t))               # (B, T) ∈ (-∞, +∞)
 
-    elif reward_type == "log_teacher_prob":
-        # log空间的teacher认可度，∈ (-∞, 0]，在接近1.0时放大微小差异，抗饱和
-        reward = teacher_log_probs  # (B, T)
+    elif reward_type == "teacher_seq_log_prob":
+        # Sequence-level reward：每条 response 的平均 teacher log_prob，广播回 token 维度
+        # 语义：teacher 对整条 response 的平均认可度（log 域），避免连乘导致数值下溢
+        # 值域：(-∞, 0]，典型值 -2.0 ~ -0.3
+        # advantage 走 GRPO 路径（sequence-level group 归一化），天然有正有负，根本解决 entropy 崩溃
+        # 注意：response_mask 在 ray_trainer.py 中已乘，这里只做 seq 均值广播
+        # seq_score shape: (B,)
+        seq_score = teacher_log_probs  # (B, T)，padding 已被 response_mask 置 0
+        # 此处返回 token-level shape，每行值相同（seq mean 广播）
+        # 实际 seq mean 在 ray_trainer.py 计算后广播，这里直接返回原始 log_probs
+        # ray_trainer.py 会在 compute_advantage 前将 token_level_rewards 替换为广播的 seq_score
+        reward = seq_score  # 占位，实际 seq-level 处理在 ray_trainer.py
+
 
     elif reward_type == "teacher_prob_relative":
         assert teacher_topk_log_probs is not None

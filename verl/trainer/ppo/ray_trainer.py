@@ -1997,6 +1997,15 @@ class RayPPOTrainer:
                             response_mask_float = batch.batch["response_mask"].float()
                             token_rewards = token_rewards * response_mask_float
 
+                            # teacher_seq_log_prob: 将 token-level reward 折叠为 sequence-level outcome reward
+                            # 每条 response 用自身平均 log_prob 作为身份标签，广播回所有 token
+                            # advantage 利用 GRPO 的 sequence-level 归一化，天然有正有负
+                            if tasd_reward_type == "teacher_seq_log_prob":
+                                resp_len = response_mask_float.sum(-1).clamp(min=1)  # (B,)
+                                seq_score = (token_rewards * response_mask_float).sum(-1) / resp_len  # (B,)
+                                # 广播回 (B, T)，每条 response 的所有 token 唃同一个标量
+                                token_rewards = seq_score.unsqueeze(-1).expand_as(response_mask_float) * response_mask_float
+
                             verifier_rewards = batch.batch["token_level_rewards"].clone()
                             batch.batch["verifier_token_rewards"] = verifier_rewards
 
@@ -2062,9 +2071,16 @@ class RayPPOTrainer:
                             metrics.update(is_metrics)
 
                         # Step4: compute advantage
+                        # teacher_seq_log_prob 已将 token_level_rewards 替换为 seq-level 广播形式
+                        # 直接走 GRPO 的 sequence-level 归一化路径
+                        _adv_estimator = (
+                            AdvantageEstimator.GRPO
+                            if is_tasd and tasd_reward_type == "teacher_seq_log_prob"
+                            else self.config.algorithm.adv_estimator
+                        )
                         batch = compute_advantage(
                             batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
+                            adv_estimator=_adv_estimator,
                             gamma=self.config.algorithm.gamma,
                             lam=self.config.algorithm.lam,
                             num_repeat=self.config.actor_rollout_ref.rollout.n,
@@ -2078,6 +2094,43 @@ class RayPPOTrainer:
                             metrics["tasd/advantage_mean"]     = valid_adv.mean().item()
                             metrics["tasd/advantage_std"]      = valid_adv.std().item()
                             metrics["tasd/advantage_pos_rate"] = (valid_adv > 0).float().mean().item()
+
+                            # adv vs verifier 对齐监控
+                            # 用每条 response 的 advantage 均值作为 sequence-level adv 符号
+                            _resp_mask = batch.batch["response_mask"].float()  # (B, T)
+                            _adv_2d    = batch.batch["advantages"]             # (B, T)
+                            _resp_len  = _resp_mask.sum(-1).clamp(min=1)       # (B,)
+                            _seq_adv   = (_adv_2d * _resp_mask).sum(-1) / _resp_len  # (B,) sequence-level adv mean
+
+                            _acc = None
+                            if "acc" in batch.batch:
+                                _acc = batch.batch["acc"].float()
+                            elif "acc" in batch.non_tensor_batch:
+                                _acc = torch.tensor(
+                                    batch.non_tensor_batch["acc"],
+                                    dtype=torch.float32,
+                                    device=_seq_adv.device,
+                                )
+
+                            if _acc is not None:
+                                _adv_pos = (_seq_adv > 0)          # teacher 认为好
+                                _adv_neg = (_seq_adv <= 0)         # teacher 认为差
+                                _ver_pos = (_acc >= tasd_success_threshold)   # verifier 认为对
+                                _ver_neg = (~_ver_pos)             # verifier 认为错
+                                n = float(_seq_adv.shape[0])
+
+                                # adv 正 & verifier 正（同向正）
+                                metrics["tasd/adv_pos_ver_pos_rate"] = (_adv_pos & _ver_pos).float().sum().item() / n
+                                # adv 负 & verifier 负（同向负）
+                                metrics["tasd/adv_neg_ver_neg_rate"] = (_adv_neg & _ver_neg).float().sum().item() / n
+                                # 两者一致（同号）
+                                metrics["tasd/adv_ver_agree_rate"]   = (
+                                    (_adv_pos & _ver_pos) | (_adv_neg & _ver_neg)
+                                ).float().mean().item()
+                                # 冲突：adv 正但 verifier 负（teacher 认可但答错）
+                                metrics["tasd/adv_pos_ver_neg_rate"] = (_adv_pos & _ver_neg).float().sum().item() / n
+                                # 冲突：adv 负但 verifier 正（teacher 不认可但答对）
+                                metrics["tasd/adv_neg_ver_pos_rate"] = (_adv_neg & _ver_pos).float().sum().item() / n
 
                     # update critic
                     if self.use_critic:

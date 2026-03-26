@@ -103,7 +103,13 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
             - num_turns/mean, max, min: Statistics about the number of multi-turn conversations
     """
     sequence_score = batch.batch["token_level_scores"].sum(-1)
-    sequence_reward = batch.batch["token_level_rewards"].sum(-1)
+    # Use masked mean for token-level rewards to make the metric comparable across
+    # different sequence lengths and algorithms (e.g., TASD token-level vs GRPO scalar).
+    # sum(-1) would inflate TASD rewards by ~500x (response length) vs GRPO scalar rewards.
+    _token_rewards = batch.batch["token_level_rewards"]
+    _resp_mask = batch.batch["response_mask"].float()
+    _resp_len = _resp_mask.sum(-1).clamp(min=1)
+    sequence_reward = (_token_rewards * _resp_mask).sum(-1) / _resp_len
 
     advantages = batch.batch["advantages"]
     returns = batch.batch["returns"]

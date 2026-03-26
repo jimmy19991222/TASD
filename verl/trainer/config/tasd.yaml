@@ -35,7 +35,8 @@ algorithm:
   adv_estimator: tasd
   norm_adv_by_std_in_grpo: False
   tasd:
-    reward_type: "teacher_prob"     # teacher_prob | log_ratio | vocab_log_ratio | forward_kl | reverse_kl | jsd | teacher_prob_relative | teacher_prob_certainty | top1_match | topk_match | student_topk_teacher_prob | student_topk_teacher_prob_weighted
+    reward_type: "teacher_prob"     # teacher_prob | log_ratio | vocab_log_ratio | forward_kl | reverse_kl | jsd | teacher_prob_relative | teacher_prob_certainty | top1_match | topk_match | student_topk_teacher_prob | student_topk_teacher_prob_weighted | teacher_logit | teacher_seq_log_prob
+                                   # teacher_seq_log_prob: sequence-level 平均 log_prob，走 GRPO advantage 路径，天然有正有负，根本解决 entropy 崩溃
     alpha: 0.5                     # jsd/kl类时生效：0.0=reverse_kl, 0.5=jsd, 1.0=forward_kl
     tail_correction: false         # K足够大时false，K较小时建议true
     distill_topk: 100              # vocab_log_ratio/jsd/kl类需要topk

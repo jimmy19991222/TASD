@@ -44,7 +44,8 @@ REWARD_TYPES=(
     # "teacher_prob_kl_weighted"            # teacher认可度 × KL(teacher∥student)，分歧大才给强信号，有平衡点
     # "teacher_prob_jsd_weighted"           # teacher认可度 × JSD(teacher,student)，对称分歧，天然有界[0,log2]
     # "teacher_prob_diff_weighted"          # teacher认可度 × (teacher_prob-student_prob).clamp(0)，最简单，无需topk
-    "teacher_logit"                       # logit(teacher_prob)，将[0,1]映射到(-∞,+∞)，方差扩大≈20倍，group内归一化后自然有正负
+    # "teacher_logit"                       # logit(teacher_prob)，将[0,1]映射到(-∞,+∞)，方差扩大≈20倍，group内归一化后自然有正负
+    "teacher_seq_log_prob"                # seq-level 平均 log_prob 作为 outcome reward，走 GRPO advantage 路径，天然有正有负，根本解决 entropy 崩溃
 )
 LRS=(
     "1e-5"
@@ -70,7 +71,7 @@ TEACHER_UPDATE_RATE_LIST=(
 )
 
 # 固定参数（不扫描）
-NORM_ADV_BY_STD="False"
+NORM_ADV_BY_STD="True"
 CLIP_ADV="True"
 CLIP_ADV_VALUE="5.0"
 ROLLOUT_IS="token"
@@ -117,8 +118,13 @@ for INCLUDE_SUCCESSFUL_ROLLOUTS in "${INCLUDE_SUCCESSFUL_ROLLOUTS_LIST[@]}"; do
         ISR_TAG="-isr0"
     fi
 
+    STD_TAG="-std"
+    if [ "$NORM_ADV_BY_STD" = "False" ]; then
+        STD_TAG="-nostd"
+    fi
+
     CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
-    JOB_NAME="TASD-bio-lr${LR}-rt${REWARD_TYPE}-nostd-clip5.0${ENT_TAG}-rctoken${ISR_TAG}${EMA_TAG}-Qwen3-8B-${CURRENT_TIME}"
+    JOB_NAME="TASD-bio-lr${LR}-rt${REWARD_TYPE}${STD_TAG}-clip5.0${ENT_TAG}-rctoken${ISR_TAG}${EMA_TAG}-Qwen3-8B-${CURRENT_TIME}"
 
     # ── 提交 ────────────────────────────────────────────────────────
     if [ "$DRY_RUN" = true ]; then
