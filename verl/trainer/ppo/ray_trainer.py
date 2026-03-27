@@ -2010,13 +2010,19 @@ class RayPPOTrainer:
                             token_rewards = token_rewards * response_mask_float
 
                             # teacher_seq_log_prob: 将 token-level reward 折叠为 sequence-level outcome reward
-                            # 每条 response 用自身平均 log_prob 作为身份标签，广播回所有 token
+                            # 每条 response 用自身平均 log_prob 作为 outcome score
                             # advantage 利用 GRPO 的 sequence-level 归一化，天然有正有负
+                            # 注意：GRPO 里 scores = token_level_rewards.sum(-1)，
+                            # 不能广播到所有 token（会乘以序列长度造成 adv 爆炸），
+                            # 正确做法：只在最后一个有效 token 位置放 seq_score，其余为 0
                             if tasd_reward_type == "teacher_seq_log_prob":
                                 resp_len = response_mask_float.sum(-1).clamp(min=1)  # (B,)
                                 seq_score = (token_rewards * response_mask_float).sum(-1) / resp_len  # (B,)
-                                # 广播回 (B, T)，每条 response 的所有 token 唃同一个标量
-                                token_rewards = seq_score.unsqueeze(-1).expand_as(response_mask_float) * response_mask_float
+                                # 找每条 response 最后一个有效 token 的位置
+                                last_token_idx = (response_mask_float.cumsum(-1) == resp_len.unsqueeze(-1)).float()  # (B, T) one-hot
+                                # 只在最后一个有效 token 位置放 seq_score，其余为 0
+                                # 这样 GRPO 的 scores = token_level_rewards.sum(-1) = seq_score，无长度偏差
+                                token_rewards = seq_score.unsqueeze(-1) * last_token_idx
 
                             verifier_rewards = batch.batch["token_level_rewards"].clone()
                             batch.batch["verifier_token_rewards"] = verifier_rewards
