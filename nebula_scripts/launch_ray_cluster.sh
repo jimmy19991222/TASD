@@ -20,31 +20,6 @@ done
 export WORLD_SIZE=$WORLD_SIZE
 export JOB_NAME=$JOB_NAME
 
-# ── export 所有超参环境变量（Nebula通过--env注入，必须显式export才能被bash子进程继承）──
-# 用 export VAR="$VAR" 而非 export VAR，确保从当前环境读取并重新标记为已导出
-# （纯 export VAR 在变量仅存在于环境而未被 shell 赋值时不生效）
-export REWARD_TYPE="$REWARD_TYPE"
-export LR="$LR"
-export ENTROPY_COEFF="$ENTROPY_COEFF"
-export TEACHER_REG="$TEACHER_REG"
-export TEACHER_UPDATE_RATE="$TEACHER_UPDATE_RATE"
-export NORM_ADV_BY_STD="$NORM_ADV_BY_STD"
-export CLIP_ADV="$CLIP_ADV"
-export CLIP_ADV_VALUE="$CLIP_ADV_VALUE"
-export ROLLOUT_IS="$ROLLOUT_IS"
-export TRAIN_BATCH_SIZE="$TRAIN_BATCH_SIZE"
-export MINI_BATCH_SIZE="$MINI_BATCH_SIZE"
-export ROLLOUT_N="$ROLLOUT_N"
-export INCLUDE_SUCCESSFUL_ROLLOUTS="$INCLUDE_SUCCESSFUL_ROLLOUTS"
-export PROJECT_NAME="$PROJECT_NAME"
-export DATASET="$DATASET"
-export MODEL_NAME="$MODEL_NAME"
-export ALPHA="$ALPHA"
-export DONT_REPROMPT_ON_SELF_SUCCESS="$DONT_REPROMPT_ON_SELF_SUCCESS"
-export ENTROPY_WEIGHTING="$ENTROPY_WEIGHTING"
-export ENTROPY_TEMPERATURE="$ENTROPY_TEMPERATURE"
-export ENTROPY_WEIGHTING_VERSION="$ENTROPY_WEIGHTING_VERSION"
-
 echo "SCRIPT_PATH = $SCRIPT_PATH"
 echo "WORLD_SIZE  = $WORLD_SIZE"
 echo "JOB_NAME    = $JOB_NAME"
@@ -103,8 +78,8 @@ echo "PYTHONPATH = $PYTHONPATH"
 clean_path() {
     echo "$1" | tr ':' '\n' | awk '!seen[$0]++' | tr '\n' ':' | sed 's/:$//'
 }
-export LD_LIBRARY_PATH=$(clean_path "$LD_LIBRARY_PATH")
-export PATH=$(clean_path "$PATH")
+export LD_LIBRARY_PATH=$(clean_path "$LD_LIBRARY_PATH") || true
+export PATH=$(clean_path "$PATH") || true
 
 # ========== 启动 Ray 集群 ==========
 if [ "$RANK" -eq 0 ]; then
