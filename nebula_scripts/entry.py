@@ -10,6 +10,9 @@ if __name__ == "__main__":
     parser.add_argument("--job_name", type=str, required=True)
     args = parser.parse_args()
 
+    print("[entry.py] DATASET=", os.environ.get("DATASET", "<NOT SET>"))
+    print("[entry.py] LR=", os.environ.get("LR", "<NOT SET>"))
+    print("[entry.py] REWARD_TYPE=", os.environ.get("REWARD_TYPE", "<NOT SET>"))
     cmd = [
         "bash",
         "nebula_scripts/launch_ray_cluster.sh",
