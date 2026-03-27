@@ -10,7 +10,7 @@ OSS_ROOT="/data/oss_bucket_0/ad/loujieming.ljm"
 
 # ── 从环境变量读取超参（均有默认值）─────────────────────────────────────
 # ── 从环境变量读取超参（必传，未设置时立即报错退出）─────────────────
-check_env() { [ -n "${!1}" ] || { echo "ERROR: $1 is not set. Aborting."; exit 1; }; }
+check_env() { val=$(eval echo "\$$1"); [ -n "$val" ] || { echo "ERROR: $1 is not set. Aborting."; exit 1; }; }
 check_env REWARD_TYPE
 check_env LR
 check_env ENTROPY_COEFF
