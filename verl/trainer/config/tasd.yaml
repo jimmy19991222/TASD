@@ -35,11 +35,12 @@ algorithm:
   adv_estimator: tasd
   norm_adv_by_std_in_grpo: False
   tasd:
-    reward_type: "teacher_prob"     # teacher_prob | log_ratio | vocab_log_ratio | forward_kl | reverse_kl | jsd | teacher_prob_relative | teacher_prob_certainty | top1_match | topk_match | student_topk_teacher_prob | student_topk_teacher_prob_weighted | teacher_logit | teacher_seq_log_prob | teacher_log_prob
+    reward_type: "teacher_prob"     # teacher_prob | teacher_prob_plus_verified | log_ratio | vocab_log_ratio | forward_kl | reverse_kl | jsd | teacher_prob_relative | teacher_prob_certainty | top1_match | topk_match | student_topk_teacher_prob | student_topk_teacher_prob_weighted | teacher_logit | teacher_seq_log_prob | teacher_log_prob | teacher_prob_binary
                                    # teacher_seq_log_prob: sequence-level 平均 log_prob，走 GRPO advantage 路径，天然有正有负，根本解决 entropy 崩溃
     alpha: 0.5                     # jsd/kl类时生效：0.0=reverse_kl, 0.5=jsd, 1.0=forward_kl
     tail_correction: false         # K足够大时false，K较小时建议true
     distill_topk: 100              # vocab_log_ratio/jsd/kl类需要topk
+    distill_temperature: 1.0       # teacher forward 的 softmax temperature（独立于 rollout temperature）；>1.0 使分布更平，reward 方差更大，避免 std 归一化爆炸
     include_successful_rollouts: true      # true=成功rollout也走TASD；false=成功rollout不走TASD
     use_self_as_teacher_on_success: true   # 成功rollout用自己的response作为teacher context
     success_reward_threshold: 1.0          # reward>=1.0视为成功，与self_distillation保持一致
@@ -49,6 +50,10 @@ algorithm:
     norm_adv_by_std: false                 # 是否除以group std归一化（teacher_prob∈[0,1]时建议false）
     clip_adv: true                         # 是否对advantage做clipping
     clip_adv_value: 5.0                    # clipping范围 [-v, v]
+    # ── Teacher-GAE（实验性）──
+    use_teacher_gae: false                 # true=用Teacher-GAE替代简单减group_mean；需要reward_type支持topk
+    teacher_gae_gamma: 1.0                 # GAE折扣因子（语言模型通常用1.0）
+    teacher_gae_lambda: 0.95               # GAE lambda（0=纯TD, 1=纯MC，0.95是常用折中）
 
 data:
   train_batch_size: 32

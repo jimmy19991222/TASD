@@ -1,9 +1,18 @@
 #!/bin/bash
 # =============================================================================
-# SDPO Baseline 超参扫描 - Nebula 批量提交
+# TASD distill_temperature sweep
 #
-# 参考 experiments/generalization/run_sdpo_all_local.sh
-# 使用方式：bash nebula_scripts/submit_sdpo_baseline_sweep.sh [--dry-run]
+# 基础配置：teacher_prob + std + clip1.0 + rctoken + isr1 + ema0.1
+# 参考实验：TASD-bio-lr1e-5-rtteacher_prob-std-clip1.0-rctoken-isr1-ema0.1-Qwen3-8B-20260327_211649
+#
+# 目标：验证提高 teacher forward temperature 能否增大 reward 方差，
+#       避免 std 归一化时 advantage 爆炸（critic/advantages/min 被 clip 到 -5）
+#
+# 扫描参数：
+#   DISTILL_TEMPERATURE ∈ {2.0, 3.0, 5.0}
+#   （1.0 = 原始对照，复用已有实验）
+#
+# 使用方式：bash nebula_scripts/submit_tasd_distill_temp_sweep.sh [--dry-run]
 # =============================================================================
 
 # ── Nebula 账号配置 ──────────────────────────────────────────────────────
@@ -14,12 +23,12 @@ OSS_ACCESS_ID="${OSS_ACCESS_ID:?OSS_ACCESS_ID not set}"
 OSS_ACCESS_KEY="${OSS_ACCESS_KEY:?OSS_ACCESS_KEY not set}"
 OSS_ENDPOINT="oss-cn-hangzhou-zmf.aliyuncs.com"
 OSS_BUCKET="lazada-ai-model"
-CLUSTER_FILE="nebula_scripts/cluster_gpu_4.json"
-SCRIPT_PATH="nebula_scripts/sdpo/sdpo_sciknoweval_parametric.sh"
-# 自定义镜像（留空则使用 --algo_name=pytorch260 默认镜像）
 CUSTOM_DOCKER_IMAGE="${CUSTOM_DOCKER_IMAGE:-hub.docker.alibaba-inc.com/mdl/notebook_saved:loujieming.ljm_yueqiu_sdpo_env_torch260_20260324155942}"
-PROJECT_NAME="Baselines"
+CLUSTER_FILE="nebula_scripts/cluster_gpu_4.json"
+SCRIPT_PATH="nebula_scripts/tasd/tasd_sciknoweval_parametric.sh"
+PROJECT_NAME="TASD_param_search"
 
+# ── dry-run ───────────────────────────────────────────────────────────────
 DRY_RUN=false
 if [ $# -gt 0 ] && [[ "$1" == "--dry-run" ]]; then
     DRY_RUN=true
@@ -27,58 +36,53 @@ if [ $# -gt 0 ] && [[ "$1" == "--dry-run" ]]; then
 fi
 
 # =============================================================================
-# 超参配置（与 run_sdpo_all_local.sh 保持一致）
+# 固定参数（与对照实验 clip1.0 保持一致）
 # =============================================================================
-DATASETS=(
-    "sciknoweval/biology"
-    "sciknoweval/chemistry"
-    "sciknoweval/material"
-    "sciknoweval/physics"
-    "tooluse"    # 如未上传到 OSS，注释此行
-)
-
-MODEL_NAMES=(
-    "Qwen3-8B"
-    # "Olmo-3-7B-Instruct"   # 如未上传到 OSS，注释此行
-)
-
-LRS=("1e-5")
-ALPHAS=("0.5")                         # 0=forward KL, 0.5=JS, 1=reverse KL
-DONT_REPROMPT_LIST=("True")
-
-# 固定参数
+REWARD_TYPE="teacher_prob"
+LR="1e-5"
+ENTROPY_COEFF="0.0"
+TEACHER_REG="ema"
+TEACHER_UPDATE_RATE="0.1"
+NORM_ADV_BY_STD="True"
+CLIP_ADV="True"
+CLIP_ADV_VALUE="2.0"
+ROLLOUT_IS="token"
 TRAIN_BATCH_SIZE="32"
+MINI_BATCH_SIZE="32"
 ROLLOUT_N="8"
+INCLUDE_SUCCESSFUL_ROLLOUTS="True"
+DISTILL_TOPK="100"
+
+# 扫描的 temperature 档位（1.0=对照已有，不重复提交）
+DISTILL_TEMPERATURES=("0.5" "2.0" "3.0")
 
 # =============================================================================
 TOTAL=0
 SUBMITTED=0
 
-for DATASET in "${DATASETS[@]}"; do
-for MODEL_NAME in "${MODEL_NAMES[@]}"; do
-for LR in "${LRS[@]}"; do
-for ALPHA in "${ALPHAS[@]}"; do
-for DONT_REPROMPT in "${DONT_REPROMPT_LIST[@]}"; do
+for DISTILL_TEMPERATURE in "${DISTILL_TEMPERATURES[@]}"; do
 
     TOTAL=$((TOTAL + 1))
-
-    DATASET_SHORT=$(echo "$DATASET" | tr '/' '-')
     CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
-    JOB_NAME="SDPO-${DATASET_SHORT}-train${TRAIN_BATCH_SIZE}-alpha${ALPHA}-lr${LR}-dross${DONT_REPROMPT}-${MODEL_NAME}-${CURRENT_TIME}"
+    JOB_NAME="TASD-bio-lr${LR}-rtteacher_prob-std-clip${CLIP_ADV_VALUE}-dtemp${DISTILL_TEMPERATURE}-rctoken-isr1-ema${TEACHER_UPDATE_RATE}-Qwen3-8B-${CURRENT_TIME}"
 
     if [ "$DRY_RUN" = true ]; then
         echo "------------------------------------------------------------"
         echo "Job #${TOTAL}: ${JOB_NAME}"
-        echo "  DATASET=$DATASET MODEL=$MODEL_NAME LR=$LR ALPHA=$ALPHA DONT_REPROMPT=$DONT_REPROMPT"
+        echo "  REWARD_TYPE=$REWARD_TYPE  LR=$LR  ENTROPY_COEFF=$ENTROPY_COEFF"
+        echo "  DISTILL_TEMPERATURE=$DISTILL_TEMPERATURE  DISTILL_TOPK=$DISTILL_TOPK"
+        echo "  NORM_ADV_BY_STD=$NORM_ADV_BY_STD  CLIP_ADV_VALUE=$CLIP_ADV_VALUE"
+        echo "  TEACHER_REG=$TEACHER_REG  UPDATE_RATE=$TEACHER_UPDATE_RATE"
+        echo "  INCLUDE_SUCCESSFUL_ROLLOUTS=$INCLUDE_SUCCESSFUL_ROLLOUTS"
     else
         echo "提交 Job #${TOTAL}: ${JOB_NAME}"
 
         SUBMIT_OUTPUT=$(nebulactl run mdl \
-                    --force \
+                --force \
             --engine=xdl \
             --queue=${QUEUE} \
             --entry=nebula_scripts/entry.py \
-            --user_params="--script_path=${SCRIPT_PATH} --world_size=${WORLD_SIZE} --job_name=${JOB_NAME} --env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=DATASET=${DATASET} --env=MODEL_NAME=${MODEL_NAME} --env=LR=${LR} --env=ALPHA=${ALPHA} --env=DONT_REPROMPT_ON_SELF_SUCCESS=${DONT_REPROMPT} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N}" \
+            --user_params="--script_path=${SCRIPT_PATH} --world_size=${WORLD_SIZE} --job_name=${JOB_NAME} --env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=REWARD_TYPE=${REWARD_TYPE} --env=LR=${LR} --env=ENTROPY_COEFF=${ENTROPY_COEFF} --env=DISTILL_TOPK=${DISTILL_TOPK} --env=DISTILL_TEMPERATURE=${DISTILL_TEMPERATURE} --env=TEACHER_REG=${TEACHER_REG} --env=TEACHER_UPDATE_RATE=${TEACHER_UPDATE_RATE} --env=NORM_ADV_BY_STD=${NORM_ADV_BY_STD} --env=CLIP_ADV=${CLIP_ADV} --env=CLIP_ADV_VALUE=${CLIP_ADV_VALUE} --env=ROLLOUT_IS=${ROLLOUT_IS} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=MINI_BATCH_SIZE=${MINI_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=INCLUDE_SUCCESSFUL_ROLLOUTS=${INCLUDE_SUCCESSFUL_ROLLOUTS}" \
             --worker_count=${WORLD_SIZE} \
             --file.cluster_file=${CLUSTER_FILE} \
             --job_name=${JOB_NAME} \
@@ -103,11 +107,7 @@ for DONT_REPROMPT in "${DONT_REPROMPT_LIST[@]}"; do
         sleep 2
     fi
 
-done  # DONT_REPROMPT
-done  # ALPHA
-done  # LR
-done  # MODEL_NAME
-done  # DATASET
+done  # DISTILL_TEMPERATURE
 
 echo ""
 echo "============================================================"

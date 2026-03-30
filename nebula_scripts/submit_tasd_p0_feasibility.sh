@@ -38,11 +38,15 @@ fi
 # =============================================================================
 # [P0] 实验列表：只跑两个 reward type，ent=0.0 排除 entropy 干扰
 # =============================================================================
-REWARD_TYPES=("teacher_log_prob" "teacher_seq_log_prob")
+REWARD_TYPES=(
+    "teacher_prob" 
+    # "teacher_log_prob" 
+    # "teacher_seq_log_prob"
+)
 
 # 固定参数
 LR="1e-5"
-ENTROPY_COEFF="0.0"
+ENTROPY_COEFF="0.1"
 TEACHER_REG="ema"
 TEACHER_UPDATE_RATE="0.1"
 NORM_ADV_BY_STD="True"

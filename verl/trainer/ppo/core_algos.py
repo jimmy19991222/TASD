@@ -2509,6 +2509,7 @@ def compute_tasd_token_rewards(
     student_topk_log_probs: Optional[torch.Tensor] = None,
     teacher_topk_log_probs: Optional[torch.Tensor] = None,
     student_topk_indices: Optional[torch.Tensor] = None,   # (B, T, K) int64，top1_match/topk_match 需要
+    verifier_rewards: Optional[torch.Tensor] = None,       # (B, T) 环境/verifier 的 token-level reward
     reward_type: str = "log_ratio",
     alpha: float = 0.5,
     tail_correction: bool = False,
@@ -2533,6 +2534,30 @@ def compute_tasd_token_rewards(
 
     elif reward_type == "teacher_prob":
         reward = teacher_log_probs.exp()  # (B, T) ∈ (0,1)
+
+    elif reward_type == "teacher_prob_plus_verified":
+        # teacher_prob + verified_reward：结合 teacher 认可度与环境反馈
+        # 语义：teacher 认为该 token 有多好 + 环境认为该 token 有多好
+        # 优势：保留 teacher 信号的同时，引入环境反馈的绝对好坏信息
+        # 后续仍走 TASD 的 group 归一化，保持相对优势计算
+        assert verifier_rewards is not None, \
+            "teacher_prob_plus_verified requires verifier_rewards (set include_environment_feedback=True)"
+        teacher_prob_t = teacher_log_probs.exp()  # (B, T) ∈ (0,1)
+        # 将 sparse 的 verified_reward 广播到所有 token：seq_score 复制到每个位置
+        # verifier_rewards 是 sparse 的（只在 EOS 位置有值），我们提取 seq-level score 后广播
+        seq_verified_reward = verifier_rewards.sum(dim=-1, keepdim=True)  # (B, 1)，提取 sequence-level reward
+        broadcast_verified_reward = seq_verified_reward.expand_as(verifier_rewards)  # (B, T)，广播到所有 token
+        reward = teacher_prob_t + broadcast_verified_reward  # (B, T)，值域 [0, 2] 左右
+
+    elif reward_type == "teacher_prob_binary":
+        # 二值化 teacher_prob：p > group_mean → 1，否则 → 0
+        # group_mean 在 token 维度上计算（response mask 内）
+        # 方差不随训练消亡，始终是相对排名信号
+        prob = teacher_log_probs.exp()  # (B, T) ∈ (0,1)
+        # 计算每条 response 的 group mean（只算 response token）
+        # response_mask 此时尚未乘入，用 prob 本身做 group mean
+        group_mean = prob.mean(dim=-1, keepdim=True)  # (B, 1)
+        reward = (prob > group_mean).float()  # (B, T) ∈ {0, 1}
 
     elif reward_type == "teacher_logit":
         # logit(teacher_prob) = log(p / (1-p))
@@ -2802,6 +2827,7 @@ def compute_tasd_advantage(
     success_mask=None,          # (B,) bool，是否是成功rollout
     epsilon=1e-6,
     config=None,                # AlgoConfig
+    teacher_value=None,         # (B, T) Teacher-GAE 的 V(s_t) 估计，可选
     **kwargs,
 ):
     """
@@ -2811,12 +2837,18 @@ def compute_tasd_advantage(
     - norm_adv_by_std (bool, default=False): 是否除以 group std 归一化
     - clip_adv (bool, default=True): 是否对 advantage 做 clipping
     - clip_adv_value (float, default=5.0): clipping 范围 [-v, v]
+    - use_teacher_gae (bool, default=False): 是否用 Teacher-GAE 替代简单减 group_mean
+    - teacher_gae_gamma (float, default=1.0): GAE 折扣因子（语言模型通常用 1.0）
+    - teacher_gae_lambda (float, default=0.95): GAE lambda（0=TD, 1=MC）
     """
     # 读取配置
     tasd_cfg = config.get("tasd", {}) if config else {}
     norm_adv_by_std = tasd_cfg.get("norm_adv_by_std", False)
     clip_adv = tasd_cfg.get("clip_adv", True)
     clip_adv_value = tasd_cfg.get("clip_adv_value", 5.0)
+    use_teacher_gae = tasd_cfg.get("use_teacher_gae", False) and (teacher_value is not None)
+    gae_gamma  = tasd_cfg.get("teacher_gae_gamma", 1.0)
+    gae_lambda = tasd_cfg.get("teacher_gae_lambda", 0.95)
 
     with torch.no_grad():
         effective_mask = response_mask
@@ -2858,7 +2890,35 @@ def compute_tasd_advantage(
             group_std = all_rewards.std(unbiased=False).clamp(min=epsilon) if norm_adv_by_std else None
 
             for i in valid_indices:
-                adv_i = token_level_rewards[i] - group_mean
+                if use_teacher_gae:
+                    # ── Teacher-GAE ───────────────────────────────────────
+                    # V(s_t) = teacher_value[i]，来自 logsumexp(teacher_topk_log_probs) - log(K)
+                    # delta_t = r_t + gamma * V_{t+1} - V_t
+                    # A_t = sum_{l>=0} (gamma*lambda)^l * delta_{t+l}
+                    v      = teacher_value[i]         # (T,)
+                    r      = token_level_rewards[i]   # (T,)
+                    mask_i = effective_mask[i]         # (T,)
+
+                    v_next = torch.cat([v[1:], v.new_zeros(1)], dim=0)          # (T,)
+                    delta  = r + gae_gamma * v_next * mask_i - v * mask_i       # (T,)
+
+                    # 反向累积
+                    gae_coeff = gae_gamma * gae_lambda
+                    adv_i  = torch.zeros_like(r)
+                    gae_acc = r.new_tensor(0.0)
+                    for t in range(r.shape[0] - 1, -1, -1):
+                        if mask_i[t] > 0:
+                            gae_acc    = delta[t] + gae_coeff * gae_acc
+                            adv_i[t]   = gae_acc
+                        else:
+                            gae_acc = r.new_tensor(0.0)   # padding 位置重置
+
+                    # 再减 group_mean，保留跨 rollout 对比信号
+                    adv_i = adv_i - group_mean
+                else:
+                    # ── 原有逻辑 ─────────────────────────────────────────
+                    adv_i = token_level_rewards[i] - group_mean
+
                 if group_std is not None:
                     adv_i = adv_i / group_std
                 advantages[i] = adv_i * effective_mask[i]

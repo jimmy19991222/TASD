@@ -287,12 +287,13 @@ def compute_advantage(
             print(f"[TASD Debug] num_success: {success_mask.sum().item()}/{len(success_mask)}")
 
         advantages, returns = core_algos.compute_tasd_advantage(
-            token_level_rewards=data.batch["token_level_rewards"],  # batch → data
-            response_mask=data.batch["response_mask"],              # batch → data
+            token_level_rewards=data.batch["token_level_rewards"],
+            response_mask=data.batch["response_mask"],
             self_distillation_mask=sdist_mask,
             index=data.non_tensor_batch["uid"],
             success_mask=success_mask,
             config=config,
+            teacher_value=data.batch.get("teacher_value", None),  # Teacher-GAE，可选
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
@@ -1762,7 +1763,7 @@ class RayPPOTrainer:
                 "student_topk_teacher_prob", "student_topk_teacher_prob_weighted",
             )
             tasd_distill_topk      = _tasd_cfg.get("distill_topk", 100) if tasd_need_topk else None
-            tasd_temperature       = self.config.actor_rollout_ref.rollout.temperature
+            tasd_temperature       = _tasd_cfg.get("distill_temperature", None) or self.config.actor_rollout_ref.rollout.temperature
             tasd_micro_batch_size  = self.config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu
 
         rollout_corr_config     = self.config.algorithm.get("rollout_correction", None)
@@ -1992,12 +1993,16 @@ class RayPPOTrainer:
                                     teacher_fwd_batch
                                 )
 
+                            # 获取 verifier_rewards（环境/verifier 的 token-level reward），供某些 reward_type 使用
+                            verifier_rewards = batch.batch["token_level_rewards"]
+
                             token_rewards = core_algos.compute_tasd_token_rewards(
                                 student_log_probs=batch.batch["old_log_probs"],
                                 teacher_log_probs=teacher_result.batch["teacher_log_probs_on_response"],
                                 student_topk_log_probs=teacher_result.batch.get("student_topk_log_probs"),
                                 teacher_topk_log_probs=teacher_result.batch.get("teacher_topk_log_probs"),
                                 student_topk_indices=teacher_result.batch.get("student_topk_indices"),
+                                verifier_rewards=verifier_rewards,
                                 reward_type=tasd_reward_type,
                                 alpha=tasd_alpha,
                                 tail_correction=tasd_tail_correction,
@@ -2024,16 +2029,30 @@ class RayPPOTrainer:
                                 # 这样 GRPO 的 scores = token_level_rewards.sum(-1) = seq_score，无长度偏差
                                 token_rewards = seq_score.unsqueeze(-1) * last_token_idx
 
-                            verifier_rewards = batch.batch["token_level_rewards"].clone()
-                            batch.batch["verifier_token_rewards"] = verifier_rewards
+                            # 保存 verifier_rewards 供后续使用（如 tasd_grpo_weight 混合）
+                            verifier_rewards_clone = verifier_rewards.clone()
+                            batch.batch["verifier_token_rewards"] = verifier_rewards_clone
 
                             if tasd_grpo_weight > 0.0:
                                 batch.batch["token_level_rewards"] = (
-                                    tasd_grpo_weight * verifier_rewards
+                                    tasd_grpo_weight * verifier_rewards_clone
                                     + (1.0 - tasd_grpo_weight) * token_rewards
                                 )
                             else:
                                 batch.batch["token_level_rewards"] = token_rewards
+
+                            # Teacher-GAE：把 teacher topk mean 存为 V(s_t) 估计
+                            # logsumexp(topk_log_probs, dim=-1) - log(K) = log(mean(topk_probs))
+                            if (
+                                tasd_need_topk
+                                and teacher_result.batch.get("teacher_topk_log_probs") is not None
+                                and _tasd_cfg.get("use_teacher_gae", False)
+                            ):
+                                _topk_lp = teacher_result.batch["teacher_topk_log_probs"]  # (B, T, K)
+                                _K = _topk_lp.shape[-1]
+                                batch.batch["teacher_value"] = (
+                                    torch.logsumexp(_topk_lp, dim=-1) - _topk_lp.new_tensor(_K).log()
+                                )  # (B, T)
 
                             response_mask  = batch.batch["response_mask"]
                             valid_tasd     = token_rewards[response_mask.bool()]
