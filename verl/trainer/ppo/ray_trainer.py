@@ -2029,6 +2029,17 @@ class RayPPOTrainer:
                                 # 这样 GRPO 的 scores = token_level_rewards.sum(-1) = seq_score，无长度偏差
                                 token_rewards = seq_score.unsqueeze(-1) * last_token_idx
 
+                            elif tasd_reward_type == "teacher_sentence_prob":
+                                # 几何平均 teacher prob：exp( mean_t[ log π_teacher(y_t) ] ) ∈ (0, 1]
+                                # 与 teacher_seq_log_prob 相同结构，但 exp 到概率域后再走 GRPO 路径
+                                # 非线性效果：压缩高质量区间差异、放大低质量区间差异
+                                resp_len = response_mask_float.sum(-1).clamp(min=1)  # (B,)
+                                mean_log_prob = (token_rewards * response_mask_float).sum(-1) / resp_len  # (B,) ∈ (-∞, 0]
+                                sentence_score = mean_log_prob.exp()                 # (B,) ∈ (0, 1]，几何平均 teacher prob
+                                last_token_idx = (response_mask_float.cumsum(-1) == resp_len.unsqueeze(-1)).float()  # (B, T) one-hot
+                                # 只在最后一个有效 token 位置放 sentence_score，走 GRPO sequence-level advantage
+                                token_rewards = sentence_score.unsqueeze(-1) * last_token_idx
+
                             # 保存 verifier_rewards 供后续使用（如 tasd_grpo_weight 混合）
                             verifier_rewards_clone = verifier_rewards.clone()
                             batch.batch["verifier_token_rewards"] = verifier_rewards_clone

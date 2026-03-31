@@ -17,11 +17,20 @@ OSS_ACCESS_ID="${OSS_ACCESS_ID:?OSS_ACCESS_ID not set}"
 OSS_ACCESS_KEY="${OSS_ACCESS_KEY:?OSS_ACCESS_KEY not set}"
 OSS_ENDPOINT="oss-cn-hangzhou-zmf.aliyuncs.com"
 OSS_BUCKET="lazada-ai-model"
-# 自定义镜像（留空则使用 --algo_name=pytorch260 默认镜像）
-CUSTOM_DOCKER_IMAGE="${CUSTOM_DOCKER_IMAGE:-hub.docker.alibaba-inc.com/mdl/notebook_saved:loujieming.ljm_yueqiu_sdpo_env_torch260_20260324155942}"
 CLUSTER_FILE="nebula_scripts/cluster_gpu_4.json"    # 4 GPU
 SCRIPT_PATH="nebula_scripts/tasd/tasd_sciknoweval_parametric.sh"
+# 自定义镜像（留空则使用 --algo_name=pytorch260 默认镜像）
+CUSTOM_DOCKER_IMAGE="${CUSTOM_DOCKER_IMAGE:-hub.docker.alibaba-inc.com/mdl/notebook_saved:loujieming.ljm_yueqiu_sdpo_env_torch260_20260324155942}"
 PROJECT_NAME="TASD_param_search"
+
+# ── 数据集配置 ──────────────────────────────────────────────────────
+DATASETS=(
+    "sciknoweval/biology"
+    # "sciknoweval/chemistry"
+    # "sciknoweval/material"
+    # "sciknoweval/physics"
+    # "tooluse"
+)
 
 # ── dry-run 模式 ─────────────────────────────────────────────────────────
 DRY_RUN=false
@@ -38,9 +47,10 @@ REWARD_TYPES=(
     # "teacher_log_prob" x
     # "teacher_seq_log_prob" x
     # "teacher_prob"
-    # "teacher_prob_binary"
-    # "top1_match"
-    "teacher_prob_plus_verified"
+    "teacher_sentence_prob"
+    # "teacher_prob_binary" x
+    # "top1_match" x
+    # "teacher_prob_plus_verified"
     # "teacher_prob_relative" x
     # "teacher_prob_certainty"
     # "student_topk_teacher_prob" x
@@ -69,14 +79,15 @@ TEACHER_UPDATE_RATE_LIST=(
 
 # 固定参数（不扫描）
 NORM_ADV_BY_STD="True"   # 开启 std 归一化，对比之前的 nostd
-CLIP_ADV="False"
-CLIP_ADV_VALUE="None"
+CLIP_ADV="True"
+CLIP_ADV_VALUE="2.0"
 ROLLOUT_IS="token"
 TRAIN_BATCH_SIZE="32"
 MINI_BATCH_SIZE="32"
 ROLLOUT_N="8"
 INCLUDE_SUCCESSFUL_ROLLOUTS_LIST=(
     "True"
+    # "False"
 )
 
 # =============================================================================
@@ -85,6 +96,7 @@ INCLUDE_SUCCESSFUL_ROLLOUTS_LIST=(
 TOTAL=0
 SUBMITTED=0
 
+for DATASET in "${DATASETS[@]}"; do
 for REWARD_TYPE in "${REWARD_TYPES[@]}"; do
 for LR in "${LRS[@]}"; do
 for ENTROPY_COEFF in "${ENTROPY_COEFF_LIST[@]}"; do
@@ -107,6 +119,9 @@ for INCLUDE_SUCCESSFUL_ROLLOUTS in "${INCLUDE_SUCCESSFUL_ROLLOUTS_LIST[@]}"; do
 
     TOTAL=$((TOTAL + 1))
 
+    # 构建短数据集名（用于实验名）
+    DATASET_SHORT=$(echo "$DATASET" | tr '/' '-')
+
     # ── 构建实验名 ───────────────────────────────────────────────────
     ENT_TAG=""
     if [ "$(echo "$ENTROPY_COEFF > 0" | bc -l)" = "1" ]; then
@@ -128,7 +143,7 @@ for INCLUDE_SUCCESSFUL_ROLLOUTS in "${INCLUDE_SUCCESSFUL_ROLLOUTS_LIST[@]}"; do
     fi
 
     CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
-    JOB_NAME="TASD-bio-lr${LR}-rt${REWARD_TYPE}${STD_TAG}-clip${CLIP_ADV_VALUE}${ENT_TAG}-rctoken${ISR_TAG}${EMA_TAG}-Qwen3-8B-${CURRENT_TIME}"
+    JOB_NAME="TASD-${DATASET_SHORT}-lr${LR}-rt${REWARD_TYPE}${STD_TAG}-clip${CLIP_ADV_VALUE}${ENT_TAG}-rctoken${ISR_TAG}${EMA_TAG}-Qwen3-8B-${CURRENT_TIME}"
 
     # ── 提交 ────────────────────────────────────────────────────────
     if [ "$DRY_RUN" = true ]; then
@@ -145,7 +160,7 @@ for INCLUDE_SUCCESSFUL_ROLLOUTS in "${INCLUDE_SUCCESSFUL_ROLLOUTS_LIST[@]}"; do
             --engine=xdl \
             --queue=${QUEUE} \
             --entry=nebula_scripts/entry.py \
-            --user_params="--script_path=${SCRIPT_PATH} --world_size=${WORLD_SIZE} --job_name=${JOB_NAME} --env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=REWARD_TYPE=${REWARD_TYPE} --env=LR=${LR} --env=ENTROPY_COEFF=${ENTROPY_COEFF} --env=TEACHER_REG=${TEACHER_REG} --env=TEACHER_UPDATE_RATE=${TEACHER_UPDATE_RATE} --env=NORM_ADV_BY_STD=${NORM_ADV_BY_STD} --env=CLIP_ADV=${CLIP_ADV} --env=CLIP_ADV_VALUE=${CLIP_ADV_VALUE} --env=ROLLOUT_IS=${ROLLOUT_IS} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=MINI_BATCH_SIZE=${MINI_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=INCLUDE_SUCCESSFUL_ROLLOUTS=${INCLUDE_SUCCESSFUL_ROLLOUTS}" \
+            --user_params="--script_path=${SCRIPT_PATH} --world_size=${WORLD_SIZE} --job_name=${JOB_NAME} --env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=DATASET=${DATASET} --env=REWARD_TYPE=${REWARD_TYPE} --env=LR=${LR} --env=ENTROPY_COEFF=${ENTROPY_COEFF} --env=TEACHER_REG=${TEACHER_REG} --env=TEACHER_UPDATE_RATE=${TEACHER_UPDATE_RATE} --env=NORM_ADV_BY_STD=${NORM_ADV_BY_STD} --env=CLIP_ADV=${CLIP_ADV} --env=CLIP_ADV_VALUE=${CLIP_ADV_VALUE} --env=ROLLOUT_IS=${ROLLOUT_IS} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=MINI_BATCH_SIZE=${MINI_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=INCLUDE_SUCCESSFUL_ROLLOUTS=${INCLUDE_SUCCESSFUL_ROLLOUTS}" \
             --worker_count=${WORLD_SIZE} \
             --file.cluster_file=${CLUSTER_FILE} \
             --job_name=${JOB_NAME} \
@@ -176,6 +191,7 @@ done  # TEACHER_REG
 done  # ENTROPY_COEFF
 done  # LR
 done  # REWARD_TYPE
+done  # DATASET
 
 echo ""
 echo "============================================================"

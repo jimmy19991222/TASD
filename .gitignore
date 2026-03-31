@@ -10,6 +10,7 @@
 **/datasets
 models/
 sdpo_env/
+models/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

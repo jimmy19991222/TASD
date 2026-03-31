@@ -2588,6 +2588,13 @@ def compute_tasd_token_rewards(
         # ray_trainer.py 会在 compute_advantage 前将 token_level_rewards 替换为广播的 seq_score
         reward = seq_score  # 占位，实际 seq-level 处理在 ray_trainer.py
 
+    elif reward_type == "teacher_sentence_prob":
+        # Sentence-level reward：几何平均 teacher prob，走 GRPO advantage 路径
+        # 公式：sentence_score = exp( mean_t[ log π_teacher(y_t) ] ) ∈ (0, 1]
+        # 语义：teacher 对整条 response 的平均认可度（概率域），与 teacher_prob 同量级
+        # 与 teacher_seq_log_prob 的区别：exp 后在概率域比较，非线性压缩高质量区间、放大低质量区间差异
+        # 占位：实际 seq-level 处理在 ray_trainer.py（同 teacher_seq_log_prob，只放最后一个 token）
+        reward = teacher_log_probs  # 占位，ray_trainer.py 会计算几何平均并放到最后一个 token
 
     elif reward_type == "teacher_prob_relative":
         assert teacher_topk_log_probs is not None

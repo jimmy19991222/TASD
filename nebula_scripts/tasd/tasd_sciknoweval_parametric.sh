@@ -9,6 +9,7 @@ set +xo pipefail
 OSS_ROOT="/data/oss_bucket_0/ad/loujieming.ljm"
 
 # ── 从环境变量读取超参（必传，未设置时立即报错退出）─────────────────
+: "${DATASET:?DATASET is not set}"
 : "${REWARD_TYPE:?REWARD_TYPE is not set}"
 : "${LR:?LR is not set}"
 : "${ENTROPY_COEFF:?ENTROPY_COEFF is not set}"
@@ -29,12 +30,9 @@ TEACHER_GAE_GAMMA="${TEACHER_GAE_GAMMA:-1.0}"
 TEACHER_GAE_LAMBDA="${TEACHER_GAE_LAMBDA:-0.95}"
 
 # ── 路径 ────────────────────────────────────────────────────────────────
-# 数据集列表（目前只跑第一个，扩展时直接往数组里加）
-DATA_PATHS=(
-    "${OSS_ROOT}/datasets/sciknoweval/biology"
-)
-train_data_path="${DATA_PATHS[0]}/train.parquet"
-val_data_path="${DATA_PATHS[0]}/test.parquet"
+# 从 DATASET 环境变量构建路径（如：sciknoweval/biology -> ${OSS_ROOT}/datasets/sciknoweval/biology）
+train_data_path="${OSS_ROOT}/datasets/${DATASET}/train.parquet"
+val_data_path="${OSS_ROOT}/datasets/${DATASET}/test.parquet"
 model_path="${OSS_ROOT}/base_models/Qwen3-8B"
 save_path="${OSS_ROOT}/models/${JOB_NAME:-tasd_sweep}"
 
