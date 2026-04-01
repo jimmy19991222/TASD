@@ -154,9 +154,13 @@ for INCLUDE_SUCCESSFUL_ROLLOUTS in "${INCLUDE_SUCCESSFUL_ROLLOUTS_LIST[@]}"; do
         ISR_TAG="-isr0"
     fi
 
-    STD_TAG="-std"
-    if [ "$NORM_ADV_BY_STD" = "False" ]; then
-        STD_TAG="-nostd"
+    STD_TAG="-nostd"
+    if [ "$NORM_ADV_BY_STD" = "True" ]; then
+        if [ "$ADV_STD_FLOOR" != "0.0" ] && [ "$ADV_STD_FLOOR" != "0" ]; then
+            STD_TAG="-std-floor${ADV_STD_FLOOR}"
+        else
+            STD_TAG="-std"
+        fi
     fi
 
     CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
