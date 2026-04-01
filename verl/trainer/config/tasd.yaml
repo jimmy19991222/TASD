@@ -49,6 +49,7 @@ algorithm:
     reward_scale: 1.0                      # tanh(x/scale)的scale，控制敏感度
     # ── advantage 计算 ──
     norm_adv_by_std: false                 # 是否除以group std归一化（teacher_prob∈[0,1]时建议false）
+    adv_std_floor: 0.0                     # std下界，防止group_std过小导致adv爆炸；设为0.1时adv最大约±10
     clip_adv: true                         # 是否对advantage做clipping
     clip_adv_value: 5.0                    # clipping范围 [-v, v]
     # ── Teacher-GAE（实验性）──

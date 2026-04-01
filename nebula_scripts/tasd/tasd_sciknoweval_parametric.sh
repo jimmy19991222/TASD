@@ -18,6 +18,7 @@ OSS_ROOT="/data/oss_bucket_0/ad/loujieming.ljm"
 : "${NORM_ADV_BY_STD:?NORM_ADV_BY_STD is not set}"
 : "${CLIP_ADV:?CLIP_ADV is not set}"
 : "${CLIP_ADV_VALUE:?CLIP_ADV_VALUE is not set}"
+ADV_STD_FLOOR="${ADV_STD_FLOOR:-0.0}"    # std下界，防止group_std过小导致adv爆炸；推荐0.1
 : "${ROLLOUT_IS:?ROLLOUT_IS is not set}"
 : "${TRAIN_BATCH_SIZE:?TRAIN_BATCH_SIZE is not set}"
 : "${MINI_BATCH_SIZE:?MINI_BATCH_SIZE is not set}"
@@ -86,6 +87,7 @@ python -m verl.trainer.main_ppo \
     algorithm.tasd.include_successful_rollouts=${INCLUDE_SUCCESSFUL_ROLLOUTS} \
     algorithm.tasd.success_reward_threshold=1.0 \
     algorithm.tasd.norm_adv_by_std=${NORM_ADV_BY_STD} \
+    algorithm.tasd.adv_std_floor=${ADV_STD_FLOOR} \
     algorithm.tasd.clip_adv=${CLIP_ADV} \
     algorithm.tasd.clip_adv_value=${CLIP_ADV_VALUE} \
     algorithm.tasd.use_teacher_gae=${USE_TEACHER_GAE} \

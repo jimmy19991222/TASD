@@ -2842,6 +2842,7 @@ def compute_tasd_advantage(
     
     可配置项（通过 config.tasd）：
     - norm_adv_by_std (bool, default=False): 是否除以 group std 归一化
+    - adv_std_floor (float, default=0.0): std 下界，防止 group_std 过小导致 adv 爆炸
     - clip_adv (bool, default=True): 是否对 advantage 做 clipping
     - clip_adv_value (float, default=5.0): clipping 范围 [-v, v]
     - use_teacher_gae (bool, default=False): 是否用 Teacher-GAE 替代简单减 group_mean
@@ -2851,6 +2852,7 @@ def compute_tasd_advantage(
     # 读取配置
     tasd_cfg = config.get("tasd", {}) if config else {}
     norm_adv_by_std = tasd_cfg.get("norm_adv_by_std", False)
+    adv_std_floor = tasd_cfg.get("adv_std_floor", 0.0)  # std下界，防止爆炸
     clip_adv = tasd_cfg.get("clip_adv", True)
     clip_adv_value = tasd_cfg.get("clip_adv_value", 5.0)
     use_teacher_gae = tasd_cfg.get("use_teacher_gae", False) and (teacher_value is not None)
@@ -2894,7 +2896,7 @@ def compute_tasd_advantage(
 
             all_rewards = torch.cat(group_token_rewards)
             group_mean = all_rewards.mean()
-            group_std = all_rewards.std(unbiased=False).clamp(min=epsilon) if norm_adv_by_std else None
+            group_std = all_rewards.std(unbiased=False).clamp(min=max(epsilon, adv_std_floor)) if norm_adv_by_std else None
 
             for i in valid_indices:
                 if use_teacher_gae:
@@ -2945,9 +2947,10 @@ def compute_tasd_advantage(
         # 打印汇总统计
         total_groups = len(uid_to_indices)
         adv_final = advantages[valid_mask]
+        std_floor_str = f", std_floor={adv_std_floor}" if norm_adv_by_std and adv_std_floor > 0 else ""
         print(f"[TASD Debug] Summary: {processed_groups}/{total_groups} groups processed, "
               f"{skipped_groups}/{total_groups} groups skipped | "
-              f"norm_adv_by_std={norm_adv_by_std}, clip_adv={clip_adv}({clip_adv_value})")
+              f"norm_adv_by_std={norm_adv_by_std}{std_floor_str}, clip_adv={clip_adv}({clip_adv_value})")
         print(f"[TASD Debug] Advantage before clip: min={adv_before_clip_min:.4f}, max={adv_before_clip_max:.4f}")
         if adv_final.numel() > 0:
             print(f"[TASD Debug] Advantage final: min={adv_final.min():.4f}, max={adv_final.max():.4f}, "
