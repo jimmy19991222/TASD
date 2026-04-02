@@ -19,6 +19,7 @@ OSS_ROOT="/data/oss_bucket_0/ad/loujieming.ljm"
 : "${CLIP_ADV:?CLIP_ADV is not set}"
 : "${CLIP_ADV_VALUE:?CLIP_ADV_VALUE is not set}"
 ADV_STD_FLOOR="${ADV_STD_FLOOR:-0.0}"    # std下界，防止group_std过小导致adv爆炸；推荐0.1
+REPETITION_PENALTY="${REPETITION_PENALTY:-1.05}"   # 复读抑制，防止entropy崩溃时产生超长重复序列
 : "${ROLLOUT_IS:?ROLLOUT_IS is not set}"
 : "${TRAIN_BATCH_SIZE:?TRAIN_BATCH_SIZE is not set}"
 : "${MINI_BATCH_SIZE:?MINI_BATCH_SIZE is not set}"
@@ -78,6 +79,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.n=16 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
+    actor_rollout_ref.rollout.repetition_penalty=${REPETITION_PENALTY} \
     algorithm.tasd.reward_type=${REWARD_TYPE} \
     algorithm.tasd.reward_transform=none \
     algorithm.tasd.reward_scale=1.0 \

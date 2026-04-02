@@ -30,6 +30,7 @@ actor_rollout_ref:
   rollout:
     n: 8
     calculate_log_probs: True
+    repetition_penalty: 1.05    # 抑制复读机：entropy崩溃时模型会输出超长重复序列撑满8192 tokens
 
 algorithm:
   adv_estimator: tasd

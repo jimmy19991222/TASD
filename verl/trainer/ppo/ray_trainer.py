@@ -2119,11 +2119,13 @@ class RayPPOTrainer:
                             metrics.update(is_metrics)
 
                         # Step4: compute advantage
-                        # teacher_seq_log_prob 已将 token_level_rewards 替换为 seq-level 广播形式
-                        # 直接走 GRPO 的 sequence-level 归一化路径
+                        # teacher_seq_log_prob / teacher_sentence_prob 已将 token_level_rewards 替换为
+                        # seq-level sparse 形式（只在最后一个有效 token 位置有值），
+                        # 直接走 GRPO 的 sequence-level 归一化路径（天然有正有负，根本解决 entropy 崩溃）
+                        _TASD_GRPO_REWARD_TYPES = {"teacher_seq_log_prob", "teacher_sentence_prob"}
                         _adv_estimator = (
                             AdvantageEstimator.GRPO
-                            if is_tasd and tasd_reward_type == "teacher_seq_log_prob"
+                            if is_tasd and tasd_reward_type in _TASD_GRPO_REWARD_TYPES
                             else self.config.algorithm.adv_estimator
                         )
                         batch = compute_advantage(

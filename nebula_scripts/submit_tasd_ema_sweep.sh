@@ -25,11 +25,11 @@ PROJECT_NAME="TASD_param_search"
 
 # ── 数据集配置 ──────────────────────────────────────────────────────
 DATASETS=(
-    "sciknoweval/biology"
+    # "sciknoweval/biology"
     # "sciknoweval/chemistry"
     # "sciknoweval/material"
     # "sciknoweval/physics"
-    # "tooluse"
+    "tooluse"
 )
 
 # ── dry-run 模式 ─────────────────────────────────────────────────────────
@@ -46,8 +46,8 @@ fi
 REWARD_TYPES=(
     # "teacher_log_prob" x
     # "teacher_seq_log_prob" x
-    "teacher_prob"
-    # "teacher_sentence_prob" x
+    # "teacher_prob"
+    "teacher_sentence_prob"
     # "teacher_prob_binary" x
     # "top1_match" x
     # "teacher_prob_plus_verified"
@@ -84,6 +84,7 @@ NORM_ADV_BY_STD="True"   # 开启 std 归一化，对比之前的 nostd
 ADV_STD_FLOOR="auto"     # std下界：auto=1/sqrt(n), float=固定值, none=不使用
 CLIP_ADV="False"
 CLIP_ADV_VALUE="None"
+REPETITION_PENALTY="1.05"   # 复读抑制，防止entropy崩溃时产生超长重复序列
 ROLLOUT_IS="token"
 TRAIN_BATCH_SIZE="32"
 MINI_BATCH_SIZE="32"
@@ -133,6 +134,14 @@ for INCLUDE_SUCCESSFUL_ROLLOUTS in "${INCLUDE_SUCCESSFUL_ROLLOUTS_LIST[@]}"; do
     # 构建短数据集名（用于实验名）
     DATASET_SHORT=$(echo "$DATASET" | tr '/' '-')
 
+    # tooluse 使用 teacher_sentence_prob（seq-level GRPO 路径），其他数据集使用配置的 REWARD_TYPE
+    # 原因：tooluse 是序列级正确/错误任务，token-level teacher_prob 方差极小（std≈0.027）无区分性
+    #       teacher_sentence_prob = exp(mean log_prob) ∈ (0,1]，走 GRPO sequence-level 归一化，天然有正有负
+    EFFECTIVE_REWARD_TYPE="${REWARD_TYPE}"
+    # if [ "$DATASET" = "tooluse" ]; then
+    #     EFFECTIVE_REWARD_TYPE="teacher_sentence_prob"
+    # fi
+
     # 构建模型短名（去掉点，用于实验名）
     MODEL_SHORT=$(echo "$MODEL" | tr '.' '-')
     # 构建模型路径（和 Qwen3-8B 同目录规范）
@@ -166,7 +175,11 @@ for INCLUDE_SUCCESSFUL_ROLLOUTS in "${INCLUDE_SUCCESSFUL_ROLLOUTS_LIST[@]}"; do
     fi
 
     CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
-    JOB_NAME="TASD-${DATASET_SHORT}-lr${LR}-rt${REWARD_TYPE}${STD_TAG}-clip${CLIP_ADV_VALUE}${ENT_TAG}-rctoken${ISR_TAG}${EMA_TAG}-${MODEL_SHORT}-${CURRENT_TIME}"
+    REP_TAG=""
+    if [ "$REPETITION_PENALTY" != "1.0" ] && [ "$REPETITION_PENALTY" != "1" ]; then
+        REP_TAG="-rep${REPETITION_PENALTY}"
+    fi
+    JOB_NAME="TASD-${DATASET_SHORT}-lr${LR}-rt${EFFECTIVE_REWARD_TYPE}${STD_TAG}-clip${CLIP_ADV_VALUE}${ENT_TAG}-rctoken${ISR_TAG}${EMA_TAG}${REP_TAG}-${MODEL_SHORT}-${CURRENT_TIME}"
 
     # ── 提交 ────────────────────────────────────────────────────────
     if [ "$DRY_RUN" = true ]; then
@@ -183,7 +196,7 @@ for INCLUDE_SUCCESSFUL_ROLLOUTS in "${INCLUDE_SUCCESSFUL_ROLLOUTS_LIST[@]}"; do
             --engine=xdl \
             --queue=${QUEUE} \
             --entry=nebula_scripts/entry.py \
-            --user_params="--script_path=${SCRIPT_PATH} --world_size=${WORLD_SIZE} --job_name=${JOB_NAME} --env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=DATASET=${DATASET} --env=MODEL=${MODEL} --env=MODEL_PATH=${MODEL_PATH} --env=REWARD_TYPE=${REWARD_TYPE} --env=LR=${LR} --env=ENTROPY_COEFF=${ENTROPY_COEFF} --env=TEACHER_REG=${TEACHER_REG} --env=TEACHER_UPDATE_RATE=${TEACHER_UPDATE_RATE} --env=NORM_ADV_BY_STD=${NORM_ADV_BY_STD} --env=ADV_STD_FLOOR=${ADV_STD_FLOOR} --env=CLIP_ADV=${CLIP_ADV} --env=CLIP_ADV_VALUE=${CLIP_ADV_VALUE} --env=ROLLOUT_IS=${ROLLOUT_IS} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=MINI_BATCH_SIZE=${MINI_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=INCLUDE_SUCCESSFUL_ROLLOUTS=${INCLUDE_SUCCESSFUL_ROLLOUTS}" \
+            --user_params="--script_path=${SCRIPT_PATH} --world_size=${WORLD_SIZE} --job_name=${JOB_NAME} --env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=DATASET=${DATASET} --env=MODEL=${MODEL} --env=MODEL_PATH=${MODEL_PATH} --env=REWARD_TYPE=${EFFECTIVE_REWARD_TYPE} --env=LR=${LR} --env=ENTROPY_COEFF=${ENTROPY_COEFF} --env=TEACHER_REG=${TEACHER_REG} --env=TEACHER_UPDATE_RATE=${TEACHER_UPDATE_RATE} --env=NORM_ADV_BY_STD=${NORM_ADV_BY_STD} --env=ADV_STD_FLOOR=${ADV_STD_FLOOR} --env=CLIP_ADV=${CLIP_ADV} --env=CLIP_ADV_VALUE=${CLIP_ADV_VALUE} --env=REPETITION_PENALTY=${REPETITION_PENALTY} --env=ROLLOUT_IS=${ROLLOUT_IS} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=MINI_BATCH_SIZE=${MINI_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=INCLUDE_SUCCESSFUL_ROLLOUTS=${INCLUDE_SUCCESSFUL_ROLLOUTS}" \
             --worker_count=${WORLD_SIZE} \
             --file.cluster_file=${CLUSTER_FILE} \
             --job_name=${JOB_NAME} \
