@@ -283,6 +283,9 @@ def _to_safe_jsonable(value):
     raise TypeError(f"Non-serializable result type: {type(value).__name__}")
 
 
+MAX_RECURSION_DEPTH = 500  # 限制递归深度，防止无限递归导致栈溢出
+
+
 def reliability_guard():
     """
     This disables various destructive functions and prevents the generated code
@@ -297,6 +300,7 @@ def reliability_guard():
     """
 
     faulthandler.disable()
+    sys.setrecursionlimit(MAX_RECURSION_DEPTH)  # 防止无限递归栈溢出
 
     # Suppress noisy SyntaxWarning (e.g., invalid escape sequences in user regex strings)
     try:
@@ -569,7 +573,7 @@ def run_tests_for_one_example(test_cases, completion, send_conn, sparse_rewards,
 
         try:
             send_conn.send(record)
-        except Exception:
+        except Exception as e:
             print(f"[{test_idx}] SEND ERROR: {type(e).__name__}: {e}\n")
 
         # End INNER block

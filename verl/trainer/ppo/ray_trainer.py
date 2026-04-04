@@ -2042,6 +2042,100 @@ class RayPPOTrainer:
                                 # 只在最后一个有效 token 位置放 sentence_score，走 GRPO sequence-level advantage
                                 token_rewards = sentence_score.unsqueeze(-1) * last_token_idx
 
+                            elif tasd_reward_type == "teacher_prob_plus_sentence":
+                                # Sentence-level + Token-level 混合 Advantage（在 Advantage 层加权）
+                                #
+                                # core_algos 已返回 token_prob = π_T(y_t) ∈ (0,1) 作为 token_rewards
+                                #
+                                # 两路信号（正交分解）：
+                                #   A_sent_i：sentence-level GRPO advantage（cross-response 差异）
+                                #             基于 sentence_score = exp(mean_t[log π_T(y_t)]) ∈ (0,1]
+                                #   A_delta_t：within-response 偏差的 group normalization（within-response 差异）
+                                #              delta_t = token_prob_t - mean_{t∈response_i}[token_prob_t]
+                                #
+                                # 最终：A_t = alpha * A_sent_i + (1-alpha) * A_delta_t
+                                #   alpha=1 → 纯 GRPO（退化为 teacher_sentence_prob）
+                                #   alpha=0 → 纯 within-response delta
+                                #
+                                # token_rewards 此处存储混合后的 dense advantage，直接跳过 compute_advantage
+                                # 通过在最后设置 batch["advantages"] 来覆盖
+
+                                resp_len = response_mask_float.sum(-1).clamp(min=1)  # (B,)
+
+                                # ── 路径1：sentence-level GRPO advantage ──────────────────
+                                # sentence_score = exp(mean_t[log π_T(y_t)])，等价于 teacher_sentence_prob
+                                # 注意：token_rewards 此时是 teacher_prob = π_T.exp()，不是 log_prob
+                                # 需要重新用 teacher_log_probs 计算
+                                _teacher_log_probs_r = teacher_result.batch["teacher_log_probs_on_response"]  # (B, T)
+                                mean_log_prob = (_teacher_log_probs_r * response_mask_float).sum(-1) / resp_len  # (B,)
+                                sentence_score = mean_log_prob.exp()                                             # (B,) ∈ (0,1]
+
+                                # GRPO 归一化：跨 response 的 sentence_score 做 group norm
+                                # 只在最后一个有效 token 位置放 sentence_score（GRPO 路径标准做法）
+                                last_token_idx = (response_mask_float.cumsum(-1) == resp_len.unsqueeze(-1)).float()
+                                _sent_rewards = sentence_score.unsqueeze(-1) * last_token_idx  # (B, T) sparse
+
+                                # 暂时将 sent_rewards 写入 batch 调用 compute_advantage 得到 A_sent
+                                _orig_rewards = batch.batch["token_level_rewards"].clone()
+                                batch.batch["token_level_rewards"] = _sent_rewards
+                                _sent_batch = compute_advantage(
+                                    batch,
+                                    adv_estimator=AdvantageEstimator.GRPO,
+                                    gamma=self.config.algorithm.gamma,
+                                    lam=self.config.algorithm.lam,
+                                    num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                    norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                    config=self.config.algorithm,
+                                )
+                                A_sent = _sent_batch.batch["advantages"].clone()    # (B, T)，broadcast 到所有 token
+                                batch.batch["token_level_rewards"] = _orig_rewards  # 恢复
+
+                                # ── 路径2：within-response delta advantage ────────────────
+                                # token_prob_t = teacher_prob（来自 core_algos 输出的 token_rewards）
+                                token_prob = token_rewards  # (B, T) ∈ (0,1)，已 mask padding
+
+                                # within-response mean：每条 response 内的 token_prob 均值
+                                within_mean = (token_prob * response_mask_float).sum(-1, keepdim=True) / resp_len.unsqueeze(-1)  # (B, 1)
+                                delta = (token_prob - within_mean) * response_mask_float  # (B, T) 正交分量，均值=0
+
+                                # 全局 group normalization（跨所有 response 的 token）
+                                _delta_cfg = self.config.algorithm.get("tasd", {})
+                                _norm_delta = _delta_cfg.get("norm_adv_by_std", False)
+                                _adv_std_floor_raw = _delta_cfg.get("adv_std_floor", 0.0)
+
+                                valid_delta = delta[response_mask_float.bool()]
+                                if _norm_delta and valid_delta.numel() > 1:
+                                    _delta_mean = valid_delta.mean()
+                                    _delta_std  = valid_delta.std(unbiased=False)
+                                    # 解析 adv_std_floor
+                                    if isinstance(_adv_std_floor_raw, str) and _adv_std_floor_raw.lower() == "auto":
+                                        _n = response_mask_float.bool().sum()
+                                        _floor = 1.0 / (_n.float() ** 0.5)
+                                    elif isinstance(_adv_std_floor_raw, str) and _adv_std_floor_raw.lower() == "none":
+                                        _floor = 1e-6
+                                    else:
+                                        _floor = max(1e-6, float(_adv_std_floor_raw))
+                                    _delta_std  = _delta_std.clamp(min=_floor)
+                                    A_delta = (delta - _delta_mean) / _delta_std * response_mask_float
+                                else:
+                                    A_delta = delta  # 不归一化时直接使用 delta
+
+                                # ── 混合 ─────────────────────────────────────────────────
+                                # A_t = alpha * A_sent + (1-alpha) * A_delta
+                                mixed_adv = tasd_alpha * A_sent + (1.0 - tasd_alpha) * A_delta  # (B, T)
+                                mixed_adv = mixed_adv * response_mask_float
+
+                                # 直接写入 advantages，跳过后续 compute_advantage
+                                batch.batch["tasd_hybrid_advantages"] = mixed_adv
+                                # token_rewards 保持原 teacher_prob，供监控使用；
+                                # 后续在 Step4 检测到 tasd_hybrid_advantages 时直接复制到 advantages
+
+                                metrics["tasd/alpha"]          = tasd_alpha
+                                metrics["tasd/A_sent_mean"]    = A_sent[response_mask_float.bool()].mean().item()
+                                metrics["tasd/A_sent_std"]     = A_sent[response_mask_float.bool()].std().item()
+                                metrics["tasd/A_delta_mean"]   = A_delta[response_mask_float.bool()].mean().item()
+                                metrics["tasd/A_delta_std"]    = A_delta[response_mask_float.bool()].std().item()
+
                             # 保存 verifier_rewards 供后续使用（如 tasd_grpo_weight 混合）
                             verifier_rewards_clone = verifier_rewards.clone()
                             batch.batch["verifier_token_rewards"] = verifier_rewards_clone
@@ -2124,21 +2218,37 @@ class RayPPOTrainer:
                         # teacher_seq_log_prob / teacher_sentence_prob 已将 token_level_rewards 替换为
                         # seq-level sparse 形式（只在最后一个有效 token 位置有值），
                         # 直接走 GRPO 的 sequence-level 归一化路径（天然有正有负，根本解决 entropy 崩溃）
+                        # teacher_prob_plus_sentence 已预先计算 hybrid advantages，直接覆盖，跳过 compute_advantage
                         _TASD_GRPO_REWARD_TYPES = {"teacher_seq_log_prob", "teacher_sentence_prob"}
-                        _adv_estimator = (
-                            AdvantageEstimator.GRPO
-                            if is_tasd and tasd_reward_type in _TASD_GRPO_REWARD_TYPES
-                            else self.config.algorithm.adv_estimator
-                        )
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=_adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
-                        )
+                        if is_tasd and tasd_reward_type == "teacher_prob_plus_sentence" and "tasd_hybrid_advantages" in batch.batch:
+                            # 混合 advantage 已在上面计算好，直接写入 batch.batch["advantages"]
+                            # 仍需要 compute_advantage 初始化 returns 等字段，但用 teacher_prob 作为 dummy rewards
+                            batch = compute_advantage(
+                                batch,
+                                adv_estimator=AdvantageEstimator.GRPO,  # dummy，advantages 之后会被覆盖
+                                gamma=self.config.algorithm.gamma,
+                                lam=self.config.algorithm.lam,
+                                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                config=self.config.algorithm,
+                            )
+                            # 用预先计算的混合 advantage 覆盖
+                            batch.batch["advantages"] = batch.batch.pop("tasd_hybrid_advantages")
+                        else:
+                            _adv_estimator = (
+                                AdvantageEstimator.GRPO
+                                if is_tasd and tasd_reward_type in _TASD_GRPO_REWARD_TYPES
+                                else self.config.algorithm.adv_estimator
+                            )
+                            batch = compute_advantage(
+                                batch,
+                                adv_estimator=_adv_estimator,
+                                gamma=self.config.algorithm.gamma,
+                                lam=self.config.algorithm.lam,
+                                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                config=self.config.algorithm,
+                            )
 
                         # advantage分布监控
                         if is_tasd:

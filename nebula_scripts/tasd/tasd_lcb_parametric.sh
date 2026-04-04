@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 # =============================================================================
-# TASD sciknoweval 参数化训练脚本（供 Nebula sweep 调用）
+# TASD lcb_v6 参数化训练脚本（供 Nebula sweep 调用）
 #
-# 所有超参通过 nebulactl --env 注入，由 submit_tasd_ema_sweep.sh 设置
+# 所有超参通过 nebulactl --env 注入，由 submit_tasd_lcb_sweep.sh 设置
 # =============================================================================
 set +xo pipefail
 
 OSS_ROOT="/data/oss_bucket_0/ad/loujieming.ljm"
 
 # ── 从环境变量读取超参（必传，未设置时立即报错退出）─────────────────
-: "${DATASET:?DATASET is not set}"
 : "${REWARD_TYPE:?REWARD_TYPE is not set}"
 : "${LR:?LR is not set}"
 : "${ENTROPY_COEFF:?ENTROPY_COEFF is not set}"
@@ -18,31 +17,29 @@ OSS_ROOT="/data/oss_bucket_0/ad/loujieming.ljm"
 : "${NORM_ADV_BY_STD:?NORM_ADV_BY_STD is not set}"
 : "${CLIP_ADV:?CLIP_ADV is not set}"
 : "${CLIP_ADV_VALUE:?CLIP_ADV_VALUE is not set}"
-ADV_STD_FLOOR="${ADV_STD_FLOOR:-0.0}"    # std下界，防止group_std过小导致adv爆炸；推荐0.1
-REPETITION_PENALTY="${REPETITION_PENALTY:-1.05}"   # 复读抑制，防止entropy崩溃时产生超长重复序列
+ADV_STD_FLOOR="${ADV_STD_FLOOR:-auto}"
+REPETITION_PENALTY="${REPETITION_PENALTY:-1.05}"
 : "${ROLLOUT_IS:?ROLLOUT_IS is not set}"
 : "${TRAIN_BATCH_SIZE:?TRAIN_BATCH_SIZE is not set}"
 : "${MINI_BATCH_SIZE:?MINI_BATCH_SIZE is not set}"
 : "${ROLLOUT_N:?ROLLOUT_N is not set}"
 : "${INCLUDE_SUCCESSFUL_ROLLOUTS:?INCLUDE_SUCCESSFUL_ROLLOUTS is not set}"
-: "${MODEL_PATH:?MODEL_PATH is not set}"
+: "${MODEL_NAME:?MODEL_NAME is not set}"
 DISTILL_TOPK="${DISTILL_TOPK:-100}"
 DISTILL_TEMPERATURE="${DISTILL_TEMPERATURE:-1.0}"
 USE_TEACHER_GAE="${USE_TEACHER_GAE:-False}"
 TEACHER_GAE_GAMMA="${TEACHER_GAE_GAMMA:-1.0}"
 TEACHER_GAE_LAMBDA="${TEACHER_GAE_LAMBDA:-0.95}"
-TASD_ALPHA="${TASD_ALPHA:-0.5}"    # teacher_prob_plus_sentence 的混合权重：1.0=纯sentence, 0.0=纯token-delta
 
 # ── 路径 ────────────────────────────────────────────────────────────────
-# 从 DATASET 环境变量构建路径（如：sciknoweval/biology -> ${OSS_ROOT}/datasets/sciknoweval/biology）
-train_data_path="${OSS_ROOT}/datasets/${DATASET}/train.parquet"
-val_data_path="${OSS_ROOT}/datasets/${DATASET}/test.parquet"
-model_path="${MODEL_PATH}"
-save_path="${OSS_ROOT}/models/${JOB_NAME:-tasd_sweep}"
+train_data_path="${OSS_ROOT}/datasets/lcb_v6/train.parquet"
+val_data_path="${OSS_ROOT}/datasets/lcb_v6/test.parquet"
+model_path="${OSS_ROOT}/base_models/${MODEL_NAME}"
+save_path="${OSS_ROOT}/models/${JOB_NAME:-tasd_lcb_sweep}"
 
 # ── 环境 ────────────────────────────────────────────────────────────────
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
-unset VLLM_ATTENTION_BACKEND  # 与 verl_training.sh 行为一致，避免平台注入的值影响 attention 计算
+unset VLLM_ATTENTION_BACKEND
 export VLLM_USE_V1=1
 export VLLM_LOGGING_LEVEL=WARN
 export WANDB_MODE=offline
@@ -54,10 +51,10 @@ export TORCH_WARN_ACCUMULATE_GRAD_STREAM=0
 
 pip install -e . --no-deps --no-build-isolation --quiet 2>/dev/null || true
 
-# 创建 SwanLab 日志目录（SwanLab 初始化时要求目录存在）
+# 创建 SwanLab 日志目录
 mkdir -p "${SWANLAB_LOG_DIR}" 2>/dev/null || true
 
-# 清理残留的 Ray session（避免 session name 冲突）
+# 清理残留的 Ray session
 ray stop --force 2>/dev/null || true
 rm -rf /tmp/ray 2>/dev/null || true
 
@@ -69,7 +66,7 @@ python -m verl.trainer.main_ppo \
     custom_reward_function.path="$(pwd)/verl/utils/reward_score/feedback/__init__.py" \
     actor_rollout_ref.model.path="${model_path}" \
     actor_rollout_ref.actor.optim.lr=${LR} \
-    actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
+    actor_rollout_ref.actor.optim.lr_warmup_steps=0 \
     actor_rollout_ref.actor.ppo_mini_batch_size=${MINI_BATCH_SIZE} \
     actor_rollout_ref.actor.entropy_coeff=${ENTROPY_COEFF} \
     actor_rollout_ref.actor.self_distillation.teacher_regularization=${TEACHER_REG} \
@@ -77,7 +74,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.self_distillation.include_environment_feedback=False \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.rollout.n=${ROLLOUT_N} \
-    actor_rollout_ref.rollout.val_kwargs.n=16 \
+    actor_rollout_ref.rollout.val_kwargs.n=4 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
     actor_rollout_ref.rollout.repetition_penalty=${REPETITION_PENALTY} \
@@ -96,16 +93,15 @@ python -m verl.trainer.main_ppo \
     algorithm.tasd.use_teacher_gae=${USE_TEACHER_GAE} \
     algorithm.tasd.teacher_gae_gamma=${TEACHER_GAE_GAMMA} \
     algorithm.tasd.teacher_gae_lambda=${TEACHER_GAE_LAMBDA} \
-    algorithm.tasd.alpha=${TASD_ALPHA} \
     algorithm.rollout_correction.rollout_is=${ROLLOUT_IS} \
     trainer.total_epochs=30 \
     trainer.total_training_steps=250 \
     trainer.save_freq=-1 \
-    trainer.save_best_metric="val-core/sciknoweval/acc/mean@16" \
+    trainer.save_best_metric="val-core/livecodebench/acc/mean@16" \
     trainer.n_gpus_per_node=4 \
     trainer.val_before_train=False \
     trainer.default_local_dir="${save_path}" \
     trainer.project_name="${PROJECT_NAME:-TASD}" \
-    trainer.experiment_name="${JOB_NAME:-tasd_sweep}" \
-    trainer.group_name="TASD-ema-teacher" \
+    trainer.experiment_name="${JOB_NAME:-tasd_lcb_sweep}" \
+    trainer.group_name="TASD-lcb" \
     "trainer.logger=[console,swanlab]"

@@ -2743,6 +2743,17 @@ def compute_tasd_token_rewards(
         teacher_prob_t = teacher_log_probs.exp()                                   # (B, T) ∈ (0,1)
         reward = teacher_prob_t * jsd_per_token                                    # (B, T) ∈ [0, log2]
 
+    elif reward_type == "teacher_prob_plus_sentence":
+        # Sentence-level + Token-level 混合 reward（在 Advantage 层加权）
+        # 公式：
+        #   A_t = alpha * A_sent + (1-alpha) * A_delta
+        #   A_sent：sentence-level GRPO advantage（cross-response 差异）
+        #   A_delta：within-response token 偏差的 group normalization（within-response 差异）
+        #
+        # 此处只返回 token-level teacher_prob，作为两路计算的基础；
+        # 实际混合 advantage 在 ray_trainer.py 中实现（与 teacher_sentence_prob 处理类似）
+        reward = teacher_log_probs.exp()  # (B, T) ∈ (0,1)，即 teacher_prob
+
     elif reward_type == "teacher_prob_diff_weighted":
         # teacher_prob[sampled_token] × (teacher_prob - student_prob).clamp(0)
         # 语义：teacher 认可度 × teacher 比 student 更倾向该 token 的程度
