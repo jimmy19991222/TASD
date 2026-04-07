@@ -300,7 +300,6 @@ def reliability_guard():
     """
 
     faulthandler.disable()
-    sys.setrecursionlimit(MAX_RECURSION_DEPTH)  # 防止无限递归栈溢出
 
     # Suppress noisy SyntaxWarning (e.g., invalid escape sequences in user regex strings)
     try:
@@ -361,6 +360,7 @@ def reliability_guard():
 
     import sys
 
+    sys.setrecursionlimit(MAX_RECURSION_DEPTH)  # 防止无限递归栈溢出
     sys.modules["ipdb"] = None
     sys.modules["joblib"] = None
     sys.modules["resource"] = None

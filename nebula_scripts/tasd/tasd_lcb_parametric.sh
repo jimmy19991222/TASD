@@ -30,6 +30,7 @@ DISTILL_TEMPERATURE="${DISTILL_TEMPERATURE:-1.0}"
 USE_TEACHER_GAE="${USE_TEACHER_GAE:-False}"
 TEACHER_GAE_GAMMA="${TEACHER_GAE_GAMMA:-1.0}"
 TEACHER_GAE_LAMBDA="${TEACHER_GAE_LAMBDA:-0.95}"
+TASD_ALPHA="${TASD_ALPHA:-0.5}"    # teacher_prob_plus_sentence 的混合权重：1.0=纯sentence, 0.0=纯token-delta
 
 # ── 路径 ────────────────────────────────────────────────────────────────
 train_data_path="${OSS_ROOT}/datasets/lcb_v6/train.parquet"
@@ -54,9 +55,12 @@ pip install -e . --no-deps --no-build-isolation --quiet 2>/dev/null || true
 # 创建 SwanLab 日志目录
 mkdir -p "${SWANLAB_LOG_DIR}" 2>/dev/null || true
 
-# 清理残留的 Ray session
+# 清理残留的 Ray session（避免 session name 冲突）
 ray stop --force 2>/dev/null || true
 rm -rf /tmp/ray 2>/dev/null || true
+rm -rf /tmp/ray_session_* 2>/dev/null || true
+rm -rf ~/.ray 2>/dev/null || true
+sleep 3  # 等待 Ray 完全停止
 
 python -m verl.trainer.main_ppo \
     --config-name tasd \
@@ -93,6 +97,7 @@ python -m verl.trainer.main_ppo \
     algorithm.tasd.use_teacher_gae=${USE_TEACHER_GAE} \
     algorithm.tasd.teacher_gae_gamma=${TEACHER_GAE_GAMMA} \
     algorithm.tasd.teacher_gae_lambda=${TEACHER_GAE_LAMBDA} \
+    algorithm.tasd.alpha=${TASD_ALPHA} \
     algorithm.rollout_correction.rollout_is=${ROLLOUT_IS} \
     trainer.total_epochs=30 \
     trainer.total_training_steps=250 \

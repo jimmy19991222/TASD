@@ -77,7 +77,8 @@ for EXP in "${EXPERIMENTS[@]}"; do
     fi
 
     CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
-    JOB_NAME="TASD-bio-lr${LR}-rt${REWARD_TYPE}-std-clip5.0${ENT_TAG}-rctoken-isr1-ema${TEACHER_UPDATE_RATE}-Qwen3-8B-${CURRENT_TIME}"
+    LR_TAG=$(echo "$LR" | tr '-' '_')  # 把 lr 中的 - 替换成 _，便于按 - 分割
+    JOB_NAME="TASD-bio-lr${LR_TAG}-rt${REWARD_TYPE}-std-clip5.0${ENT_TAG}-rctoken-isr1-ema${TEACHER_UPDATE_RATE}-Qwen3-8B-${CURRENT_TIME}"
 
     if [ "$DRY_RUN" = true ]; then
         echo "------------------------------------------------------------"

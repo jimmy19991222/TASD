@@ -65,8 +65,9 @@ SUBMITTED=0
 for REWARD_TYPE in "${REWARD_TYPES[@]}"; do
 
     TOTAL=$((TOTAL + 1))
+    LR_TAG=$(echo "$LR" | tr '-' '_')  # 把 lr 中的 - 替换成 _，便于按 - 分割
     CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
-    JOB_NAME="TASD-bio-lr${LR}-rt${REWARD_TYPE}-std-clip5.0-rctoken-isr1-ema${TEACHER_UPDATE_RATE}-Qwen3-8B-${CURRENT_TIME}"
+    JOB_NAME="TASD-bio-lr${LR_TAG}-rt${REWARD_TYPE}-std-clip5.0-rctoken-isr1-ema${TEACHER_UPDATE_RATE}-Qwen3-8B-${CURRENT_TIME}"
 
     if [ "$DRY_RUN" = true ]; then
         echo "------------------------------------------------------------"

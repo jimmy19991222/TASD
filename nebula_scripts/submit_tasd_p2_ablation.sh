@@ -84,7 +84,7 @@ for EXP in "${EXPERIMENTS[@]}"; do
     fi
     STD_TAG="-std"
     if [ "$NORM_ADV_BY_STD" = "False" ]; then
-        STD_TAG="-nostd"
+        STD_TAG="-no_std"
     fi
     ISR_TAG="-isr1"
     if [ "$INCLUDE_SUCCESSFUL_ROLLOUTS" = "False" ]; then
@@ -92,7 +92,8 @@ for EXP in "${EXPERIMENTS[@]}"; do
     fi
 
     CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
-    JOB_NAME="TASD-bio-lr${LR}-rt${REWARD_TYPE}${STD_TAG}-clip5.0${ENT_TAG}-rctoken${ISR_TAG}${EMA_TAG}-Qwen3-8B-${CURRENT_TIME}"
+    LR_TAG=$(echo "$LR" | tr '-' '_')  # 把 lr 中的 - 替换成 _，便于按 - 分割
+    JOB_NAME="TASD-bio-lr${LR_TAG}-rt${REWARD_TYPE}${STD_TAG}-clip5.0${ENT_TAG}-rctoken${ISR_TAG}${EMA_TAG}-Qwen3-8B-${CURRENT_TIME}"
 
     if [ "$DRY_RUN" = true ]; then
         echo "------------------------------------------------------------"

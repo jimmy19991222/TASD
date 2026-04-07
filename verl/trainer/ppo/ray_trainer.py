@@ -1701,12 +1701,62 @@ class RayPPOTrainer:
         np.random.seed(seed)
         torch.manual_seed(seed)
 
+        # 从实验名称自动提取 SwanLab tags 和 group
+        # 实验名称格式：TASD-sciknoweval-material-lr1e-5-rtteacher_prob-std-auto-...-Qwen3-8B-时间戳
+        # group: 前面的方法+数据集部分（如 TASD-sciknoweval-material）
+        # tags: 后面的超参部分（如 lr1e-5, rt-teacher_prob, std-auto）
+        _experiment_name = self.config.trainer.experiment_name
+        _swanlab_tags = None
+        _swanlab_group = None
+
+        if _experiment_name:
+            # 按 - 分割实验名称
+            _parts = _experiment_name.split("-")
+            # 找到数据集结束位置：通常是 前缀-数据集类型-数据集名（如 TASD-sciknoweval-material）
+            # 或者 前缀-数据集（如 GRPO-lcb, TASD-lcb）
+            # 数据集关键词：sciknoweval, lcb, tooluse 等
+            _dataset_keywords = {"sciknoweval", "lcb", "tooluse"}
+            _group_end_idx = 0
+            for i, part in enumerate(_parts):
+                if part in _dataset_keywords:
+                    # 如果下一个不是超参关键词，则继续包含（如 sciknoweval 后面可能有 biology/material）
+                    if i + 1 < len(_parts) and _parts[i + 1] not in {"lr", "rt", "std", "clip", "rc", "isr", "ema", "rep", "alpha"}:
+                        _group_end_idx = i + 2
+                    else:
+                        _group_end_idx = i + 1
+                    break
+
+            if _group_end_idx > 0:
+                _swanlab_group = "-".join(_parts[:_group_end_idx])
+                # 剩余部分全部作为 tags（包括模型名、超参等，只排除时间戳）
+                _tag_parts = _parts[_group_end_idx:]
+                _filtered_tags = []
+                for p in _tag_parts:
+                    # 只跳过时间戳（包含下划线）
+                    if "_" in p:
+                        continue
+                    _filtered_tags.append(p)
+                if _filtered_tags:
+                    _swanlab_tags = _filtered_tags
+
+        # 环境变量优先级更高（允许手动覆盖）
+        _env_tags = os.environ.get("SWANLAB_TAGS", "")
+        if _env_tags:
+            _swanlab_tags = [t.strip() for t in _env_tags.split(",") if t.strip()]
+        _env_group = os.environ.get("SWANLAB_GROUP", "")
+        if _env_group:
+            _swanlab_group = _env_group
+        # 最后回退到 config
+        if not _swanlab_group:
+            _swanlab_group = self.config.trainer.get("group_name", None)
+
         logger = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
             default_backend=self.config.trainer.logger,
             config=OmegaConf.to_container(self.config, resolve=True),
-            group_name=self.config.trainer.get("group_name", None),
+            group_name=_swanlab_group,
+            tags=_swanlab_tags,
         )
 
         self.global_steps = 0
@@ -2108,9 +2158,11 @@ class RayPPOTrainer:
                                     _delta_mean = valid_delta.mean()
                                     _delta_std  = valid_delta.std(unbiased=False)
                                     # 解析 adv_std_floor
+                                    # 注意：A_delta 的 floor 应基于 response 数而非 token 数，与 A_sent 对齐
+                                    # 否则 floor 过小（1/sqrt(N*L) vs 1/sqrt(N)）导致两路量级不匹配
+                                    _n_responses = resp_len.shape[0]  # batch size = response 数
                                     if isinstance(_adv_std_floor_raw, str) and _adv_std_floor_raw.lower() == "auto":
-                                        _n = response_mask_float.bool().sum()
-                                        _floor = 1.0 / (_n.float() ** 0.5)
+                                        _floor = 1.0 / (_n_responses ** 0.5)  # 与 GRPO 对齐，N=8 → 0.354
                                     elif isinstance(_adv_std_floor_raw, str) and _adv_std_floor_raw.lower() == "none":
                                         _floor = 1e-6
                                     else:

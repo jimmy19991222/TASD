@@ -30,9 +30,9 @@ fi
 # 超参配置（与 run_sdpo_all_local.sh 保持一致）
 # =============================================================================
 DATASETS=(
-    "sciknoweval/biology"
-    "sciknoweval/chemistry"
-    "sciknoweval/material"
+    # "sciknoweval/biology"
+    # "sciknoweval/chemistry"
+    # "sciknoweval/material"
     "sciknoweval/physics"
     "tooluse"    # 如未上传到 OSS，注释此行
 )
@@ -63,8 +63,9 @@ for DONT_REPROMPT in "${DONT_REPROMPT_LIST[@]}"; do
     TOTAL=$((TOTAL + 1))
 
     DATASET_SHORT=$(echo "$DATASET" | tr '/' '-')
+    LR_TAG=$(echo "$LR" | tr '-' '_')  # 把 lr 中的 - 替换成 _，便于按 - 分割
     CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
-    JOB_NAME="SDPO-${DATASET_SHORT}-train${TRAIN_BATCH_SIZE}-alpha${ALPHA}-lr${LR}-dross${DONT_REPROMPT}-${MODEL_NAME}-${CURRENT_TIME}"
+    JOB_NAME="SDPO-${DATASET_SHORT}-train${TRAIN_BATCH_SIZE}-alpha${ALPHA}-lr${LR_TAG}-dross${DONT_REPROMPT}-${MODEL_NAME}-${CURRENT_TIME}"
 
     if [ "$DRY_RUN" = true ]; then
         echo "------------------------------------------------------------"

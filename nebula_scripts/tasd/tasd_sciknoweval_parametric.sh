@@ -60,6 +60,9 @@ mkdir -p "${SWANLAB_LOG_DIR}" 2>/dev/null || true
 # 清理残留的 Ray session（避免 session name 冲突）
 ray stop --force 2>/dev/null || true
 rm -rf /tmp/ray 2>/dev/null || true
+rm -rf /tmp/ray_session_* 2>/dev/null || true
+rm -rf ~/.ray 2>/dev/null || true
+sleep 3  # 等待 Ray 完全停止
 
 python -m verl.trainer.main_ppo \
     --config-name tasd \

@@ -25,11 +25,11 @@ PROJECT_NAME="TASD_param_search"
 
 # ── 数据集配置 ──────────────────────────────────────────────────────
 DATASETS=(
-    # "sciknoweval/biology"
-    "sciknoweval/chemistry"
-    "sciknoweval/material"
-    "sciknoweval/physics"
-    "tooluse"
+    "sciknoweval/biology"
+    # "sciknoweval/chemistry"
+    # "sciknoweval/material"
+    # "sciknoweval/physics"
+    # "tooluse"
 )
 
 # ── dry-run 模式 ─────────────────────────────────────────────────────────
@@ -47,7 +47,7 @@ REWARD_TYPES=(
     # "teacher_log_prob" x
     # "teacher_seq_log_prob" x
     "teacher_prob"
-    "teacher_sentence_prob"
+    # "teacher_sentence_prob"
     # "teacher_prob_binary" x
     # "top1_match" x
     # "teacher_prob_plus_verified"
@@ -83,7 +83,7 @@ TEACHER_UPDATE_RATE_LIST=(
 NORM_ADV_BY_STD="True"   # 固定开启 std 归一化
 ADV_STD_FLOOR_LIST=(
     "auto"     # auto=1/sqrt(n)
-    "none"     # 不使用下界
+    # "none"     # 不使用下界
     # "0.1"
     # "0.5"
 )
@@ -180,14 +180,14 @@ for CLIP_ADV_VALUE in "${CLIP_ADV_VALUE_LIST[@]}"; do
         ISR_TAG="-isr0"
     fi
 
-    STD_TAG="-nostd"
+    STD_TAG="-no_std"
     if [ "$NORM_ADV_BY_STD" = "True" ]; then
         if [ "$ADV_STD_FLOOR" = "auto" ]; then
-            STD_TAG="-std-auto"
+            STD_TAG="-std_auto"
         elif [ "$ADV_STD_FLOOR" != "0.0" ] && [ "$ADV_STD_FLOOR" != "0" ] && [ "$ADV_STD_FLOOR" != "none" ]; then
-            STD_TAG="-std-floor${ADV_STD_FLOOR}"
+            STD_TAG="-std_floor${ADV_STD_FLOOR}"
         else
-            STD_TAG="-std-none"
+            STD_TAG="-std_none"
         fi
     fi
 
@@ -196,7 +196,8 @@ for CLIP_ADV_VALUE in "${CLIP_ADV_VALUE_LIST[@]}"; do
     if [ "$REPETITION_PENALTY" != "1.0" ] && [ "$REPETITION_PENALTY" != "1" ]; then
         REP_TAG="-rep${REPETITION_PENALTY}"
     fi
-    JOB_NAME="TASD-${DATASET_SHORT}-lr${LR}-rt${EFFECTIVE_REWARD_TYPE}${STD_TAG}-clip${CLIP_ADV_VALUE}${ENT_TAG}-rctoken${ISR_TAG}${EMA_TAG}${REP_TAG}-${MODEL_SHORT}-${CURRENT_TIME}"
+    LR_TAG=$(echo "$LR" | tr '-' '_')  # 把 lr 中的 - 替换成 _，便于按 - 分割
+    JOB_NAME="TASD-${DATASET_SHORT}-lr${LR_TAG}-rt${EFFECTIVE_REWARD_TYPE}${STD_TAG}-clip${CLIP_ADV_VALUE}${ENT_TAG}-rctoken${ISR_TAG}${EMA_TAG}${REP_TAG}-${MODEL_SHORT}-${CURRENT_TIME}"
 
     # ── 提交 ────────────────────────────────────────────────────────
     if [ "$DRY_RUN" = true ]; then

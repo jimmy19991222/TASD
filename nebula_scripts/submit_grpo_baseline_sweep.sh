@@ -34,8 +34,8 @@ DATASETS=(
     # "sciknoweval/biology"
     # "sciknoweval/chemistry"
     # "sciknoweval/material"
-    "sciknoweval/physics"
-    # "tooluse"    # 如未上传到 OSS，注释此行
+    # "sciknoweval/physics"
+    "tooluse"    # 如未上传到 OSS，注释此行
 )
 
 MODEL_NAMES=(
@@ -69,8 +69,9 @@ for MINI_BATCH_SIZE in "${MINI_BATCH_SIZES[@]}"; do
 
     # 构建短数据集名（用于实验名）
     DATASET_SHORT=$(echo "$DATASET" | tr '/' '-')
+    LR_TAG=$(echo "$LR" | tr '-' '_')  # 把 lr 中的 - 替换成 _，便于按 - 分割
     CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
-    JOB_NAME="GRPO-${DATASET_SHORT}-mbs${MINI_BATCH_SIZE}-train${TRAIN_BATCH_SIZE}-lr${LR}-${MODEL_NAME}-${CURRENT_TIME}"
+    JOB_NAME="GRPO-${DATASET_SHORT}-mbs${MINI_BATCH_SIZE}-train${TRAIN_BATCH_SIZE}-lr${LR_TAG}-${MODEL_NAME}-${CURRENT_TIME}"
 
     if [ "$DRY_RUN" = true ]; then
         echo "------------------------------------------------------------"

@@ -130,14 +130,14 @@ for INCLUDE_SUCCESSFUL_ROLLOUTS in "${INCLUDE_SUCCESSFUL_ROLLOUTS_LIST[@]}"; do
         ISR_TAG="-isr0"
     fi
 
-    STD_TAG="-nostd"
+    STD_TAG="-no_std"
     if [ "$NORM_ADV_BY_STD" = "True" ]; then
         if [ "$ADV_STD_FLOOR" = "auto" ]; then
-            STD_TAG="-std-auto"
+            STD_TAG="-std_auto"
         elif [ "$ADV_STD_FLOOR" != "0.0" ] && [ "$ADV_STD_FLOOR" != "0" ] && [ "$ADV_STD_FLOOR" != "none" ]; then
-            STD_TAG="-std-floor${ADV_STD_FLOOR}"
+            STD_TAG="-std_floor${ADV_STD_FLOOR}"
         else
-            STD_TAG="-std-none"
+            STD_TAG="-std_none"
         fi
     fi
 
@@ -146,7 +146,8 @@ for INCLUDE_SUCCESSFUL_ROLLOUTS in "${INCLUDE_SUCCESSFUL_ROLLOUTS_LIST[@]}"; do
     if [ "$REPETITION_PENALTY" != "1.0" ] && [ "$REPETITION_PENALTY" != "1" ]; then
         REP_TAG="-rep${REPETITION_PENALTY}"
     fi
-    JOB_NAME="TASD-lcb-lr${LR}-rt${REWARD_TYPE}${STD_TAG}-clip${CLIP_ADV_VALUE}${ENT_TAG}-rctoken${ISR_TAG}${EMA_TAG}${REP_TAG}-${MODEL_SHORT}-${CURRENT_TIME}"
+    LR_TAG=$(echo "$LR" | tr '-' '_')  # 把 lr 中的 - 替换成 _，便于按 - 分割
+    JOB_NAME="TASD-lcb-lr${LR_TAG}-rt${REWARD_TYPE}${STD_TAG}-clip${CLIP_ADV_VALUE}${ENT_TAG}-rctoken${ISR_TAG}${EMA_TAG}${REP_TAG}-${MODEL_SHORT}-${CURRENT_TIME}"
 
     # ── 提交 ────────────────────────────────────────────────────────
     if [ "$DRY_RUN" = true ]; then

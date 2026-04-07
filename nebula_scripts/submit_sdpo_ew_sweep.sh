@@ -81,13 +81,14 @@ for EW_VER in "${ENTROPY_WEIGHTING_VERSION_LIST[@]}"; do
     TOTAL=$((TOTAL + 1))
 
     DATASET_SHORT=$(echo "$DATASET" | tr '/' '-')
+    LR_TAG=$(echo "$LR" | tr '-' '_')  # 把 lr 中的 - 替换成 _，便于按 - 分割
     CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
     EW_TAG="ew${EW}"
     ET_TAG=""
     if [ "$EW" = "True" ]; then
         ET_TAG="-et${ET}"
     fi
-    JOB_NAME="SDPO-${DATASET_SHORT}-alpha${ALPHA}-lr${LR}-dross${DONT_REPROMPT}-${EW_VER}-${EW_TAG}${ET_TAG}-${MODEL_NAME}-${CURRENT_TIME}"
+    JOB_NAME="SDPO-${DATASET_SHORT}-alpha${ALPHA}-lr${LR_TAG}-dross${DONT_REPROMPT}-${EW_VER}-${EW_TAG}${ET_TAG}-${MODEL_NAME}-${CURRENT_TIME}"
 
     if [ "$DRY_RUN" = true ]; then
         echo "------------------------------------------------------------"
