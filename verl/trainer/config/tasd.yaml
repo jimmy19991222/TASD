@@ -56,6 +56,10 @@ algorithm:
                                            # - "none" or 0.0: 不使用floor
     clip_adv: true                         # 是否对advantage做clipping
     clip_adv_value: 5.0                    # clipping范围 [-v, v]
+    # ── Safety Threshold（借鉴FIPO）──
+    safety_thresh: 0.1                     # reward 阈值，低于此值且adv为负时触发保护
+                                           # 0 表示禁用 safety threshold
+    safety_clip_value: 0.5                 # safety 触发时，限制 advantage 到 [-v, 0]
     # ── Teacher-GAE（实验性）──
     use_teacher_gae: false                 # true=用Teacher-GAE替代简单减group_mean；需要reward_type支持topk
     teacher_gae_gamma: 1.0                 # GAE折扣因子（语言模型通常用1.0）

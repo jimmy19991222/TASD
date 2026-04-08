@@ -2561,7 +2561,8 @@ def compute_tasd_token_rewards(
         reward = log_ratio_topk.mean(dim=-1)  # (B, T)
 
     elif reward_type == "teacher_prob":
-        reward = teacher_log_probs.exp()  # (B, T) ∈ (0,1)
+        # 借鉴 FIPO：clamp log_prob 保证数值稳定性
+        reward = teacher_log_probs.clamp(min=-20.0).exp()  # (B, T) ∈ (0, 1]
 
     elif reward_type == "teacher_prob_plus_verified":
         # teacher_prob + verified_reward：结合 teacher 认可度与环境反馈
@@ -2601,7 +2602,8 @@ def compute_tasd_token_rewards(
         # 语义：teacher 对该 token 的认可度（log 域），值域 (-∞, 0]
         # 与 teacher_seq_log_prob 的区别：保留 token 粒度差异，不做 seq 聚合
         # advantage 走 TASD 路径（token-level group 归一化），group mean 来自所有 token 的 log_prob 均值
-        reward = teacher_log_probs  # (B, T)
+        # 借鉴 FIPO：clamp 保证数值稳定性，防止极端 log_prob 导致 advantage 爆炸
+        reward = teacher_log_probs.clamp(min=-20.0, max=0.0)  # (B, T) ∈ [-20, 0]
 
     elif reward_type == "teacher_seq_log_prob":
         # Sequence-level reward：每条 response 的平均 teacher log_prob，广播回 token 维度
@@ -3005,6 +3007,51 @@ def compute_tasd_advantage(
             clipped = torch.clamp(advantages, min=-clip_adv_value, max=clip_adv_value)
             # 只替换有效位置，padding 保持 0
             advantages = torch.where(valid_mask, clipped, advantages)
+
+        # ═══════════════════════════════════════════════════════════════
+        # Safety Threshold（借鉴 FIPO）：负样本保护
+        # 当 token 的 reward 极低（teacher 极度不认可）时，限制惩罚力度
+        # 避免 over-penalization 导致 entropy 崩溃
+        #
+        # 注意：不同 reward_type 的值域不同：
+        #   - teacher_prob: (0, 1)，safety_thresh=0.1 表示 prob < 10%
+        #   - teacher_log_prob: (-∞, 0]，safety_thresh 需要用负值
+        #     例如 -5.0 表示 log_prob < -5（即 prob < 0.7%）
+        #   - 如果 safety_thresh=0 且 reward_type=teacher_log_prob，自动设为 -5.0
+        # ═══════════════════════════════════════════════════════════════
+        safety_thresh_raw = tasd_cfg.get("safety_thresh", 0.1)  # reward 阈值
+        safety_clip_value = tasd_cfg.get("safety_clip_value", 0.5)  # 限制惩罚到 -0.5
+
+        # 自动调整 safety_thresh：如果配置为正值但 reward 是 log_prob 域（全负）
+        # 检测方式：如果 token_level_rewards 的均值 < 0，说明是 log_prob 域
+        if safety_thresh_raw > 0 and token_level_rewards[valid_mask].mean() < 0:
+            # reward 是 log_prob 域（负值），自动转换为 log 域阈值
+            # 例如 0.1 表示 "底部 10% 的 reward"
+            valid_rewards = token_level_rewards[valid_mask]
+            safety_thresh_actual = valid_rewards.quantile(safety_thresh_raw).item()
+            print(f"[TASD Safety] Auto-adjusted threshold for log-prob domain: {safety_thresh_raw} -> {safety_thresh_actual:.4f}")
+        else:
+            safety_thresh_actual = safety_thresh_raw
+
+        if safety_thresh_actual != 0:
+            # 找到 reward 极低且 advantage 为负的 token（极度不认可）
+            if safety_thresh_actual > 0:
+                very_low_reward = token_level_rewards < safety_thresh_actual
+            else:
+                # log_prob 域：小于阈值（更负）表示更低概率
+                very_low_reward = token_level_rewards < safety_thresh_actual
+            neg_adv = advantages < 0
+            safety_mask = valid_mask & very_low_reward & neg_adv
+            if safety_mask.any():
+                # 限制这些 token 的 advantage 不低于 safety_clip_value
+                advantages = torch.where(
+                    safety_mask,
+                    torch.clamp(advantages, min=-safety_clip_value, max=0.0),
+                    advantages
+                )
+                safety_clipped_count = safety_mask.sum().item()
+                print(f"[TASD Safety] {safety_clipped_count} tokens with reward<{safety_thresh_actual:.4f} "
+                      f"had advantage clipped to [-{safety_clip_value}, 0]")
 
         # 打印汇总统计
         total_groups = len(uid_to_indices)
