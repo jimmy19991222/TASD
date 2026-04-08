@@ -18,7 +18,7 @@ CLUSTER_FILE="nebula_scripts/cluster_gpu_4.json"
 SCRIPT_PATH="nebula_scripts/grpo/grpo_sciknoweval_parametric.sh"
 # 自定义镜像（留空则使用 --algo_name=pytorch260 默认镜像）
 CUSTOM_DOCKER_IMAGE="${CUSTOM_DOCKER_IMAGE:-hub.docker.alibaba-inc.com/mdl/notebook_saved:loujieming.ljm_yueqiu_sdpo_env_torch260_20260324155942}"
-PROJECT_NAME="Baselines"
+PROJECT_NAME="Baselines_v3"
 
 DRY_RUN=false
 if [ $# -gt 0 ] && [[ "$1" == "--dry-run" ]]; then
@@ -31,10 +31,10 @@ fi
 # =============================================================================
 # DATASET 为 OSS datasets/ 下的相对路径，MODEL_NAME 为 base_models/ 下的目录名
 DATASETS=(
-    # "sciknoweval/biology"
-    # "sciknoweval/chemistry"
-    # "sciknoweval/material"
-    # "sciknoweval/physics"
+    "sciknoweval/biology"
+    "sciknoweval/chemistry"
+    "sciknoweval/material"
+    "sciknoweval/physics"
     "tooluse"    # 如未上传到 OSS，注释此行
 )
 

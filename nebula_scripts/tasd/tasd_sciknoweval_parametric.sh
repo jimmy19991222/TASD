@@ -33,6 +33,12 @@ TEACHER_GAE_GAMMA="${TEACHER_GAE_GAMMA:-1.0}"
 TEACHER_GAE_LAMBDA="${TEACHER_GAE_LAMBDA:-0.95}"
 TASD_ALPHA="${TASD_ALPHA:-0.5}"    # teacher_prob_plus_sentence 的混合权重：1.0=纯sentence, 0.0=纯token-delta
 
+# ── Future-KL Modulation 参数（默认关闭）──────────────────────────────────
+FUTURE_KL_ENABLED="${FUTURE_KL_ENABLED:-False}"       # 是否启用 Future-KL Modulation
+FUTURE_KL_SIGNAL_TYPE="${FUTURE_KL_SIGNAL_TYPE:-teacher_student_kl}"  # 信号类型
+FUTURE_KL_DECAY_RATE="${FUTURE_KL_DECAY_RATE:-128}"   # 衰减率：gamma = 2^{-1/decay_rate}
+FUTURE_KL_CLIP_RATIO="${FUTURE_KL_CLIP_RATIO:-0.5}"   # weight ∈ [1-ratio, 1+ratio]
+
 # ── 路径 ────────────────────────────────────────────────────────────────
 # 从 DATASET 环境变量构建路径（如：sciknoweval/biology -> ${OSS_ROOT}/datasets/sciknoweval/biology）
 train_data_path="${OSS_ROOT}/datasets/${DATASET}/train.parquet"
@@ -100,6 +106,10 @@ python -m verl.trainer.main_ppo \
     algorithm.tasd.teacher_gae_gamma=${TEACHER_GAE_GAMMA} \
     algorithm.tasd.teacher_gae_lambda=${TEACHER_GAE_LAMBDA} \
     algorithm.tasd.alpha=${TASD_ALPHA} \
+    algorithm.future_kl_modulation.enabled=${FUTURE_KL_ENABLED} \
+    algorithm.future_kl_modulation.signal_type=${FUTURE_KL_SIGNAL_TYPE} \
+    algorithm.future_kl_modulation.decay_rate=${FUTURE_KL_DECAY_RATE} \
+    algorithm.future_kl_modulation.clip_ratio=${FUTURE_KL_CLIP_RATIO} \
     algorithm.rollout_correction.rollout_is=${ROLLOUT_IS} \
     trainer.total_epochs=30 \
     trainer.total_training_steps=250 \

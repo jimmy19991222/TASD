@@ -198,6 +198,10 @@ def compute_advantage(
     num_repeat: int = 1,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
+    # Future-KL Modulation 参数
+    teacher_log_probs: Optional[torch.Tensor] = None,
+    student_log_probs: Optional[torch.Tensor] = None,
+    old_log_probs: Optional[torch.Tensor] = None,
 ) -> DataProto:
     """Compute advantage estimates for policy optimization.
 
@@ -329,6 +333,26 @@ def compute_advantage(
         advantages, returns = adv_estimator_fn(**adv_kwargs)
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    
+    # ═══════════════════════════════════════════════════════════════
+    # Future-KL Modulation：独立组件，可和任何 advantage estimator 组合
+    # 借鉴 FIPO 的 Future-KL 思想，用 teacher-student 分歧调制 advantage
+    # ═══════════════════════════════════════════════════════════════
+    fkl_cfg = config.get("future_kl_modulation", {}) if config else {}
+    if fkl_cfg.get("enabled", False):
+        # 检查必要的数据是否存在
+        if teacher_log_probs is None or student_log_probs is None:
+            print("[Future-KL Modulation] Warning: enabled but teacher_log_probs or student_log_probs not provided, skipping")
+        else:
+            data.batch["advantages"] = core_algos.apply_future_kl_modulation(
+                advantages=data.batch["advantages"],
+                teacher_log_probs=teacher_log_probs,
+                student_log_probs=student_log_probs,
+                response_mask=data.batch["response_mask"],
+                config=config,
+                old_log_probs=old_log_probs,
+            )
+    
     return data
 
 
@@ -2065,6 +2089,10 @@ class RayPPOTrainer:
                             # Mask out padding positions: teacher_log_probs=0 at pad → exp(0)=1.0 (wrong!)
                             response_mask_float = batch.batch["response_mask"].float()
                             token_rewards = token_rewards * response_mask_float
+                            
+                            # 保存 teacher/student log_probs 供 Future-KL Modulation 使用
+                            batch.batch["teacher_log_probs_for_modulation"] = teacher_result.batch["teacher_log_probs_on_response"]
+                            batch.batch["student_log_probs_for_modulation"] = batch.batch["old_log_probs"]
 
                             # teacher_seq_log_prob: 将 token-level reward 折叠为 sequence-level outcome reward
                             # 每条 response 用自身平均 log_prob 作为 outcome score
@@ -2283,6 +2311,10 @@ class RayPPOTrainer:
                                 num_repeat=self.config.actor_rollout_ref.rollout.n,
                                 norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                                 config=self.config.algorithm,
+                                # Future-KL Modulation 参数
+                                teacher_log_probs=batch.batch.get("teacher_log_probs_for_modulation"),
+                                student_log_probs=batch.batch.get("student_log_probs_for_modulation"),
+                                old_log_probs=batch.batch.get("old_log_probs"),
                             )
                             # 用预先计算的混合 advantage 覆盖
                             batch.batch["advantages"] = batch.batch.pop("tasd_hybrid_advantages")
@@ -2300,6 +2332,10 @@ class RayPPOTrainer:
                                 num_repeat=self.config.actor_rollout_ref.rollout.n,
                                 norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                                 config=self.config.algorithm,
+                                # Future-KL Modulation 参数
+                                teacher_log_probs=batch.batch.get("teacher_log_probs_for_modulation"),
+                                student_log_probs=batch.batch.get("student_log_probs_for_modulation"),
+                                old_log_probs=batch.batch.get("old_log_probs"),  # 用于 policy_change signal_type
                             )
 
                         # advantage分布监控

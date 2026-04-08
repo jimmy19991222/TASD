@@ -150,6 +150,152 @@ def get_adv_estimator_fn(name_or_enum):
     return ADV_ESTIMATOR_REGISTRY[name]
 
 
+def apply_future_kl_modulation(
+    advantages: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    student_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    config: Optional[dict] = None,
+    old_log_probs: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Future-KL Modulation：独立组件，用于调制 advantage。
+    
+    借鉴 FIPO 的 Future-KL 思想，用 teacher-student 分歧信号调制 advantage，
+    识别"关键 token"并动态调整其权重。
+    
+    公式：
+        Signal_t = f(teacher, student)  # 根据 signal_type 计算
+        FutureKL_t = Σ_{k=t}^{T} γ^{k-t} · Signal_k
+        weight_t = clip(exp(FutureKL_t), 1-ratio, 1+ratio)
+        advantages_modulated = advantages × weight
+    
+    信号类型 (signal_type)：
+        - "teacher_student_kl": KL(π_teacher ∥ π_student)，teacher-student 分歧
+        - "teacher_prob": π_teacher(y_t)，teacher 认可度
+        - "policy_change": log π_new - log π_old，FIPO 原版（需要 old_log_probs）
+    
+    语义：
+        - 正的 FutureKL（teacher 比学生更认可未来）→ weight > 1 → 放大 advantage
+        - 负的 FutureKL（teacher 不认可未来）→ weight < 1 → 缩小 advantage
+    
+    Args:
+        advantages: (B, T) advantage 张量
+        teacher_log_probs: (B, T) teacher 的 log prob
+        student_log_probs: (B, T) student (current policy) 的 log prob
+        response_mask: (B, T) 有效 token 掩码
+        config: 配置字典，包含 future_kl_modulation 子配置
+        old_log_probs: (B, T) old policy 的 log prob，用于 policy_change signal_type
+    
+    Returns:
+        (B, T) 调制后的 advantage
+    """
+    # 读取配置
+    if config is None:
+        config = {}
+    fkl_cfg = config.get("future_kl_modulation", {})
+    
+    enabled = fkl_cfg.get("enabled", False)
+    if not enabled:
+        return advantages
+    
+    signal_type = fkl_cfg.get("signal_type", "teacher_student_kl")
+    decay_rate = fkl_cfg.get("decay_rate", 128)
+    clip_ratio = fkl_cfg.get("clip_ratio", 0.5)
+    
+    with torch.no_grad():
+        batch_size, response_len = advantages.shape
+        device = advantages.device
+        dtype = advantages.dtype
+        
+        # 1. 计算基础 signal
+        if signal_type == "teacher_student_kl":
+            # KL(π_teacher ∥ π_student) = Σ p_teacher × (log p_teacher - log p_student)
+            # 在采样 token 上的点估计：KL_t ≈ log π_teacher(y_t) - log π_student(y_t)
+            signal = teacher_log_probs - student_log_probs  # (B, T)
+            
+        elif signal_type == "teacher_prob":
+            # Teacher 认可度：直接用 π_teacher(y_t)
+            signal = teacher_log_probs.exp()  # (B, T) ∈ (0, 1)
+            
+        elif signal_type == "policy_change":
+            # FIPO 原版：Δ log p = log π_new - log π_old
+            assert old_log_probs is not None, \
+                "policy_change signal_type requires old_log_probs"
+            signal = student_log_probs - old_log_probs  # (B, T)
+            
+        elif signal_type == "teacher_student_diff":
+            # Teacher 比 student 更倾向该 token 的程度
+            # π_teacher(y_t) - π_student(y_t)，正值表示 teacher 更认可
+            teacher_prob = teacher_log_probs.exp()
+            student_prob = student_log_probs.exp()
+            signal = (teacher_prob - student_prob).clamp(min=0.0)  # (B, T) ≥ 0
+            
+        else:
+            raise ValueError(f"Unknown signal_type: {signal_type}")
+        
+        # 2. 计算 Future-KL：累积 signal
+        # FutureKL_t = Σ_{k=t}^{T} γ^{k-t} · Signal_k
+        gamma = 2 ** (-1.0 / decay_rate)  # 例如 decay_rate=128 -> γ≈0.9946
+        
+        mask_float = response_mask.to(dtype)
+        signal_masked = signal * mask_float
+        
+        # 从后向前累积
+        future_kl = torch.zeros((batch_size, response_len), device=device, dtype=dtype)
+        
+        # 分 chunk 计算以提高效率（向量化实现）
+        chunk_size = 128
+        pos_i = torch.arange(response_len, device=device).unsqueeze(1)  # (L, 1)
+        gamma_t = torch.tensor(gamma, dtype=dtype, device=device)
+        
+        for j_start in range(0, response_len, chunk_size):
+            j_end = min(response_len, j_start + chunk_size)
+            j_idx = torch.arange(j_start, j_end, device=device).unsqueeze(0)  # (1, K)
+            distance = j_idx - pos_i  # (L, K)
+            mask = distance >= 0
+            distance_clamped = distance.clamp(min=0)
+            decay_block = torch.pow(gamma_t, distance_clamped) * mask.to(dtype)  # (L, K)
+            signal_block = signal_masked[:, j_start:j_end]  # (B, K)
+            contrib = torch.matmul(signal_block, decay_block.t())  # (B, L)
+            future_kl += contrib
+        
+        # 3. 转换为 influence weight：exp(future_kl) 裁剪到 [1-ratio, 1+ratio]
+        lower_bound = 1.0 - clip_ratio
+        upper_bound = 1.0 + clip_ratio
+        influence_weights = torch.clamp(
+            torch.exp(future_kl), 
+            min=lower_bound, 
+            max=upper_bound
+        ).detach()
+        
+        # 4. 应用 modulation
+        advantages_modulated = advantages * influence_weights
+        
+        # 5. 打印统计
+        valid_mask = response_mask.bool()
+        iw_valid = influence_weights[valid_mask]
+        fkl_valid = future_kl[valid_mask]
+        signal_valid = signal[valid_mask]
+        
+        print(f"[Future-KL Modulation] signal_type={signal_type}, "
+              f"decay_rate={decay_rate}(γ={gamma:.4f}), clip_ratio={clip_ratio}")
+        print(f"[Future-KL Modulation] Signal: mean={signal_valid.mean():.4f}, "
+              f"std={signal_valid.std():.4f}, min={signal_valid.min():.4f}, max={signal_valid.max():.4f}")
+        print(f"[Future-KL Modulation] FutureKL: mean={fkl_valid.mean():.4f}, "
+              f"std={fkl_valid.std():.4f}, min={fkl_valid.min():.4f}, max={fkl_valid.max():.4f}")
+        print(f"[Future-KL Modulation] Influence weight: mean={iw_valid.mean():.4f}, "
+              f"std={iw_valid.std():.4f}, min={iw_valid.min():.4f}, max={iw_valid.max():.4f}")
+        
+        # 打印 modulation 效果
+        adv_before = advantages[valid_mask]
+        adv_after = advantages_modulated[valid_mask]
+        print(f"[Future-KL Modulation] Advantage: before mean={adv_before.mean():.4f}, "
+              f"after mean={adv_after.mean():.4f}, diff={(adv_after.mean() - adv_before.mean()):.4f}")
+        
+        return advantages_modulated
+
+
 class AdaptiveKLController:
     """
     Adaptive KL controller described in the paper:
