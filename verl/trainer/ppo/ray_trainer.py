@@ -1631,6 +1631,14 @@ class RayPPOTrainer:
 
         from verl.utils.tracking import Tracking
 
+        # 设置全局随机种子（可复现性）
+        seed = self.config.trainer.get("seed", 42)
+        import random
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        print(f"[TASD] Global seed set to {seed}")
+
         logger = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
