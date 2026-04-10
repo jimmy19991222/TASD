@@ -673,6 +673,93 @@ class DataParallelPPOActor(BasePPOActor):
         return outputs
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
+    def compute_teacher_log_probs(self, data: DataProto) -> dict[str, torch.Tensor]:
+        """
+        为TASD计算teacher log-probs（清爽版）。
+        支持 teacher_prob、teacher_log_prob reward_type 和 entropy_gate。
+        当 entropy_gate != "none" 时需要 topk 信息。
+        """
+        self.actor_module.eval()
+
+        temperature      = data.meta_info["temperature"]
+        micro_batch_size = data.meta_info["micro_batch_size"]
+        pad_token_id     = data.meta_info.get("pad_token_id", 0)
+        distill_topk     = data.meta_info.get("distill_topk", None)
+
+        teacher_model = self.teacher_module or self.actor_module
+        micro_batches = data.split(micro_batch_size)
+        teacher_log_probs_lst = []
+        teacher_topk_lst = []
+        student_topk_lst = []
+
+        for micro_batch in micro_batches:
+            micro_batch = micro_batch.to(get_device_id())
+
+            if distill_topk is not None:
+                # ── Step1: student forward，得到student topk indices ──────
+                student_inputs = {
+                    "input_ids":      micro_batch.batch["input_ids"],
+                    "attention_mask": micro_batch.batch["attention_mask"],
+                    "position_ids":   micro_batch.batch["position_ids"],
+                    "responses":      micro_batch.batch["responses"],
+                    "pad_token_id":   pad_token_id,
+                }
+                with torch.no_grad():
+                    student_outputs = self._forward_micro_batch(
+                        student_inputs,
+                        temperature=temperature,
+                        distill_topk=distill_topk,
+                        module=self.actor_module,
+                    )
+                student_topk_lst.append(student_outputs["topk_logps"])
+                student_topk_indices = student_outputs["topk_indices"]
+
+                # ── Step2: teacher在student topk位置gather ───────────────
+                teacher_inputs = {
+                    "input_ids":      micro_batch.batch["teacher_input_ids"],
+                    "attention_mask": micro_batch.batch["teacher_attention_mask"],
+                    "position_ids":   micro_batch.batch["teacher_position_ids"],
+                    "responses":      micro_batch.batch["responses"],
+                    "pad_token_id":   pad_token_id,
+                }
+                with torch.no_grad():
+                    teacher_outputs = self._forward_micro_batch(
+                        teacher_inputs,
+                        temperature=temperature,
+                        distill_topk=None,
+                        topk_indices=student_topk_indices,
+                        module=teacher_model,
+                    )
+                teacher_log_probs_lst.append(teacher_outputs["log_probs"])
+                teacher_topk_lst.append(teacher_outputs["topk_logps"])
+
+            else:
+                # ── 不需要 topk：只需 teacher token log-prob ─────────────
+                teacher_inputs = {
+                    "input_ids":      micro_batch.batch["teacher_input_ids"],
+                    "attention_mask": micro_batch.batch["teacher_attention_mask"],
+                    "position_ids":   micro_batch.batch["teacher_position_ids"],
+                    "responses":      micro_batch.batch["responses"],
+                    "pad_token_id":   pad_token_id,
+                }
+                with torch.no_grad():
+                    teacher_outputs = self._forward_micro_batch(
+                        teacher_inputs,
+                        temperature=temperature,
+                        module=teacher_model,
+                    )
+                teacher_log_probs_lst.append(teacher_outputs["log_probs"])
+
+        result = {
+            "teacher_log_probs_on_response": torch.cat(teacher_log_probs_lst, dim=0)
+        }
+        if teacher_topk_lst:
+            result["teacher_topk_log_probs"] = torch.cat(teacher_topk_lst, dim=0)
+            result["student_topk_log_probs"] = torch.cat(student_topk_lst, dim=0)
+
+        return result
+
+    @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
         self.actor_module.train()

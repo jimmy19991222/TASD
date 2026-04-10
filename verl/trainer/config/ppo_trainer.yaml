@@ -158,6 +158,11 @@ trainer:
   # Save frequency (by iteration) for model checkpoints
   save_freq: -1
 
+  # Metric key to determine the best checkpoint. When set, saves to <save_path>/best/ whenever this metric improves.
+  # Example: "val-core/sciknoweval/acc/mean@16"
+  # If null, no best checkpoint is saved.
+  save_best_metric: null
+
   # ESI refers to the elastic server instance used during training, similar to the training plan. For example,
   # if you purchase 10 hours of computing power, the ESI will automatically shut down after 10 hours of training.
   # To ensure a checkpoint is saved before ESI shuts down, the system will start saving a checkpoint in advance.
@@ -210,6 +215,8 @@ trainer:
   # whether to use legacy worker implementation
   #  mode: "auto", "enable", or "disable"
   use_legacy_worker_impl: auto
+
+  seed: 42
 
 # profiler configs
 global_profiler:

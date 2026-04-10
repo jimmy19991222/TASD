@@ -250,6 +250,21 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    elif adv_estimator == AdvantageEstimator.TASD:
+        # TASD advantage estimation（清爽版）
+        # self_distillation_mask 标识哪些样本有 teacher context
+        sdist_mask = None
+        if "self_distillation_mask" in data.batch:
+            sdist_mask = data.batch["self_distillation_mask"]
+        
+        advantages, returns = core_algos.compute_tasd_advantage(
+            token_level_rewards=data.batch["token_level_rewards"],
+            response_mask=data.batch["response_mask"],
+            index=data.non_tensor_batch["uid"],
+            config=config,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -1177,6 +1192,61 @@ class RayPPOTrainer:
             rm_resource_pool=rm_resource_pool,
         )
 
+    def _get_best_metric_value(self, val_metrics: dict):
+        """Extract the metric value used for best checkpoint tracking.
+
+        Priority:
+        1. trainer.save_best_metric (explicit config)
+        2. First key containing 'mean@' in val-core namespace
+        3. First key containing 'mean@' in any namespace
+        Returns None if no suitable metric found.
+        """
+        explicit = self.config.trainer.get("save_best_metric", None)
+        if explicit:
+            return val_metrics.get(explicit, None), explicit
+        # auto-detect: prefer val-core/*mean@*
+        for k, v in val_metrics.items():
+            if "val-core" in k and "mean@" in k:
+                return v, k
+        for k, v in val_metrics.items():
+            if "mean@" in k:
+                return v, k
+        return None, None
+
+    def _maybe_save_best_checkpoint(self, val_metrics: dict):
+        """Save best checkpoint when the monitored metric improves."""
+        metric_val, metric_key = self._get_best_metric_value(val_metrics)
+        if metric_val is None:
+            return
+        if self._best_val_metric is None or metric_val > self._best_val_metric:
+            self._best_val_metric = metric_val
+            print(
+                f"[BestCkpt] New best {metric_key}={metric_val:.4f} at step {self.global_steps}, saving best checkpoint."
+            )
+            self._save_best_checkpoint()
+
+    def _save_best_checkpoint(self):
+        """Save actor checkpoint to <default_local_dir>/best/actor, always overwriting."""
+        from verl.utils.fs import local_mkdir_safe
+
+        best_folder = os.path.join(self.config.trainer.default_local_dir, "best")
+        actor_local_path = os.path.join(best_folder, "actor")
+        actor_remote_path = (
+            None
+            if self.config.trainer.default_hdfs_dir is None
+            else os.path.join(self.config.trainer.default_hdfs_dir, "best", "actor")
+        )
+        # max_ckpt_to_keep=1 ensures old best is removed when a new best arrives
+        self.actor_rollout_wg.save_checkpoint(
+            actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=1
+        )
+        # write a metadata file so we know which step the best is from
+        local_mkdir_safe(best_folder)
+        best_meta_path = os.path.join(best_folder, "best_step.txt")
+        with open(best_meta_path, "w") as f:
+            f.write(f"step={self.global_steps}\nbest_metric={self._best_val_metric}\n")
+        print(f"[BestCkpt] Best checkpoint saved to {best_folder}")
+
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
 
@@ -1570,6 +1640,7 @@ class RayPPOTrainer:
         )
 
         self.global_steps = 0
+        self._best_val_metric = None  # track best val metric for best checkpoint saving
 
         # load checkpoint before doing anything
         self._load_checkpoint()
@@ -1605,6 +1676,19 @@ class RayPPOTrainer:
             else False
         )
         next_step_profile = False
+
+        # ── TASD 配置解析（循环外，避免每step重复读取）──────────
+        is_tasd = self.config.algorithm.adv_estimator == AdvantageEstimator.TASD
+        if is_tasd:
+            _tasd_cfg = self.config.algorithm.get("tasd", {})
+            tasd_reward_type = _tasd_cfg.get("reward_type", "teacher_prob")
+            tasd_entropy_gate = _tasd_cfg.get("entropy_gate", "none")
+            tasd_temperature = _tasd_cfg.get("distill_temperature", None) or self.config.actor_rollout_ref.rollout.temperature
+            tasd_micro_batch_size = self.config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu
+            # entropy_gate 需要 topk 信息
+            tasd_need_topk = tasd_entropy_gate != "none"
+            tasd_distill_topk = _tasd_cfg.get("distill_topk", 100) if tasd_need_topk else None
+        # ────────────────────────────────────────────────────────
 
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -1802,6 +1886,48 @@ class RayPPOTrainer:
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
+                        # ── TASD: 计算 teacher token-level rewards ─────────────────────
+                        if is_tasd and "teacher_input_ids" in batch.batch:
+                            teacher_fwd_batch = DataProto.from_dict(
+                                tensors={
+                                    "teacher_input_ids":      batch.batch["teacher_input_ids"],
+                                    "teacher_attention_mask": batch.batch["teacher_attention_mask"],
+                                    "teacher_position_ids":   batch.batch["teacher_position_ids"],
+                                    "responses":              batch.batch["responses"],
+                                    "input_ids":              batch.batch["input_ids"],
+                                    "attention_mask":         batch.batch["attention_mask"],
+                                    "position_ids":           batch.batch["position_ids"],
+                                }
+                            )
+                            teacher_fwd_batch.meta_info = {
+                                "temperature":      tasd_temperature,
+                                "micro_batch_size": tasd_micro_batch_size,
+                                "pad_token_id":     self.tokenizer.pad_token_id,
+                                "distill_topk":     tasd_distill_topk,
+                            }
+
+                            with marked_timer("tasd_teacher_fwd", timing_raw, color="cyan"):
+                                teacher_result = self.actor_rollout_wg.compute_teacher_log_probs(
+                                    teacher_fwd_batch
+                                )
+
+                            token_rewards = core_algos.compute_tasd_token_rewards(
+                                student_log_probs=batch.batch["old_log_probs"],
+                                teacher_log_probs=teacher_result.batch["teacher_log_probs_on_response"],
+                                student_topk_log_probs=teacher_result.batch.get("student_topk_log_probs"),
+                                teacher_topk_log_probs=teacher_result.batch.get("teacher_topk_log_probs"),
+                                reward_type=tasd_reward_type,
+                                entropy_gate=tasd_entropy_gate,
+                            )
+
+                            # Mask out padding positions
+                            response_mask_float = batch.batch["response_mask"].float()
+                            token_rewards = token_rewards * response_mask_float
+
+                            # 覆盖 token_level_rewards
+                            batch.batch["token_level_rewards"] = token_rewards
+                        # ────────────────────────────────────────────────────────────
+
                         # Compute rollout correction: IS weights, rejection sampling, and metrics
                         # Only runs in decoupled mode (computes once per batch using stable π_old)
                         # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
@@ -1863,6 +1989,8 @@ class RayPPOTrainer:
                         if is_last_step:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
+                    # save best checkpoint if val metric improved
+                    self._maybe_save_best_checkpoint(val_metrics)
 
                 # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                 esi_close_to_expiration = should_save_ckpt_esi(
