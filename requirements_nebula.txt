@@ -1,5 +1,26 @@
-# Minimal requirements for Nebula cluster
-# The base docker image already has torch, transformers, etc.
+# SDPO Nebula 运行环境依赖（精简版）
+# 
+# 原则：pytorch260 镜像已预装大部分库，只安装镜像中没有的或 SDPO 特有的
+# 已预装：torch, vllm, flash-attn, transformers, accelerate, datasets,
+#         ray, pandas, numpy, pyarrow, wandb 等
 
-# Additional dependencies
-swanlab
+# ── SDPO 特有依赖（镜像中可能没有）────────────────────────────────────────────
+vllm>=0.9.0
+swanlab                     # 日志（替代 ml_tracker）
+openlm-hub                  # 模型加载
+codetiming                  # 性能计时
+liger-kernel                # 高效 kernel
+tensordict
+hydra-core
+omegaconf                   # hydra 配置
+dill                        # 序列化
+pybind11                    # C++ 绑定
+pylatexenc                  # LaTeX 编码
+torchdata                   # 数据加载
+peft                        # LoRA/PEFT 训练
+
+# ── 奖励评估（sciknoweval 数学验证需要）───────────────────────────────────────
+math-verify[antlr4_9_3]
+latex2sympy2_extended
+latex2sympy2
+word2number
