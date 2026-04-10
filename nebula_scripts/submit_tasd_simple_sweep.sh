@@ -61,7 +61,7 @@ CLIP_ADV_VALUES=(
 # ── 固定参数 ────────────────────────────────────────────────────────────
 LR="1e-5"
 SEED="42"
-TEACHER_REG="none"
+TEACHER_REG="ema"
 TEACHER_UPDATE_RATE="0.1"
 REPETITION_PENALTY="1.1"
 TRAIN_BATCH_SIZE="32"
