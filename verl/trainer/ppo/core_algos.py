@@ -107,6 +107,7 @@ class AdvantageEstimator(str, Enum):
     GRPO_VECTORIZED = "grpo_vectorized"
     OPTIMAL_TOKEN_BASELINE = "optimal_token_baseline"
     TIR_OPTIMAL_TOKEN_BASELINE = "tir_optimal_token_baseline"
+    TASD = "tasd"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -2306,3 +2307,153 @@ def compute_policy_loss_bypass_mode(
     pg_metrics.update(rollout_metrics)
 
     return pg_loss, pg_metrics
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TASD (Test-time Self-Distillation) - 清爽版
+# 核心功能：
+#   - reward_type: teacher_prob | teacher_log_prob
+#   - entropy_gate: none | hard | soft（筛选有效训练信号）
+#   - clip_adv: advantage clipping
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def compute_tasd_token_rewards(
+    student_log_probs: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    student_topk_log_probs: Optional[torch.Tensor] = None,
+    teacher_topk_log_probs: Optional[torch.Tensor] = None,
+    reward_type: str = "teacher_prob",
+    entropy_gate: str = "none",
+) -> torch.Tensor:
+    """
+    TASD token-level reward 计算（清爽版）。
+    
+    Args:
+        student_log_probs: (B, T) - student 对生成 token 的 log_prob
+        teacher_log_probs: (B, T) - teacher 对生成 token 的 log_prob
+        student_topk_log_probs: (B, T, K) - student topk log_probs（熵门控需要）
+        teacher_topk_log_probs: (B, T, K) - teacher topk log_probs（熵门控需要）
+        reward_type: "teacher_prob" | "teacher_log_prob"
+        entropy_gate: "none" | "hard" | "soft" - 熵门控模式
+    
+    Returns:
+        reward: (B, T) - token-level reward
+    """
+    # ── 计算 reward ─────────────────────────────────────────────────────────
+    if reward_type == "teacher_prob":
+        # teacher 对 student 生成 token 的概率
+        # 值域 (0, 1]，数值稳定性：clamp log_prob
+        reward = teacher_log_probs.clamp(min=-20.0).exp()
+    
+    elif reward_type == "teacher_log_prob":
+        # teacher 的 log_prob
+        # 值域 (-∞, 0]，保留更多信息
+        reward = teacher_log_probs.clamp(min=-20.0, max=0.0)
+    
+    else:
+        raise ValueError(f"Unknown reward_type: {reward_type}. Supported: teacher_prob, teacher_log_prob")
+    
+    # ── entropy gate: 熵门控，筛选有效训练信号 ──────────────────────────────
+    # 核心思想：只有当 teacher 比 student 更确定（熵更低）时，信号才可靠
+    if entropy_gate != "none":
+        assert student_topk_log_probs is not None and teacher_topk_log_probs is not None, \
+            f"entropy_gate={entropy_gate} requires topk information (set distill_topk)"
+        
+        # 计算熵 H(p) = -sum(p * log(p))
+        teacher_topk_probs = teacher_topk_log_probs.exp()
+        student_topk_probs = student_topk_log_probs.exp()
+        
+        teacher_entropy = -(teacher_topk_probs * teacher_topk_log_probs.clamp(min=-20.0)).sum(dim=-1)
+        student_entropy = -(student_topk_probs * student_topk_log_probs.clamp(min=-20.0)).sum(dim=-1)
+        
+        if entropy_gate == "hard":
+            # 硬筛选：只有 teacher 更确定的位置才保留信号
+            entropy_mask = (teacher_entropy < student_entropy).float()
+            reward = reward * entropy_mask
+        
+        elif entropy_gate == "soft":
+            # 软门控：熵差作为权重
+            entropy_weight = (student_entropy - teacher_entropy).clamp(min=0.0)
+            # 归一化
+            nonzero_mask = entropy_weight > 0
+            if nonzero_mask.any():
+                max_weight = entropy_weight[nonzero_mask].max().clamp(min=1e-6)
+                entropy_weight = entropy_weight / max_weight
+            reward = reward * entropy_weight
+    
+    
+    return reward
+
+
+@register_adv_est(AdvantageEstimator.TASD)
+def compute_tasd_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index,  # uid for grouping
+    config: Optional[Any] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    TASD advantage 计算（清爽版）。
+    
+    特点：
+    - 从 reward=0 的位置过滤掉（已被熵门控过滤）
+    - group_mean 归一化
+    - advantage clipping
+    
+    Args:
+        token_level_rewards: (B, T) - token-level rewards
+        response_mask: (B, T) - 有效 token mask
+        index: uid for grouping responses
+        config: 配置对象，读取 tasd.clip_adv 和 clip_adv_value
+    
+    Returns:
+        advantages: (B, T)
+        returns: (B, T) - 与 advantages 相同（TASD 不使用 value function）
+    """
+    # 读取配置
+    tasd_cfg = config.get("tasd", {}) if config else {}
+    clip_adv = tasd_cfg.get("clip_adv", True)
+    clip_adv_value = tasd_cfg.get("clip_adv_value", 2.0)
+    
+    with torch.no_grad():
+        # ── 排除 reward=0 的位置 ───────────────────────────────────────────
+        # 这些位置被熵门控过滤，不应参与 group_mean 计算
+        nonzero_mask = (token_level_rewards.abs() > 1e-8).float()
+        effective_mask = response_mask * nonzero_mask
+        
+        advantages = torch.zeros_like(token_level_rewards)
+        
+        # 按 uid 分组
+        uid_to_indices = defaultdict(list)
+        for i in range(token_level_rewards.shape[0]):
+            uid_to_indices[index[i]].append(i)
+        
+        for uid, indices in uid_to_indices.items():
+            # 收集有效 token 的 reward
+            valid_rewards = []
+            for i in indices:
+                valid_r = token_level_rewards[i][effective_mask[i].bool()]
+                if valid_r.numel() > 0:
+                    valid_rewards.append(valid_r)
+            
+            if len(valid_rewards) == 0:
+                continue
+            
+            all_rewards = torch.cat(valid_rewards)
+            group_mean = all_rewards.mean()
+            
+            # 计算 advantage = reward - group_mean
+            for i in indices:
+                adv_i = token_level_rewards[i] - group_mean
+                advantages[i] = adv_i * effective_mask[i]
+        
+        
+        # ── Advantage clipping ──────────────────────────────────────────────
+        valid_mask = effective_mask.bool()
+        if clip_adv:
+            clipped = torch.clamp(advantages, min=-clip_adv_value, max=clip_adv_value)
+            advantages = torch.where(valid_mask, clipped, advantages)
+        
+        # 返回 advantages 和 returns（TASD 中 returns = advantages）
+        return advantages, advantages

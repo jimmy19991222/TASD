@@ -1,0 +1,59 @@
+defaults:
+  - ppo_trainer
+  - user
+  - _self_
+
+max_model_len: 18944
+
+# ── 随机种子（可复现性）─────────────────────────────────────────────────
+seed: 42
+
+actor_rollout_ref:
+  actor:
+    ppo_mini_batch_size: 32
+    entropy_coeff: 0.0
+    policy_loss:
+      loss_mode: tasd
+    self_distillation:
+      max_reprompt_len: 10240
+      is_clip: 2.0
+      # EMA teacher 配置
+      teacher_regularization: "none"
+      teacher_update_rate: 0.05
+      include_environment_feedback: false
+      success_reward_threshold: 1.0
+    optim:
+      lr: 1e-5
+  rollout:
+    n: 8
+    calculate_log_probs: True
+    repetition_penalty: 1.05
+
+algorithm:
+  adv_estimator: tasd
+  norm_adv_by_std_in_grpo: False
+  tasd:
+    # ── 核心参数（清爽版）────────────────────────────────────
+    reward_type: "teacher_prob"     # "teacher_prob" | "teacher_log_prob"
+    
+    # ── entropy gate: 熵门控，筛选有效训练信号 ──────────────────
+    entropy_gate: "none"            # "none" | "hard" | "soft"
+    
+    # ── distill topk（熵门控需要）─────────────────────────────
+    distill_topk: 100
+    distill_temperature: 1.0
+    
+    # ── advantage clipping ────────────────────────────────────
+    clip_adv: true
+    clip_adv_value: 2.0
+    
+    # ── 成功 rollout 配置 ─────────────────────────────────────
+    include_successful_rollouts: true
+    use_self_as_teacher_on_success: true
+    success_reward_threshold: 1.0
+
+data:
+  train_batch_size: 32
+
+trainer:
+  val_before_train: False

@@ -1,0 +1,5 @@
+# Minimal requirements for Nebula cluster
+# The base docker image already has torch, transformers, etc.
+
+# Additional dependencies
+swanlab
