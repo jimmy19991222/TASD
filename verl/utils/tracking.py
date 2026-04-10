@@ -49,7 +49,7 @@ class Tracking:
         "file",
     ]
 
-    def __init__(self, project_name, experiment_name, default_backend: str | list[str] = "console", config=None, group_name=None):
+    def __init__(self, project_name, experiment_name, default_backend: str | list[str] = "console", config=None, group_name=None, tags=None):
         if isinstance(default_backend, str):
             default_backend = [default_backend]
         for backend in default_backend:
@@ -121,6 +121,8 @@ class Tracking:
                 config={"FRAMEWORK": "verl", **config},
                 logdir=SWANLAB_LOG_DIR,
                 mode=SWANLAB_MODE,
+                group=group_name,
+                tags=tags if tags else [],
             )
             self.logger["swanlab"] = swanlab
 

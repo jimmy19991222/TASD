@@ -1359,6 +1359,10 @@ def compute_policy_loss_vanilla(
     return pg_loss, pg_metrics
 
 
+# TASD 使用与 vanilla 相同的 PPO clipped loss，通过 loss_mode="tasd" 区分以便初始化 teacher_module
+register_policy_loss("tasd")(compute_policy_loss_vanilla)
+
+
 @register_policy_loss("gspo")
 def compute_policy_loss_gspo(
     old_log_prob: torch.Tensor,
