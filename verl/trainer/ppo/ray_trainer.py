@@ -262,6 +262,7 @@ def compute_advantage(
             response_mask=data.batch["response_mask"],
             index=data.non_tensor_batch["uid"],
             config=config,
+            self_distillation_mask=sdist_mask,
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
@@ -670,13 +671,28 @@ class RayPPOTrainer:
         response_texts: list[str],
         dont_reprompt_on_self_success: bool = False,
         remove_thinking_from_demonstration: bool = False,
+        fallback_to_self: bool = False,
+        use_self_as_teacher_on_success: bool = False,
     ) -> Optional[str]:
         uid = uids[idx]
         solution_idxs = success_by_uid[uid]
+        is_self_success = idx in solution_idxs
+
+        # 成功 rollout 用自己的 response 作为 teacher context
+        if use_self_as_teacher_on_success and is_self_success:
+            solution = response_texts[idx]
+            if remove_thinking_from_demonstration:
+                solution = self._remove_thinking_trace(solution)
+            return solution
+
         if dont_reprompt_on_self_success:
             solution_idxs = [j for j in solution_idxs if j != idx]
+
         if len(solution_idxs) == 0:
+            if fallback_to_self and is_self_success:
+                return response_texts[idx]
             return None
+
         solution_idx = solution_idxs[0]  # taking the first successful demonstration effectively selects a random one
         solution_str = response_texts[solution_idx]
         if remove_thinking_from_demonstration:
@@ -692,8 +708,20 @@ class RayPPOTrainer:
     ) -> Optional[tuple[DataProto, dict[str, float]]]:
         self_distillation_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
         loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
-        if self_distillation_cfg is None or loss_mode != "sdpo":
+        adv_estimator = self.config.algorithm.adv_estimator
+
+        is_sdpo = loss_mode == "sdpo"
+        is_tasd = adv_estimator == "tasd"
+        if self_distillation_cfg is None or (not is_sdpo and not is_tasd):
             return None
+
+        tasd_cfg = self.config.algorithm.get("tasd", {})
+
+        # use_self_as_teacher_on_success：只对TASD生效
+        use_self_as_teacher_on_success = (
+            is_tasd
+            and tasd_cfg.get("use_self_as_teacher_on_success", False)
+        )
 
         device = batch.batch["input_ids"].device
         response_mask = batch.batch["response_mask"]
@@ -718,6 +746,8 @@ class RayPPOTrainer:
                 response_texts,
                 self_distillation_cfg.dont_reprompt_on_self_success,
                 self_distillation_cfg.get("remove_thinking_from_demonstration", False),
+                fallback_to_self=False,
+                use_self_as_teacher_on_success=use_self_as_teacher_on_success,
             )
             for i in range(batch_size)
         ]
@@ -1968,7 +1998,7 @@ class RayPPOTrainer:
                                     teacher_fwd_batch
                                 )
 
-                            token_rewards = core_algos.compute_tasd_token_rewards(
+                            token_rewards, gate_mask = core_algos.compute_tasd_token_rewards(
                                 student_log_probs=batch.batch["old_log_probs"],
                                 teacher_log_probs=teacher_result.batch["teacher_log_probs_on_response"],
                                 student_topk_log_probs=teacher_result.batch.get("student_topk_log_probs"),
@@ -1983,6 +2013,83 @@ class RayPPOTrainer:
 
                             # 覆盖 token_level_rewards
                             batch.batch["token_level_rewards"] = token_rewards
+
+                            # ── 记录 TASD token reward 指标 ─────────────────────────────
+                            response_mask_bool = batch.batch["response_mask"].bool()
+                            valid_token_rewards = token_rewards[response_mask_bool]
+
+                            metrics["tasd/token_reward_mean"] = valid_token_rewards.mean().item()
+                            metrics["tasd/token_reward_std"] = valid_token_rewards.std().item() if valid_token_rewards.numel() > 1 else 0.0
+                            metrics["tasd/token_reward_pos_rate"] = (valid_token_rewards > 0).float().mean().item()
+
+                            # ── 记录 entropy gate 指标 ─────────────────────────────
+                            # 生成 token 数量（每条 response）
+                            response_token_counts = response_mask_float.sum(dim=-1)  # (B,)
+                            metrics["tasd/gen_token_count_mean"] = response_token_counts.mean().item()
+                            metrics["tasd/gen_token_count_max"] = response_token_counts.max().item()
+                            metrics["tasd/gen_token_count_min"] = response_token_counts.min().item()
+
+                            # 熵门控统计：使用 gate_mask 计算
+                            # gate_mask: None (无门控) | (B,T) float [0,1]
+                            # - hard: 0/1 二值，1=保留，0=丢弃
+                            # - soft: 连续权重，表示保留程度
+                            if gate_mask is not None:
+                                # 只统计 response 内的 token
+                                gate_mask_masked = gate_mask * response_mask_float  # (B, T)
+                                
+                                # 平均保留权重（soft 模式下是连续值）
+                                gate_retention_ratio = gate_mask_masked.sum(dim=-1) / response_token_counts.clamp(min=1.0)  # (B,)
+                                metrics["tasd/gate_retention_ratio_mean"] = gate_retention_ratio.mean().item()
+                                metrics["tasd/gate_retention_ratio_max"] = gate_retention_ratio.max().item()
+                                metrics["tasd/gate_retention_ratio_min"] = gate_retention_ratio.min().item()
+                                
+                                # hard 模式：统计被丢弃的 token 数量
+                                if tasd_entropy_gate == "hard":
+                                    dropped_counts = (gate_mask_masked < 0.5).float().sum(dim=-1)  # (B,)
+                                    metrics["tasd/gate_dropped_count_mean"] = dropped_counts.mean().item()
+                                    metrics["tasd/gate_dropped_count_max"] = dropped_counts.max().item()
+                                    metrics["tasd/gate_dropped_count_min"] = dropped_counts.min().item()
+                            else:
+                                # 无熵门控时，所有 token 都保留
+                                metrics["tasd/gate_retention_ratio_mean"] = 1.0
+                                metrics["tasd/gate_retention_ratio_max"] = 1.0
+                                metrics["tasd/gate_retention_ratio_min"] = 1.0
+
+                            # 按 success/fail 分组统计（需要 acc 字段）
+                            if "acc" in batch.batch:
+                                acc = batch.batch["acc"]
+                            elif "acc" in batch.non_tensor_batch:
+                                acc = torch.tensor(
+                                    batch.non_tensor_batch["acc"],
+                                    dtype=torch.float32,
+                                    device=token_rewards.device,
+                                )
+                            else:
+                                acc = None
+
+                            if acc is not None:
+                                tasd_success_threshold = tasd_cfg.get("success_reward_threshold", 1.0)
+                                success_mask_1d = acc >= tasd_success_threshold
+                                fail_mask_1d = ~success_mask_1d
+
+                                def _masked_valid_tokens_2d(tensor_2d, seq_mask_1d, token_mask):
+                                    combined_mask = token_mask * seq_mask_1d.unsqueeze(-1).float()
+                                    return tensor_2d[combined_mask.bool()]
+
+                                success_rewards = _masked_valid_tokens_2d(token_rewards, success_mask_1d, response_mask_bool)
+                                fail_rewards = _masked_valid_tokens_2d(token_rewards, fail_mask_1d, response_mask_bool)
+
+                                if success_rewards.numel() > 0:
+                                    metrics["tasd/token_reward_mean_success"] = success_rewards.mean().item()
+                                    metrics["tasd/token_reward_std_success"] = (
+                                        success_rewards.std().item() if success_rewards.numel() > 1 else 0.0
+                                    )
+                                if fail_rewards.numel() > 0:
+                                    metrics["tasd/token_reward_mean_fail"] = fail_rewards.mean().item()
+                                    metrics["tasd/token_reward_std_fail"] = (
+                                        fail_rewards.std().item() if fail_rewards.numel() > 1 else 0.0
+                                    )
+                                metrics["tasd/success_rate"] = success_mask_1d.float().mean().item()
                         # ────────────────────────────────────────────────────────────
 
                         # Compute rollout correction: IS weights, rejection sampling, and metrics
@@ -2014,6 +2121,13 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+
+                        # ── TASD: 记录 advantage 分布指标 ───────────────────────────────
+                        if is_tasd:
+                            valid_adv = batch.batch["advantages"][batch.batch["response_mask"].bool()]
+                            metrics["tasd/advantage_mean"] = valid_adv.mean().item()
+                            metrics["tasd/advantage_std"] = valid_adv.std().item() if valid_adv.numel() > 1 else 0.0
+                            metrics["tasd/advantage_pos_rate"] = (valid_adv > 0).float().mean().item()
 
                     # update critic
                     if self.use_critic:

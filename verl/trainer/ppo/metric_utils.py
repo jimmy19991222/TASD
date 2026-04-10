@@ -136,6 +136,12 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
 
+    # Check for empty tensors or NaN values - use 0.0 as fallback
+    if valid_adv.numel() == 0 or torch.isnan(valid_adv).any():
+        valid_adv = torch.tensor([0.0], device=advantages.device)
+    if valid_returns.numel() == 0 or torch.isnan(valid_returns).any():
+        valid_returns = torch.tensor([0.0], device=returns.device)
+
     if use_critic:
         values = batch.batch["values"]
         valid_values = torch.masked_select(values, response_mask)

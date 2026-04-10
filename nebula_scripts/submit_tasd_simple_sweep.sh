@@ -27,6 +27,10 @@ PROJECT_NAME="TASD_simple"
 # ── 数据集配置 ──────────────────────────────────────────────────────
 DATASETS=(
     "sciknoweval/biology"
+    # "sciknoweval/chemistry"
+    # "sciknoweval/material"
+    # "sciknoweval/physics"
+    # "tooluse"
 )
 
 # ── dry-run 模式 ─────────────────────────────────────────────────────────
@@ -132,7 +136,7 @@ for NORM_ADV_BY_STD in "${NORM_ADV_BY_STD_LIST[@]}"; do
     fi
 
     CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
-    JOB_NAME="TASD-simple-${DATASET_SHORT}-rt${REWARD_TYPE}${ENTROPY_TAG}-clip${CLIP_ADV_VALUE}${TOPK_TAG}${REP_TAG}${STD_TAG}-${MODEL_SHORT}-${CURRENT_TIME}"
+    JOB_NAME="TASD-simple-${DATASET_SHORT}-rt_${REWARD_TYPE}${ENTROPY_TAG}-clip${CLIP_ADV_VALUE}${TOPK_TAG}${REP_TAG}${STD_TAG}-${MODEL_SHORT}-${CURRENT_TIME}"
 
     # ── 提交 ────────────────────────────────────────────────────────
     if [ "$DRY_RUN" = true ]; then

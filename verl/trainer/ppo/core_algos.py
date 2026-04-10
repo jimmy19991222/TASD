@@ -2328,9 +2328,9 @@ def compute_tasd_token_rewards(
     teacher_topk_log_probs: Optional[torch.Tensor] = None,
     reward_type: str = "teacher_prob",
     entropy_gate: str = "none",
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """
-    TASD token-level reward 计算（清爽版）。
+    TASD token-level reward 计算（清爽版）.
     
     Args:
         student_log_probs: (B, T) - student 对生成 token 的 log_prob
@@ -2342,6 +2342,7 @@ def compute_tasd_token_rewards(
     
     Returns:
         reward: (B, T) - token-level reward
+        gate_mask: (B, T) or None - 熵门控 mask（1=保留, 0=丢弃），entropy_gate="none" 时为 None
     """
     # ── 计算 reward ─────────────────────────────────────────────────────────
     if reward_type == "teacher_prob":
@@ -2357,8 +2358,13 @@ def compute_tasd_token_rewards(
     else:
         raise ValueError(f"Unknown reward_type: {reward_type}. Supported: teacher_prob, teacher_log_prob")
     
+    # 保护：处理可能的 NaN/Inf 值
+    reward = torch.where(torch.isfinite(reward), reward, torch.zeros_like(reward))
+    
     # ── entropy gate: 熵门控，筛选有效训练信号 ──────────────────────────────
     # 核心思想：只有当 teacher 比 student 更确定（熵更低）时，信号才可靠
+    gate_mask = None  # 默认 None，表示没有熵门控
+    
     if entropy_gate != "none":
         assert student_topk_log_probs is not None and teacher_topk_log_probs is not None, \
             f"entropy_gate={entropy_gate} requires topk information (set distill_topk)"
@@ -2372,8 +2378,8 @@ def compute_tasd_token_rewards(
         
         if entropy_gate == "hard":
             # 硬筛选：只有 teacher 更确定的位置才保留信号
-            entropy_mask = (teacher_entropy < student_entropy).float()
-            reward = reward * entropy_mask
+            gate_mask = (teacher_entropy < student_entropy).float()
+            reward = reward * gate_mask
         
         elif entropy_gate == "soft":
             # 软门控：熵差作为权重
@@ -2383,10 +2389,12 @@ def compute_tasd_token_rewards(
             if nonzero_mask.any():
                 max_weight = entropy_weight[nonzero_mask].max().clamp(min=1e-6)
                 entropy_weight = entropy_weight / max_weight
-            reward = reward * entropy_weight
+            # soft 模式下 gate_mask 是连续值（权重），表示保留程度
+            gate_mask = entropy_weight
+            reward = reward * gate_mask
     
     
-    return reward
+    return reward, gate_mask
 
 
 @register_adv_est(AdvantageEstimator.TASD)
@@ -2395,13 +2403,13 @@ def compute_tasd_advantage(
     response_mask: torch.Tensor,
     index,  # uid for grouping
     config: Optional[Any] = None,
+    self_distillation_mask: Optional[torch.Tensor] = None,  # (B,) bool tensor
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     TASD advantage 计算（清爽版）。
     
     特点：
-    - reward=0 的位置过滤掉（已被熵门控过滤），不参与 mean/std 统计
     - group_mean 归一化，可选 group_std 归一化（norm_adv_by_std）
     - advantage clipping
     
@@ -2410,6 +2418,7 @@ def compute_tasd_advantage(
         response_mask: (B, T) - 有效 token mask
         index: uid for grouping responses
         config: 配置对象，读取 tasd.clip_adv / clip_adv_value / norm_adv_by_std
+        self_distillation_mask: (B,) bool tensor，标识哪些样本有 teacher context
     
     Returns:
         advantages: (B, T)
@@ -2422,10 +2431,10 @@ def compute_tasd_advantage(
     norm_adv_by_std = tasd_cfg.get("norm_adv_by_std", False)
     
     with torch.no_grad():
-        # ── 排除 reward=0 的位置 ───────────────────────────────────────────
-        # 这些位置被熵门控过滤（entropy_gate 置 0），不应参与 mean/std 统计
-        nonzero_mask = (token_level_rewards.abs() > 1e-8).float()
-        effective_mask = response_mask * nonzero_mask
+        # ── 计算 effective_mask ───────────────────────────────────────────
+        effective_mask = response_mask.float()
+        if self_distillation_mask is not None:
+            effective_mask = effective_mask * self_distillation_mask.unsqueeze(1).float()
         
         advantages = torch.zeros_like(token_level_rewards)
         
@@ -2448,7 +2457,7 @@ def compute_tasd_advantage(
             all_rewards = torch.cat(valid_rewards)
             group_mean = all_rewards.mean()
             
-            # 可选：除以 group std（基于 effective token 统计，与 mean 保持一致）
+            # 可选：除以 group std
             if norm_adv_by_std:
                 group_std = all_rewards.std().clamp(min=1e-8)
             else:
@@ -2466,6 +2475,9 @@ def compute_tasd_advantage(
         if clip_adv:
             clipped = torch.clamp(advantages, min=-clip_adv_value, max=clip_adv_value)
             advantages = torch.where(valid_mask, clipped, advantages)
+        
+        # 保护：处理可能的 NaN/Inf 值
+        advantages = torch.where(torch.isfinite(advantages), advantages, torch.zeros_like(advantages))
         
         # 返回 advantages 和 returns（TASD 中 returns = advantages）
         return advantages, advantages
