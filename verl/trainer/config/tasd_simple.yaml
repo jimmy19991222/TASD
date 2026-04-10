@@ -44,6 +44,7 @@ algorithm:
     distill_temperature: 1.0
     
     # ── advantage clipping ────────────────────────────────────
+    norm_adv_by_std: false          # 是否除以 group std（std 基于 effective token 统计，排除熵门控过滤的位置）
     clip_adv: true
     clip_adv_value: 2.0
     

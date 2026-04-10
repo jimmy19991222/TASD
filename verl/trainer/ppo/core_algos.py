@@ -2401,15 +2401,15 @@ def compute_tasd_advantage(
     TASD advantage 计算（清爽版）。
     
     特点：
-    - 从 reward=0 的位置过滤掉（已被熵门控过滤）
-    - group_mean 归一化
+    - reward=0 的位置过滤掉（已被熵门控过滤），不参与 mean/std 统计
+    - group_mean 归一化，可选 group_std 归一化（norm_adv_by_std）
     - advantage clipping
     
     Args:
         token_level_rewards: (B, T) - token-level rewards
         response_mask: (B, T) - 有效 token mask
         index: uid for grouping responses
-        config: 配置对象，读取 tasd.clip_adv 和 clip_adv_value
+        config: 配置对象，读取 tasd.clip_adv / clip_adv_value / norm_adv_by_std
     
     Returns:
         advantages: (B, T)
@@ -2419,10 +2419,11 @@ def compute_tasd_advantage(
     tasd_cfg = config.get("tasd", {}) if config else {}
     clip_adv = tasd_cfg.get("clip_adv", True)
     clip_adv_value = tasd_cfg.get("clip_adv_value", 2.0)
+    norm_adv_by_std = tasd_cfg.get("norm_adv_by_std", False)
     
     with torch.no_grad():
         # ── 排除 reward=0 的位置 ───────────────────────────────────────────
-        # 这些位置被熵门控过滤，不应参与 group_mean 计算
+        # 这些位置被熵门控过滤（entropy_gate 置 0），不应参与 mean/std 统计
         nonzero_mask = (token_level_rewards.abs() > 1e-8).float()
         effective_mask = response_mask * nonzero_mask
         
@@ -2434,7 +2435,7 @@ def compute_tasd_advantage(
             uid_to_indices[index[i]].append(i)
         
         for uid, indices in uid_to_indices.items():
-            # 收集有效 token 的 reward
+            # 收集有效 token 的 reward（仅 effective_mask=1 的位置）
             valid_rewards = []
             for i in indices:
                 valid_r = token_level_rewards[i][effective_mask[i].bool()]
@@ -2447,11 +2448,18 @@ def compute_tasd_advantage(
             all_rewards = torch.cat(valid_rewards)
             group_mean = all_rewards.mean()
             
-            # 计算 advantage = reward - group_mean
+            # 可选：除以 group std（基于 effective token 统计，与 mean 保持一致）
+            if norm_adv_by_std:
+                group_std = all_rewards.std().clamp(min=1e-8)
+            else:
+                group_std = None
+            
+            # 计算 advantage = (reward - group_mean) [/ group_std]
             for i in indices:
                 adv_i = token_level_rewards[i] - group_mean
+                if norm_adv_by_std and group_std is not None:
+                    adv_i = adv_i / group_std
                 advantages[i] = adv_i * effective_mask[i]
-        
         
         # ── Advantage clipping ──────────────────────────────────────────────
         valid_mask = effective_mask.bool()

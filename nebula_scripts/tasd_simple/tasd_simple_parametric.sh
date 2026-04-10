@@ -25,6 +25,7 @@ SEED="${SEED:-42}"
 TEACHER_REG="${TEACHER_REG:-ema}"
 TEACHER_UPDATE_RATE="${TEACHER_UPDATE_RATE:-0.05}"
 CLIP_ADV="${CLIP_ADV:-true}"
+NORM_ADV_BY_STD="${NORM_ADV_BY_STD:-false}"
 DISTILL_TOPK="${DISTILL_TOPK:-100}"
 DISTILL_TEMPERATURE="${DISTILL_TEMPERATURE:-1.0}"
 REPETITION_PENALTY="${REPETITION_PENALTY:-1.05}"
@@ -67,7 +68,7 @@ echo "TASD 清爽版实验配置："
 echo "  DATASET: ${DATASET}"
 echo "  REWARD_TYPE: ${REWARD_TYPE}"
 echo "  ENTROPY_GATE: ${ENTROPY_GATE}"
-echo "  CLIP_ADV: ${CLIP_ADV}, VALUE: ${CLIP_ADV_VALUE}"
+echo "  CLIP_ADV: ${CLIP_ADV}, VALUE: ${CLIP_ADV_VALUE}, NORM_BY_STD: ${NORM_ADV_BY_STD}"
 echo "  DISTILL_TOPK: ${DISTILL_TOPK}"
 echo "  SEED: ${SEED}"
 echo "============================================"
@@ -97,6 +98,7 @@ python -m verl.trainer.main_ppo \
     algorithm.tasd.entropy_gate=${ENTROPY_GATE} \
     algorithm.tasd.distill_topk=${DISTILL_TOPK} \
     algorithm.tasd.distill_temperature=${DISTILL_TEMPERATURE} \
+    algorithm.tasd.norm_adv_by_std=${NORM_ADV_BY_STD} \
     algorithm.tasd.clip_adv=${CLIP_ADV} \
     algorithm.tasd.clip_adv_value=${CLIP_ADV_VALUE} \
     algorithm.tasd.use_self_as_teacher_on_success=${INCLUDE_SUCCESSFUL_ROLLOUTS} \

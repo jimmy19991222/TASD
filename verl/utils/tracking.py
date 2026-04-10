@@ -115,15 +115,18 @@ class Tracking:
 
             if config is None:
                 config = {}  # make sure config is not None, otherwise **config will raise error
-            swanlab.init(
-                project=project_name,
-                experiment_name=experiment_name,
-                config={"FRAMEWORK": "verl", **config},
-                logdir=SWANLAB_LOG_DIR,
-                mode=SWANLAB_MODE,
-                group=group_name,
-                tags=tags if tags else [],
-            )
+            swanlab_init_kwargs = {
+                "project": project_name,
+                "experiment_name": experiment_name,
+                "config": {"FRAMEWORK": "verl", **config},
+                "logdir": SWANLAB_LOG_DIR,
+                "mode": SWANLAB_MODE,
+            }
+            if group_name:
+                swanlab_init_kwargs["group"] = group_name
+            if tags:
+                swanlab_init_kwargs["tags"] = tags if isinstance(tags, list) else [tags]
+            swanlab.init(**swanlab_init_kwargs)
             self.logger["swanlab"] = swanlab
 
         if "vemlp_wandb" in default_backend:
