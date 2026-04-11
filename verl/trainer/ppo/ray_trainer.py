@@ -2068,7 +2068,7 @@ class RayPPOTrainer:
                                 acc = None
 
                             if acc is not None:
-                                tasd_success_threshold = tasd_cfg.get("success_reward_threshold", 1.0)
+                                tasd_success_threshold = _tasd_cfg.get("success_reward_threshold", 1.0)
                                 success_mask_1d = acc >= tasd_success_threshold
                                 fail_mask_1d = ~success_mask_1d
 
