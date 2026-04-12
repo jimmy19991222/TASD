@@ -45,6 +45,7 @@ algorithm:
     
     # ── advantage clipping ────────────────────────────────────
     norm_adv_by_std: false          # 是否除以 group std（std 基于 effective token 统计，排除熵门控过滤的位置）
+    adv_std_floor: 0.0              # std下界：0.0 | auto | float，防止 group_std 过小导致 adv 爆炸
     clip_adv: true
     clip_adv_value: 2.0
     
