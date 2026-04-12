@@ -2376,14 +2376,22 @@ def compute_tasd_token_rewards(
         teacher_entropy = -(teacher_topk_probs * teacher_topk_log_probs.clamp(min=-20.0)).sum(dim=-1)
         student_entropy = -(student_topk_probs * student_topk_log_probs.clamp(min=-20.0)).sum(dim=-1)
         
+        # ── topk 熵校正 ─────────────────────────────────────────────────────
+        # 问题：topk 计算的熵最大值是 log(K)，不同 K 值的熵不可比
+        # 校正：H_normalized = H / log(K)，将熵归一化到 [0, 1]
+        K = teacher_topk_log_probs.shape[-1]
+        H_max = torch.log(torch.tensor(K, dtype=teacher_entropy.dtype, device=teacher_entropy.device))
+        teacher_entropy_norm = teacher_entropy / H_max
+        student_entropy_norm = student_entropy / H_max
+        
         if entropy_gate == "hard":
             # 硬筛选：只有 teacher 更确定的位置才保留信号
-            gate_mask = (teacher_entropy < student_entropy).float()
+            gate_mask = (teacher_entropy_norm < student_entropy_norm).float()
             reward = reward * gate_mask
         
         elif entropy_gate == "soft":
-            # 软门控：熵差作为权重
-            entropy_weight = (student_entropy - teacher_entropy).clamp(min=0.0)
+            # 软门控：归一化熵差作为权重
+            entropy_weight = (student_entropy_norm - teacher_entropy_norm).clamp(min=0.0)
             # 归一化
             nonzero_mask = entropy_weight > 0
             if nonzero_mask.any():
