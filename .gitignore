@@ -7,6 +7,9 @@
 **/*.tar.gz
 **/playground
 **/wandb
+models/
+nebula_env/
+sdpo_env/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

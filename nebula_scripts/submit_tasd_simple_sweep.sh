@@ -47,7 +47,7 @@ fi
 # ── Reward Type ─────────────────────────────────────────────────────
 REWARD_TYPES=(
     "teacher_prob"
-    "teacher_log_prob"
+    # "teacher_log_prob"
 )
 
 # ── Entropy Gate ─────────────────────────────────────────────────────
@@ -76,7 +76,7 @@ REPETITION_PENALTY_LIST=(
 # ── Norm Adv By Std ─────────────────────────────────────────────────
 NORM_ADV_BY_STD_LIST=(
     "true"
-    # "false"
+    "false"
 )
 
 # ── 固定参数 ────────────────────────────────────────────────────────────
