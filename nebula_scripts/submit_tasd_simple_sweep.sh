@@ -26,11 +26,11 @@ PROJECT_NAME="TASD_simple"
 
 # ── 数据集配置 ──────────────────────────────────────────────────────
 DATASETS=(
-    # "sciknoweval/biology"
-    "sciknoweval/chemistry"
-    "sciknoweval/material"
-    "sciknoweval/physics"
-    "tooluse"
+    "sciknoweval/biology"
+    # "sciknoweval/chemistry"
+    # "sciknoweval/material"
+    # "sciknoweval/physics"
+    # "tooluse"
 )
 
 # ── dry-run 模式 ─────────────────────────────────────────────────────────
@@ -47,7 +47,7 @@ fi
 # ── Reward Type ─────────────────────────────────────────────────────
 REWARD_TYPES=(
     "teacher_prob"
-    # "teacher_log_prob"
+    "teacher_log_prob"
 )
 
 # ── Entropy Gate ─────────────────────────────────────────────────────
@@ -65,6 +65,8 @@ CLIP_ADV_VALUES=(
 # ── Distill Topk ──────────────────────────────────────────────────────
 DISTILL_TOPK_LIST=(
     "100"
+    "256"
+    # "512"
 )
 
 # ── Repetition Penalty ───────────────────────────────────────────────
@@ -76,7 +78,7 @@ REPETITION_PENALTY_LIST=(
 # ── Norm Adv By Std ─────────────────────────────────────────────────
 NORM_ADV_BY_STD_LIST=(
     "true"
-    # "false"
+    "false"
 )
 
 # ── Adv Std Floor ───────────────────────────────────────────────────
