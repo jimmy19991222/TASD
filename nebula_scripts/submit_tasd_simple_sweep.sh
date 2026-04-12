@@ -54,7 +54,7 @@ REWARD_TYPES=(
 ENTROPY_GATE_LIST=(
     "none"
     "hard"
-    "soft"
+    # "soft"
 )
 
 # ── Clip Adv Value ───────────────────────────────────────────────────
@@ -69,7 +69,7 @@ DISTILL_TOPK_LIST=(
 
 # ── Repetition Penalty ───────────────────────────────────────────────
 REPETITION_PENALTY_LIST=(
-    # "1.0"
+    "1.0"
     "1.05"
 )
 
@@ -80,10 +80,10 @@ NORM_ADV_BY_STD_LIST=(
 )
 
 # ── Adv Std Floor ───────────────────────────────────────────────────
-# std下界：0.0 | auto | float（仅在 norm_adv_by_std=true 时生效）
+# std下界：none | auto | float（仅在 norm_adv_by_std=true 时生效）
 ADV_STD_FLOOR_LIST=(
+    "none"
     "auto"
-    # "0.0"
     # "0.1"
 )
 
@@ -140,8 +140,8 @@ for ADV_STD_FLOOR in "${ADV_STD_FLOOR_LIST[@]}"; do
     if [ "$NORM_ADV_BY_STD" = "true" ]; then
         if [ "$ADV_STD_FLOOR" = "auto" ]; then
             STD_TAG="-std_auto"
-        elif [ "$ADV_STD_FLOOR" = "0.0" ] || [ "$ADV_STD_FLOOR" = "0" ]; then
-            STD_TAG="-normStd"
+        elif [ "$ADV_STD_FLOOR" = "none" ] || [ "$ADV_STD_FLOOR" = "0.0" ] || [ "$ADV_STD_FLOOR" = "0" ]; then
+            STD_TAG="-normStd"  # 无 floor 保护，纯 std 归一化
         else
             STD_TAG="-std_${ADV_STD_FLOOR}"
         fi
