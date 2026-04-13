@@ -66,7 +66,7 @@ ENTROPY_GATE_LIST=(
 # ── Clip Adv ─────────────────────────────────────────────────────────
 # clip_adv: 是否 clip advantage 到 [-clip_adv_value, +clip_adv_value]
 CLIP_ADV_LIST=(
-    # "true"
+    "true"
     "false"
 )
 CLIP_ADV_VALUE="2.0"   # clip 范围（仅 clip_adv=true 时生效）
@@ -115,7 +115,7 @@ FILTER_GROUPS_ENABLE_LIST=(
 # ── 固定参数 ────────────────────────────────────────────────────────────
 LR="1e-5"
 SEED="42"
-ENTROPY_COEFF="0.05"       # DAPO: 保持探索
+ENTROPY_COEFF="0.001"       # DAPO: 保持探索
 TEACHER_REG="ema"
 TEACHER_UPDATE_RATE="0.1"
 TRAIN_BATCH_SIZE="32"
@@ -200,7 +200,7 @@ for FILTER_GROUPS_ENABLE in "${FILTER_GROUPS_ENABLE_LIST[@]}"; do
     if [ "$CLIP_ADV" = "false" ]; then
         CLIP_ADV_TAG="-noClipAdv"
     else
-        CLIP_ADV_TAG=""
+        CLIP_ADV_TAG="-clipAdv${CLIP_ADV_VALUE}"
     fi
 
     JOB_NAME="TASD-DAPO-${DATASET_SHORT}-rt_${REWARD_TYPE}${ENTROPY_TAG}${TOPK_TAG}${REP_TAG}${STD_TAG}${CLIP_TAG}${FG_TAG}${CLIP_ADV_TAG}-${MODEL_SHORT}-${CURRENT_TIME}"
