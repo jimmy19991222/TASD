@@ -119,6 +119,10 @@ algorithm:
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
 
+  # DAPO-style group filtering: filter out groups with all same reward
+  # Set via dapo_trainer.yaml or tasd_simple.yaml; null = disabled
+  filter_groups: null
+
 # config for the trainer
 trainer:
 

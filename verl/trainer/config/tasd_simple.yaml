@@ -11,7 +11,11 @@ seed: 42
 actor_rollout_ref:
   actor:
     ppo_mini_batch_size: 32
-    entropy_coeff: 0.0
+    entropy_coeff: 0.001        # DAPO: 保持探索
+    # PPO clip ratio 配置（DAPO 风格：只 clip 下界，不 clip 上界）
+    clip_ratio: 0.2
+    clip_ratio_low: 0.2
+    clip_ratio_high: 10000    # DAPO: 不 clip 上界（让好的 token 充分学习）
     policy_loss:
       loss_mode: tasd
     self_distillation:
@@ -53,9 +57,17 @@ algorithm:
     include_successful_rollouts: true
     use_self_as_teacher_on_success: true
     success_reward_threshold: 1.0
+  # ── DAPO 动态采样（Dynamic Sampling / Group Filtering）──────────────
+  # 过滤全对/全错的 group，只保留有区分度的 group 参与训练
+  filter_groups:
+    _target_: verl.trainer.config.FilterGroupsConfig
+    enable: False             # 默认关闭，可通过 Nebula 覆盖
+    metric: acc               # 用于判断是否全同：acc / seq_reward / seq_final_reward
+    max_num_gen_batches: 0    # 0 = 不限制重采样次数
 
 data:
   train_batch_size: 32
+  gen_batch_size: ${data.train_batch_size}
 
 trainer:
   val_before_train: False

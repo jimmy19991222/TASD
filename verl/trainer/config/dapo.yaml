@@ -1,0 +1,57 @@
+defaults:
+  - ppo_trainer
+  - user
+  - _self_
+
+# DAPO: Decoupled Clip and Dynamic Sampling Policy Optimization
+# 参考: verl-recipe/dapo/config/dapo_trainer.yaml
+# 核心特性:
+#   1. Clip-Higher: clip_ratio_high >> clip_ratio_low，只 clip 下界，不限上界
+#   2. Dynamic Sampling: filter_groups 过滤全对/全错的 group
+#   3. Token-level Loss: loss_agg_mode=token-mean（默认）
+#   4. Entropy coeff: 保持探索（建议 0.001）
+#   5. Overlong Reward Shaping: reward_model.overlong_buffer（可选）
+
+max_model_len: 18944
+
+# ── 随机种子（可复现性）─────────────────────────────────────────────────
+seed: 42
+
+actor_rollout_ref:
+  actor:
+    ppo_mini_batch_size: 32
+    # ── DAPO Clip-Higher ─────────────────────────────────────────────
+    # clip_ratio_low = ε_low (standard PPO lower clip)
+    # clip_ratio_high >> clip_ratio_low: don't clip the upper side
+    clip_ratio: 0.2
+    clip_ratio_low: 0.2
+    clip_ratio_high: 10000    # effectively no upper clip
+    # ── Entropy coefficient ──────────────────────────────────────────
+    entropy_coeff: 0.001      # DAPO: encourage exploration
+    # ── Token-level loss ─────────────────────────────────────────────
+    loss_agg_mode: token-mean # DAPO token-level loss aggregation
+    optim:
+      lr: 1e-5
+  rollout:
+    n: 8
+    calculate_log_probs: True
+    repetition_penalty: 1.05
+
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: False
+  # ── DAPO Dynamic Sampling (Group Filtering) ──────────────────────────
+  # 过滤全对/全错的 group，只保留有区分度的 group 参与训练
+  filter_groups:
+    _target_: verl.trainer.config.FilterGroupsConfig
+    enable: False             # 默认关闭，可通过 Nebula 覆盖开启
+    metric: acc               # acc / seq_reward / seq_final_reward
+    max_num_gen_batches: 0    # 0 = no upper limit on resampling
+
+data:
+  train_batch_size: 32
+  # gen_batch_size 可以 >= train_batch_size 以支持 filter_groups 过滤后仍有足够样本
+  gen_batch_size: ${data.train_batch_size}
+
+trainer:
+  val_before_train: False

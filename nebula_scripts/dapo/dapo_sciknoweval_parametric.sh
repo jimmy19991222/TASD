@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # =============================================================================
-# TASD 清爽版参数化训练脚本（供 Nebula sweep 调用）
+# DAPO 参数化训练脚本（供 Nebula sweep 调用）
 #
-# 核心功能：
-#   - reward_type: teacher_prob | teacher_log_prob
-#   - entropy_gate: none | hard | soft
-#   - clip_adv
+# 核心特性:
+#   1. Clip-Higher: clip_ratio_high >> clip_ratio_low
+#   2. Dynamic Sampling: filter_groups 过滤全对/全错 group
+#   3. Token-level Loss: loss_agg_mode=token-mean
+#   4. Entropy coeff: 保持探索
 # =============================================================================
 set +xo pipefail
 
@@ -13,45 +14,32 @@ OSS_ROOT="/data/oss_bucket_0/ad/loujieming.ljm"
 
 # ── 必需参数 ─────────────────────────────────────────────────────────────
 : "${DATASET:?DATASET is not set}"
-: "${REWARD_TYPE:?REWARD_TYPE is not set}"      # teacher_prob | teacher_log_prob
-: "${ENTROPY_GATE:?ENTROPY_GATE is not set}"     # none | hard | soft
-: "${CLIP_ADV_VALUE:?CLIP_ADV_VALUE is not set}"
 : "${MODEL_PATH:?MODEL_PATH is not set}"
 
 # ── 可选参数（有默认值）─────────────────────────────────────────────────
 LR="${LR:-1e-5}"
-ENTROPY_COEFF="${ENTROPY_COEFF:-0.001}"
+ENTROPY_COEFF="${ENTROPY_COEFF:-0.001}"       # DAPO: 保持探索
+CLIP_RATIO_HIGH="${CLIP_RATIO_HIGH:-10000}"   # DAPO Clip-Higher: 不限上界
 SEED="${SEED:-42}"
-TEACHER_REG="${TEACHER_REG:-ema}"
-TEACHER_UPDATE_RATE="${TEACHER_UPDATE_RATE:-0.1}"
-CLIP_ADV="${CLIP_ADV:-true}"
-NORM_ADV_BY_STD="${NORM_ADV_BY_STD:-false}"
-ADV_STD_FLOOR="${ADV_STD_FLOOR:-0.0}"  # std下界：0 | auto | float
-CLIP_RATIO_HIGH="${CLIP_RATIO_HIGH:-10000}"  # DAPO 风格：不 clip 上界；用 0.2 可退回标准 PPO
-DISTILL_TOPK="${DISTILL_TOPK:-100}"
-DISTILL_TEMPERATURE="${DISTILL_TEMPERATURE:-1.0}"
 REPETITION_PENALTY="${REPETITION_PENALTY:-1.05}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"
-GEN_BATCH_SIZE="${GEN_BATCH_SIZE:-64}"   # 应大于 train_batch_size，保证 filter_groups 后有足够样本
 MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-32}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
-INCLUDE_SUCCESSFUL_ROLLOUTS="${INCLUDE_SUCCESSFUL_ROLLOUTS:-True}"
-# ── DAPO 动态采样配置 ────────────────────────────────────────────────
+# ── DAPO Dynamic Sampling ────────────────────────────────────────────────
 FILTER_GROUPS_ENABLE="${FILTER_GROUPS_ENABLE:-false}"  # 是否启用 filter_groups
-FILTER_GROUPS_METRIC="${FILTER_GROUPS_METRIC:-acc}"    # 过滤指标：acc / seq_reward / seq_final_reward
+FILTER_GROUPS_METRIC="${FILTER_GROUPS_METRIC:-acc}"    # acc / seq_reward / seq_final_reward
 FILTER_GROUPS_MAX_GEN="${FILTER_GROUPS_MAX_GEN:-0}"    # 最大重采样次数，0=不限制
 
 # ── 路径 ────────────────────────────────────────────────────────────────
 train_data_path="${OSS_ROOT}/datasets/${DATASET}/train.parquet"
 val_data_path="${OSS_ROOT}/datasets/${DATASET}/test.parquet"
 model_path="${MODEL_PATH}"
-save_path="${OSS_ROOT}/models/${JOB_NAME:-tasd_simple}"
+save_path="${OSS_ROOT}/models/${JOB_NAME:-dapo}"
 
 # ── 环境 ────────────────────────────────────────────────────────────────
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
 unset VLLM_ATTENTION_BACKEND
-# VLLM_USE_V1 在 vLLM 0.8.4 不支持，移除避免警告
-# export VLLM_USE_V1=1
+export VLLM_USE_V1=1
 export VLLM_LOGGING_LEVEL=WARN
 export WANDB_MODE=offline
 export WANDB_ENTITY=oh-my-team
@@ -72,22 +60,19 @@ rm -rf ~/.ray 2>/dev/null || true
 sleep 3
 
 echo "============================================"
-echo "TASD 清爽版实验配置："
+echo "DAPO 实验配置："
 echo "  DATASET: ${DATASET}"
-echo "  REWARD_TYPE: ${REWARD_TYPE}"
-echo "  ENTROPY_GATE: ${ENTROPY_GATE}"
-echo "  CLIP_ADV: ${CLIP_ADV}, VALUE: ${CLIP_ADV_VALUE}, NORM_BY_STD: ${NORM_ADV_BY_STD}"
-echo "  CLIP_RATIO_HIGH: ${CLIP_RATIO_HIGH}, ENTROPY_COEFF: ${ENTROPY_COEFF}"
+echo "  LR: ${LR}, ENTROPY_COEFF: ${ENTROPY_COEFF}"
+echo "  CLIP_RATIO_HIGH: ${CLIP_RATIO_HIGH}"
 echo "  FILTER_GROUPS: enable=${FILTER_GROUPS_ENABLE}, metric=${FILTER_GROUPS_METRIC}, max_gen=${FILTER_GROUPS_MAX_GEN}"
-echo "  DISTILL_TOPK: ${DISTILL_TOPK}"
+echo "  REPETITION_PENALTY: ${REPETITION_PENALTY}"
 echo "  SEED: ${SEED}"
 echo "============================================"
 
 python -m verl.trainer.main_ppo \
-    --config-name tasd_simple \
+    --config-name dapo \
     seed=${SEED} \
     data.train_batch_size=${TRAIN_BATCH_SIZE} \
-    data.gen_batch_size=${GEN_BATCH_SIZE} \
     data.train_files="${train_data_path}" \
     data.val_files="${val_data_path}" \
     custom_reward_function.path="$(pwd)/verl/utils/reward_score/feedback/__init__.py" \
@@ -97,26 +82,12 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.ppo_mini_batch_size=${MINI_BATCH_SIZE} \
     actor_rollout_ref.actor.entropy_coeff=${ENTROPY_COEFF} \
     actor_rollout_ref.actor.clip_ratio_high=${CLIP_RATIO_HIGH} \
-    actor_rollout_ref.actor.self_distillation.teacher_regularization=${TEACHER_REG} \
-    actor_rollout_ref.actor.self_distillation.teacher_update_rate=${TEACHER_UPDATE_RATE} \
-    actor_rollout_ref.actor.self_distillation.include_environment_feedback=False \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.rollout.n=${ROLLOUT_N} \
     actor_rollout_ref.rollout.val_kwargs.n=16 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
     actor_rollout_ref.rollout.repetition_penalty=${REPETITION_PENALTY} \
-    algorithm.tasd.reward_type=${REWARD_TYPE} \
-    algorithm.tasd.entropy_gate=${ENTROPY_GATE} \
-    algorithm.tasd.distill_topk=${DISTILL_TOPK} \
-    algorithm.tasd.distill_temperature=${DISTILL_TEMPERATURE} \
-    algorithm.tasd.norm_adv_by_std=${NORM_ADV_BY_STD} \
-    algorithm.tasd.adv_std_floor=${ADV_STD_FLOOR} \
-    algorithm.tasd.clip_adv=${CLIP_ADV} \
-    algorithm.tasd.clip_adv_value=${CLIP_ADV_VALUE} \
-    algorithm.tasd.use_self_as_teacher_on_success=${INCLUDE_SUCCESSFUL_ROLLOUTS} \
-    algorithm.tasd.include_successful_rollouts=${INCLUDE_SUCCESSFUL_ROLLOUTS} \
-    algorithm.tasd.success_reward_threshold=1.0 \
     algorithm.filter_groups.enable=${FILTER_GROUPS_ENABLE} \
     algorithm.filter_groups.metric=${FILTER_GROUPS_METRIC} \
     algorithm.filter_groups.max_num_gen_batches=${FILTER_GROUPS_MAX_GEN} \
@@ -127,7 +98,7 @@ python -m verl.trainer.main_ppo \
     trainer.n_gpus_per_node=4 \
     trainer.val_before_train=False \
     trainer.default_local_dir="${save_path}" \
-    trainer.project_name="${PROJECT_NAME:-TASD_simple}" \
-    trainer.experiment_name="${JOB_NAME:-tasd_simple}" \
-    trainer.group_name="TASD-simple" \
+    trainer.project_name="${PROJECT_NAME:-DAPO}" \
+    trainer.experiment_name="${JOB_NAME:-dapo}" \
+    trainer.group_name="DAPO" \
     "trainer.logger=[console,swanlab]"

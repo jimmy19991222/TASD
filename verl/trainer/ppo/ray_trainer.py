@@ -1782,6 +1782,11 @@ class RayPPOTrainer:
             tasd_distill_topk = _tasd_cfg.get("distill_topk", 100) if tasd_need_topk else None
         # ────────────────────────────────────────────────────────
 
+        # ── DAPO filter_groups 流式累积状态（循环外，跨 dataloader step 持继）
+        _fg_accumulated_batch = None   # 累积过滤后的 batch
+        _fg_num_prompt_in_batch = 0    # 已累积的合格 prompt 数
+        _fg_num_gen_batches = 0        # 当前 step 已生成次数
+
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
@@ -2100,6 +2105,82 @@ class RayPPOTrainer:
                                         fail_rewards.std().item() if fail_rewards.numel() > 1 else 0.0
                                     )
                                 metrics["tasd/success_rate"] = success_mask_1d.float().mean().item()
+                        # ────────────────────────────────────────────────────────────
+
+                        # ── DAPO filter_groups: 动态采样，过滤全对/全错的 group ────────
+                        # 参考 dapo_ray_trainer.py 实现：
+                        #   - 过滤后样本累积到 _fg_accumulated_batch
+                        #   - 合格 prompt 不够则 continue 继续下一个 dataloader batch
+                        #   - 有上限时（max_num_gen_batches>0）超限则 raise ValueError
+                        _filter_groups_cfg = self.config.algorithm.get("filter_groups", None)
+                        _filter_groups_enabled = (
+                            _filter_groups_cfg is not None
+                            and getattr(_filter_groups_cfg, "enable", False)
+                        )
+                        if _filter_groups_enabled:
+                            _fg_metric = getattr(_filter_groups_cfg, "metric", "acc")
+                            _fg_max_gen = getattr(_filter_groups_cfg, "max_num_gen_batches", 0)
+                            _fg_num_gen_batches += 1
+
+                            # 构建 metric 字段
+                            if _fg_metric == "seq_final_reward":
+                                batch.non_tensor_batch["seq_final_reward"] = (
+                                    batch.batch["token_level_rewards"].sum(dim=-1).cpu().numpy()
+                                )
+                            elif _fg_metric == "seq_reward":
+                                batch.non_tensor_batch["seq_reward"] = (
+                                    batch.batch["token_level_scores"].sum(dim=-1).cpu().numpy()
+                                )
+
+                            # 按 uid 统计 metric std，过滤全同的 group
+                            uid_to_metric_vals = defaultdict(list)
+                            for uid_val, metric_val in zip(
+                                batch.non_tensor_batch["uid"],
+                                batch.non_tensor_batch[_fg_metric],
+                            ):
+                                uid_to_metric_vals[uid_val].append(float(metric_val))
+
+                            kept_uids = [
+                                uid for uid, vals in uid_to_metric_vals.items()
+                                if np.std(vals) > 0 or len(vals) == 1
+                            ]
+                            kept_idxs = [
+                                i for i, uid_val in enumerate(batch.non_tensor_batch["uid"])
+                                if uid_val in kept_uids
+                            ]
+
+                            _fg_num_prompt_in_batch += len(kept_uids)
+                            filtered_batch = batch[kept_idxs]
+                            _fg_accumulated_batch = (
+                                filtered_batch if _fg_accumulated_batch is None
+                                else DataProto.concat([_fg_accumulated_batch, filtered_batch])
+                            )
+
+                            metrics["filter_groups/n_prompts_before"] = len(uid_to_metric_vals)
+                            metrics["filter_groups/n_prompts_kept"] = len(kept_uids)
+                            metrics["filter_groups/keep_ratio"] = len(kept_uids) / max(len(uid_to_metric_vals), 1)
+                            metrics["filter_groups/num_gen_batches"] = _fg_num_gen_batches
+                            metrics["filter_groups/num_prompt_accumulated"] = _fg_num_prompt_in_batch
+
+                            prompt_bsz = self.config.data.train_batch_size
+                            if _fg_num_prompt_in_batch < prompt_bsz:
+                                print(f"[filter_groups] {_fg_num_prompt_in_batch=} < {prompt_bsz=}")
+                                if _fg_max_gen <= 0 or _fg_num_gen_batches < _fg_max_gen:
+                                    print(f"[filter_groups] {_fg_num_gen_batches=}. Keep generating...")
+                                    continue
+                                else:
+                                    raise ValueError(
+                                        f"[filter_groups] {_fg_num_gen_batches=} >= {_fg_max_gen=}. "
+                                        "Generated too many batches. Check if data are too easy/hard, "
+                                        "or set max_num_gen_batches=0 for unlimited retries."
+                                    )
+
+                            # 样本足够，裁剪到 traj_bsz 并重置累积状态
+                            traj_bsz = prompt_bsz * self.config.actor_rollout_ref.rollout.n
+                            batch = _fg_accumulated_batch[:traj_bsz]
+                            _fg_accumulated_batch = None
+                            _fg_num_prompt_in_batch = 0
+                            _fg_num_gen_batches = 0
                         # ────────────────────────────────────────────────────────────
 
                         # Compute rollout correction: IS weights, rejection sampling, and metrics
