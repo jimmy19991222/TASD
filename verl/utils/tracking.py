@@ -118,7 +118,12 @@ class Tracking:
             swanlab_init_kwargs = {
                 "project": project_name,
                 "experiment_name": experiment_name,
-                "config": {"FRAMEWORK": "verl", **config},
+                "config": {
+                    "FRAMEWORK": "verl",
+                    "GIT_BRANCH": os.environ.get("GIT_BRANCH", "unknown"),
+                    "GIT_COMMIT": os.environ.get("GIT_COMMIT", "unknown"),
+                    **config
+                },
                 "logdir": SWANLAB_LOG_DIR,
                 "mode": SWANLAB_MODE,
             }

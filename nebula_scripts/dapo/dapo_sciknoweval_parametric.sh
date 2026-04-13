@@ -47,6 +47,9 @@ export SWANLAB_MODE=cloud
 export SWANLAB_API_KEY="${SWANLAB_API_KEY:-M5oC00EEt8G1wC0XaHkal}"
 export SWANLAB_LOG_DIR="${OSS_ROOT}/logs/swanlab_logs"
 export TORCH_WARN_ACCUMULATE_GRAD_STREAM=0
+# git 分支信息（记录到 SwanLab config）
+export GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
+export GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
 
 pip install -e . --no-deps --no-build-isolation --quiet 2>/dev/null || true
 
