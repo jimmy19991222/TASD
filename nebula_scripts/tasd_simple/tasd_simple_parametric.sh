@@ -100,6 +100,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.ppo_mini_batch_size=${MINI_BATCH_SIZE} \
     actor_rollout_ref.actor.entropy_coeff=${ENTROPY_COEFF} \
     actor_rollout_ref.actor.clip_ratio_high=${CLIP_RATIO_HIGH} \
+    actor_rollout_ref.actor.data_loader_seed=${SEED} \
     actor_rollout_ref.actor.self_distillation.teacher_regularization=${TEACHER_REG} \
     actor_rollout_ref.actor.self_distillation.teacher_update_rate=${TEACHER_UPDATE_RATE} \
     actor_rollout_ref.actor.self_distillation.include_environment_feedback=False \
@@ -109,6 +110,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
     actor_rollout_ref.rollout.repetition_penalty=${REPETITION_PENALTY} \
+    actor_rollout_ref.rollout.seed=${SEED} \
     algorithm.tasd.reward_type=${REWARD_TYPE} \
     algorithm.tasd.entropy_gate=${ENTROPY_GATE} \
     algorithm.tasd.distill_topk=${DISTILL_TOPK} \
