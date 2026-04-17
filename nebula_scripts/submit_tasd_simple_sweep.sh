@@ -109,14 +109,21 @@ CLIP_RATIO_HIGH_LIST=(
 
 # Filter Groups: 动态采样，过滤全对/全错的 group
 FILTER_GROUPS_ENABLE_LIST=(
-    "true"
-    # "false"
+    # "true"
+    "false"
+)
+
+# ── Include Successful Rollouts ─────────────────────────────────────
+# True: 成功的 rollout 也参与训练；False: 只用失败的 rollout
+INCLUDE_SUCCESSFUL_ROLLOUTS_LIST=(
+    # "True"
+    "False"
 )
 
 # ── Teacher Update Rate ─────────────────────────────────────────────
 # EMA 更新率：1.0 = 完全跟随 student，0.1 = 缓慢跟踪
 TEACHER_UPDATE_RATE_LIST=(
-    "0.1"
+    # "0.1"
     "1.0"
 )
 
@@ -126,12 +133,11 @@ SEED="42"
 # Git 信息（在本地获取，传递给 Nebula）
 GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
 GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
-ENTROPY_COEFF="0.001"       # DAPO: 保持探索
+ENTROPY_COEFF="0.05"       # DAPO: 保持探索
 TEACHER_REG="ema"
 TRAIN_BATCH_SIZE="32"
 MINI_BATCH_SIZE="32"
 ROLLOUT_N="8"
-INCLUDE_SUCCESSFUL_ROLLOUTS="True"
 MODEL="Qwen3-8B"
 # Filter Groups 固定参数
 FILTER_GROUPS_METRIC="acc"
@@ -153,6 +159,7 @@ for NORM_ADV_BY_STD in "${NORM_ADV_BY_STD_LIST[@]}"; do
 for ADV_STD_FLOOR in "${ADV_STD_FLOOR_LIST[@]}"; do
 for CLIP_RATIO_HIGH in "${CLIP_RATIO_HIGH_LIST[@]}"; do
 for FILTER_GROUPS_ENABLE in "${FILTER_GROUPS_ENABLE_LIST[@]}"; do
+for INCLUDE_SUCCESSFUL_ROLLOUTS in "${INCLUDE_SUCCESSFUL_ROLLOUTS_LIST[@]}"; do
 for TEACHER_UPDATE_RATE in "${TEACHER_UPDATE_RATE_LIST[@]}"; do
 
     TOTAL=$((TOTAL + 1))
@@ -206,6 +213,13 @@ for TEACHER_UPDATE_RATE in "${TEACHER_UPDATE_RATE_LIST[@]}"; do
         FG_TAG=""
     fi
 
+    # include_successful_rollouts 标签
+    if [ "$INCLUDE_SUCCESSFUL_ROLLOUTS" = "True" ]; then
+        ISR_TAG="-inclSucc"
+    else
+        ISR_TAG=""
+    fi
+
     # EMA update rate 标签
     if [ "$TEACHER_UPDATE_RATE" = "0.1" ]; then
         EMA_TAG="-ema0.1"
@@ -223,7 +237,8 @@ for TEACHER_UPDATE_RATE in "${TEACHER_UPDATE_RATE_LIST[@]}"; do
         CLIP_ADV_TAG="-clipAdv${CLIP_ADV_VALUE}"
     fi
 
-    JOB_NAME="TASD-DAPO-${DATASET_SHORT}-rt_${REWARD_TYPE}${ENTROPY_TAG}${TOPK_TAG}${REP_TAG}${STD_TAG}${CLIP_TAG}${FG_TAG}${CLIP_ADV_TAG}${EMA_TAG}-${MODEL_SHORT}-${CURRENT_TIME}"
+    EC_TAG="-ec${ENTROPY_COEFF}"
+    JOB_NAME="TASD-DAPO-${DATASET_SHORT}-rt_${REWARD_TYPE}${ENTROPY_TAG}${TOPK_TAG}${REP_TAG}${STD_TAG}${CLIP_TAG}${FG_TAG}${ISR_TAG}${CLIP_ADV_TAG}${EMA_TAG}${EC_TAG}-${MODEL_SHORT}-${CURRENT_TIME}"
 
     # ── 提交 ────────────────────────────────────────────────────────
     if [ "$DRY_RUN" = true ]; then
@@ -265,6 +280,7 @@ for TEACHER_UPDATE_RATE in "${TEACHER_UPDATE_RATE_LIST[@]}"; do
         sleep 2
     fi
 
+done
 done
 done
 done

@@ -40,6 +40,7 @@ fi
 # Ray worker 进程从 ray daemon 继承环境变量，必须在 ray start 前设置
 
 # 1. PYTHONPATH: 让 worker 加载 SDPO 自定义的 verl
+# 注意：将 $(pwd) 放在最前面，确保覆盖 train_package 中的旧版 verl
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
 
 # 2. CUDA 环境 ───────────────────────────────────────────────────
