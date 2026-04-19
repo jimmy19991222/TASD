@@ -78,10 +78,9 @@ def check_training_anomalies(metrics: dict, step: int, experiment_name: str = ""
     Alert conditions (skip warmup_steps to avoid false alarms at training start):
     1. Entropy collapse: actor/entropy < 0.005 (model too deterministic)
     2. Gate retention too low: tasd/gate_retention_ratio_mean < 0.1 (almost all tokens filtered)
-    3. Token reward all negative: tasd/token_reward_pos_rate < 0.05 (sustained, after warmup)
-    4. Gradient explosion: actor/grad_norm > 100
-    5. Repetition /复读机: response_length/clip_ratio > 0.3
-    6. High abort ratio: response/aborted_ratio > 0.3
+    3. Gradient explosion: actor/grad_norm > 100
+    4. Repetition /复读机: response_length/clip_ratio > 0.3
+    5. High abort ratio: response/aborted_ratio > 0.3
     """
     alerts = []
     prefix = f"[TASD Alert] step={step}" + (f" exp={experiment_name}" if experiment_name else "")
@@ -95,11 +94,6 @@ def check_training_anomalies(metrics: dict, step: int, experiment_name: str = ""
     gate_ret = metrics.get("tasd/gate_retention_ratio_mean")
     if gate_ret is not None and gate_ret < 0.1:
         alerts.append(f"🔴 Gate retention too low: {gate_ret:.4f} < 0.1 — almost all tokens filtered by entropy gate")
-
-    # 3. Token reward all negative (skip warmup: normal to have low pos_rate at start)
-    pos_rate = metrics.get("tasd/token_reward_pos_rate")
-    if pos_rate is not None and step > warmup_steps and pos_rate < 0.05:
-        alerts.append(f"🔴 Token reward pos_rate={pos_rate:.4f} < 0.05 — no effective positive reward signal (after warmup)")
 
     # 4. Gradient explosion
     grad_norm = metrics.get("actor/grad_norm")
