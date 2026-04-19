@@ -57,18 +57,21 @@ REWARD_TYPES=(
 
 # ── Entropy Gate ─────────────────────────────────────────────────────
 ENTROPY_GATE_LIST=(
-    # "none"
-    "hard"
+    "none"
+    # "hard"
     # "soft"
     # "soft_v2"
 )
 
 # ── Clip Adv ─────────────────────────────────────────────────────────
-# clip_adv 固定为 true，扫描 clip_adv_value
-CLIP_ADV="true"
+# clip_adv 开关遍历：true = clip advantage，false = 不 clip
+CLIP_ADV_LIST=(
+    # "true"
+    "false"
+)
 CLIP_ADV_VALUE_LIST=(
     "1.0"
-    "2.0"
+    # "2.0"
     # "5.0"
 )
 
@@ -147,6 +150,7 @@ SUBMITTED=0
 for DATASET in "${DATASETS[@]}"; do
 for REWARD_TYPE in "${REWARD_TYPES[@]}"; do
 for ENTROPY_GATE in "${ENTROPY_GATE_LIST[@]}"; do
+for CLIP_ADV in "${CLIP_ADV_LIST[@]}"; do
 for CLIP_ADV_VALUE in "${CLIP_ADV_VALUE_LIST[@]}"; do
 for DISTILL_TOPK in "${DISTILL_TOPK_LIST[@]}"; do
 for REPETITION_PENALTY in "${REPETITION_PENALTY_LIST[@]}"; do
@@ -200,7 +204,11 @@ for INCLUDE_SUCCESSFUL_ROLLOUTS in "${INCLUDE_SUCCESSFUL_ROLLOUTS_LIST[@]}"; do
     fi
 
     # clip_adv 标签
-    CLIP_ADV_TAG="-clipAdv${CLIP_ADV_VALUE}"
+    if [ "$CLIP_ADV" = "true" ]; then
+        CLIP_ADV_TAG="-clipAdv${CLIP_ADV_VALUE}"
+    else
+        CLIP_ADV_TAG="-noClipAdv"
+    fi
 
     # EMA update rate 标签
     EMA_TAG="-ema${TEACHER_UPDATE_RATE}"
@@ -258,6 +266,7 @@ for INCLUDE_SUCCESSFUL_ROLLOUTS in "${INCLUDE_SUCCESSFUL_ROLLOUTS_LIST[@]}"; do
         sleep 2
     fi
 
+done
 done
 done
 done
