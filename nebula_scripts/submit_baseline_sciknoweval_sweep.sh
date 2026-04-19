@@ -88,7 +88,7 @@ _submit_job() {
             --engine=xdl \
             --queue=${QUEUE} \
             --entry=nebula_scripts/entry.py \
-            --user_params="--script_path=${SCRIPT_PATH} --world_size=${WORLD_SIZE} --job_name=${JOB_NAME} ${USER_PARAMS}" \
+            --user_params="--script_path=${SCRIPT_PATH} --world_size=${WORLD_SIZE} --job_name=${JOB_NAME} ${USER_PARAMS} --env=DINGTALK_WEBHOOK=https://oapi.dingtalk.com/robot/send?access_token=f598ad33b071751bf79d2484d8e1acefe8df9d879e129cae40340a158854f9cb --env=DINGTALK_SECRET=SECc5b9e4f61f56b32b46abf1ecedc11bdcba10dc35fbba8fa0ff62c084a1cc6ad3" \
             --worker_count=${WORLD_SIZE} \
             --file.cluster_file=${CLUSTER_FILE} \
             --job_name=${JOB_NAME} \
