@@ -351,16 +351,28 @@ def compute_advantage(
         # 被 gate 掉的 token 不参与 group_mean 计算，advantage 直接置 0
         gate_mask = data.batch.get("tasd_gate_mask", None)
 
-        advantages, returns = core_algos.compute_tasd_advantage(
+        # tasd_teacher/student_entropy_norm: 熵信息（adv_entropy_weight 需要）
+        teacher_entropy_norm = data.batch.get("tasd_teacher_entropy_norm", None)
+        student_entropy_norm = data.batch.get("tasd_student_entropy_norm", None)
+
+        advantages, returns, filtered_response_mask = core_algos.compute_tasd_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
             response_mask=data.batch["response_mask"],
             index=data.non_tensor_batch["uid"],
             config=config,
             self_distillation_mask=sdist_mask,
             gate_mask=gate_mask,
+            teacher_entropy_norm=teacher_entropy_norm,
+            student_entropy_norm=student_entropy_norm,
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+        # adv_entropy_weight: 归一化 entropy_w 乘到 advantage 上（均值=1，量级不变）
+        # 被过滤的 token (w=0) → advantage=0 且 response_mask=False → 不贡献梯度也不计入分母
+        _tasd_cfg = config.algorithm.get("tasd", {}) if hasattr(config, "algorithm") else {}
+        _adv_entropy_weight = _tasd_cfg.get("adv_entropy_weight", "none") if _tasd_cfg else "none"
+        if _adv_entropy_weight != "none":
+            data.batch["response_mask"] = filtered_response_mask
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -1877,10 +1889,11 @@ class RayPPOTrainer:
             _tasd_cfg = self.config.algorithm.get("tasd", {})
             tasd_reward_type = _tasd_cfg.get("reward_type", "teacher_prob")
             tasd_entropy_gate = _tasd_cfg.get("entropy_gate", "none")
+            tasd_adv_entropy_weight = _tasd_cfg.get("adv_entropy_weight", "none")
             tasd_temperature = _tasd_cfg.get("distill_temperature", None) or self.config.actor_rollout_ref.rollout.temperature
             tasd_micro_batch_size = self.config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu
-            # entropy_gate 需要 topk 信息
-            tasd_need_topk = tasd_entropy_gate != "none"
+            # entropy_gate 或 adv_entropy_weight 需要 topk 信息
+            tasd_need_topk = tasd_entropy_gate != "none" or tasd_adv_entropy_weight != "none"
             tasd_distill_topk = _tasd_cfg.get("distill_topk", 100) if tasd_need_topk else None
         # ────────────────────────────────────────────────────────
 
@@ -2110,13 +2123,14 @@ class RayPPOTrainer:
                                     teacher_fwd_batch
                                 )
 
-                            token_rewards, gate_mask = core_algos.compute_tasd_token_rewards(
+                            token_rewards, gate_mask, teacher_entropy_norm, student_entropy_norm = core_algos.compute_tasd_token_rewards(
                                 student_log_probs=batch.batch["old_log_probs"],
                                 teacher_log_probs=teacher_result.batch["teacher_log_probs_on_response"],
                                 student_topk_log_probs=teacher_result.batch.get("student_topk_log_probs"),
                                 teacher_topk_log_probs=teacher_result.batch.get("teacher_topk_log_probs"),
                                 reward_type=tasd_reward_type,
                                 entropy_gate=tasd_entropy_gate,
+                                adv_entropy_weight=tasd_adv_entropy_weight,
                             )
 
                             # Mask out padding positions
@@ -2130,6 +2144,12 @@ class RayPPOTrainer:
                             # gate_mask=None 表示无熵门控（noGate），gate_mask!=None 表示 hard/soft 门控
                             if gate_mask is not None:
                                 batch.batch["tasd_gate_mask"] = (gate_mask * response_mask_float).bool()
+
+                            # 保存熵信息，供 adv_entropy_weight 使用
+                            if teacher_entropy_norm is not None:
+                                batch.batch["tasd_teacher_entropy_norm"] = teacher_entropy_norm
+                            if student_entropy_norm is not None:
+                                batch.batch["tasd_student_entropy_norm"] = student_entropy_norm
 
                             # ── 记录 TASD token reward 指标 ─────────────────────────────
                             response_mask_bool = batch.batch["response_mask"].bool()

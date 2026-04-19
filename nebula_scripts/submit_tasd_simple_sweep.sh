@@ -70,8 +70,9 @@ CLIP_ADV_LIST=(
     "false"
 )
 CLIP_ADV_VALUE_LIST=(
-    "1.0"
-    # "2.0"
+    # "1.0"
+    "2.0"
+    # "3.0"
     # "5.0"
 )
 
@@ -102,6 +103,20 @@ ADV_STD_FLOOR_LIST=(
     # "0.1"
 )
 
+# ── Adv Entropy Weight ──────────────────────────────────────────────
+# advantage 阶段熵加权：none | hard_filter | teacher_conf | teacher_conf_filtered | certainty_diff_filtered
+# hard_filter: 先过滤(teacher更确定的位置), 不额外加权
+# teacher_conf: 不过滤, 全部token按teacher确定性加权(1-H_t)
+# teacher_conf_filtered: 先过滤, 再按teacher确定性加权 mask×(1-H_t)
+# certainty_diff_filtered: 先过滤, 再按熵差加权
+ADV_ENTROPY_WEIGHT_LIST=(
+    # "none"
+    "hard_filter"
+    "teacher_conf"
+    "teacher_conf_filtered"
+    "certainty_diff_filtered"
+)
+
 # ── Clip Ratio High ──────────────────────────────────────────────────
 # 10000 = Clip-Higher（不 clip 上界），0.2 = 标准 PPO（关闭 Clip-Higher）
 CLIP_RATIO_HIGH_LIST=(
@@ -117,7 +132,7 @@ FILTER_GROUPS_MAX_GEN="0"
 # Include Successful Rollouts: 成功的 rollout 也参与训练
 INCLUDE_SUCCESSFUL_ROLLOUTS_LIST=(
     "True"
-    "False"
+    # "False"
 )
 
 # ── Teacher Update Rate ─────────────────────────────────────────────
@@ -134,7 +149,7 @@ SEED="42"
 # Git 信息（在本地获取，传递给 Nebula）
 GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
 GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
-ENTROPY_COEFF="0.0"
+ENTROPY_COEFF="0.001"
 TEACHER_REG="ema"
 TRAIN_BATCH_SIZE="32"
 MINI_BATCH_SIZE="32"
@@ -156,6 +171,7 @@ for DISTILL_TOPK in "${DISTILL_TOPK_LIST[@]}"; do
 for REPETITION_PENALTY in "${REPETITION_PENALTY_LIST[@]}"; do
 for NORM_ADV_BY_STD in "${NORM_ADV_BY_STD_LIST[@]}"; do
 for ADV_STD_FLOOR in "${ADV_STD_FLOOR_LIST[@]}"; do
+for ADV_ENTROPY_WEIGHT in "${ADV_ENTROPY_WEIGHT_LIST[@]}"; do
 for CLIP_RATIO_HIGH in "${CLIP_RATIO_HIGH_LIST[@]}"; do
 for TEACHER_UPDATE_RATE in "${TEACHER_UPDATE_RATE_LIST[@]}"; do
 for INCLUDE_SUCCESSFUL_ROLLOUTS in "${INCLUDE_SUCCESSFUL_ROLLOUTS_LIST[@]}"; do
@@ -220,9 +236,16 @@ for INCLUDE_SUCCESSFUL_ROLLOUTS in "${INCLUDE_SUCCESSFUL_ROLLOUTS_LIST[@]}"; do
         ISR_TAG=""
     fi
 
+    # adv_entropy_weight 标签
+    if [ "$ADV_ENTROPY_WEIGHT" = "none" ]; then
+        AEW_TAG=""
+    else
+        AEW_TAG="-aew_${ADV_ENTROPY_WEIGHT}"
+    fi
+
     CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
     EC_TAG="-ec${ENTROPY_COEFF}"
-    JOB_NAME="TASD-${DATASET_SHORT}-rt_${REWARD_TYPE}${ENTROPY_TAG}${TOPK_TAG}${REP_TAG}${STD_TAG}${CLIP_TAG}${CLIP_ADV_TAG}${EMA_TAG}${ISR_TAG}${EC_TAG}-${MODEL_SHORT}-${CURRENT_TIME}"
+    JOB_NAME="TASD-${DATASET_SHORT}-rt_${REWARD_TYPE}${ENTROPY_TAG}${TOPK_TAG}${REP_TAG}${STD_TAG}${CLIP_TAG}${CLIP_ADV_TAG}${EMA_TAG}${ISR_TAG}${AEW_TAG}${EC_TAG}-${MODEL_SHORT}-${CURRENT_TIME}"
 
     # ── 提交 ────────────────────────────────────────────────────────
     if [ "$DRY_RUN" = true ]; then
@@ -231,6 +254,7 @@ for INCLUDE_SUCCESSFUL_ROLLOUTS in "${INCLUDE_SUCCESSFUL_ROLLOUTS_LIST[@]}"; do
         echo "  REWARD_TYPE=$REWARD_TYPE ENTROPY_GATE=$ENTROPY_GATE"
         echo "  CLIP_ADV_VALUE=$CLIP_ADV_VALUE DISTILL_TOPK=$DISTILL_TOPK"
         echo "  REPETITION_PENALTY=$REPETITION_PENALTY NORM_ADV_BY_STD=$NORM_ADV_BY_STD ADV_STD_FLOOR=$ADV_STD_FLOOR"
+        echo "  ADV_ENTROPY_WEIGHT=$ADV_ENTROPY_WEIGHT"
         echo "  TEACHER_UPDATE_RATE=$TEACHER_UPDATE_RATE"
     else
         echo "提交 Job #${TOTAL}: ${JOB_NAME}"
@@ -240,7 +264,7 @@ for INCLUDE_SUCCESSFUL_ROLLOUTS in "${INCLUDE_SUCCESSFUL_ROLLOUTS_LIST[@]}"; do
             --engine=xdl \
             --queue=${QUEUE} \
             --entry=nebula_scripts/entry.py \
-            --user_params="--script_path=${SCRIPT_PATH} --world_size=${WORLD_SIZE} --job_name=${JOB_NAME} --env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=DATASET=${DATASET} --env=MODEL=${MODEL} --env=MODEL_PATH=${MODEL_PATH} --env=REWARD_TYPE=${REWARD_TYPE} --env=ENTROPY_GATE=${ENTROPY_GATE} --env=CLIP_ADV=${CLIP_ADV} --env=CLIP_ADV_VALUE=${CLIP_ADV_VALUE} --env=DISTILL_TOPK=${DISTILL_TOPK} --env=REPETITION_PENALTY=${REPETITION_PENALTY} --env=LR=${LR} --env=SEED=${SEED} --env=ENTROPY_COEFF=${ENTROPY_COEFF} --env=TEACHER_REG=${TEACHER_REG} --env=TEACHER_UPDATE_RATE=${TEACHER_UPDATE_RATE} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=MINI_BATCH_SIZE=${MINI_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=INCLUDE_SUCCESSFUL_ROLLOUTS=${INCLUDE_SUCCESSFUL_ROLLOUTS} --env=NORM_ADV_BY_STD=${NORM_ADV_BY_STD} --env=ADV_STD_FLOOR=${ADV_STD_FLOOR} --env=CLIP_RATIO_HIGH=${CLIP_RATIO_HIGH} --env=FILTER_GROUPS_ENABLE=${FILTER_GROUPS_ENABLE} --env=FILTER_GROUPS_METRIC=${FILTER_GROUPS_METRIC} --env=FILTER_GROUPS_MAX_GEN=${FILTER_GROUPS_MAX_GEN} --env=GIT_BRANCH=${GIT_BRANCH} --env=GIT_COMMIT=${GIT_COMMIT} --env=DINGTALK_WEBHOOK=https://oapi.dingtalk.com/robot/send?access_token=f598ad33b071751bf79d2484d8e1acefe8df9d879e129cae40340a158854f9cb --env=DINGTALK_SECRET=SECc5b9e4f61f56b32b46abf1ecedc11bdcba10dc35fbba8fa0ff62c084a1cc6ad3" \
+            --user_params="--script_path=${SCRIPT_PATH} --world_size=${WORLD_SIZE} --job_name=${JOB_NAME} --env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=DATASET=${DATASET} --env=MODEL=${MODEL} --env=MODEL_PATH=${MODEL_PATH} --env=REWARD_TYPE=${REWARD_TYPE} --env=ENTROPY_GATE=${ENTROPY_GATE} --env=CLIP_ADV=${CLIP_ADV} --env=CLIP_ADV_VALUE=${CLIP_ADV_VALUE} --env=DISTILL_TOPK=${DISTILL_TOPK} --env=REPETITION_PENALTY=${REPETITION_PENALTY} --env=LR=${LR} --env=SEED=${SEED} --env=ENTROPY_COEFF=${ENTROPY_COEFF} --env=TEACHER_REG=${TEACHER_REG} --env=TEACHER_UPDATE_RATE=${TEACHER_UPDATE_RATE} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=MINI_BATCH_SIZE=${MINI_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=INCLUDE_SUCCESSFUL_ROLLOUTS=${INCLUDE_SUCCESSFUL_ROLLOUTS} --env=NORM_ADV_BY_STD=${NORM_ADV_BY_STD} --env=ADV_STD_FLOOR=${ADV_STD_FLOOR} --env=ADV_ENTROPY_WEIGHT=${ADV_ENTROPY_WEIGHT} --env=CLIP_RATIO_HIGH=${CLIP_RATIO_HIGH} --env=FILTER_GROUPS_ENABLE=${FILTER_GROUPS_ENABLE} --env=FILTER_GROUPS_METRIC=${FILTER_GROUPS_METRIC} --env=FILTER_GROUPS_MAX_GEN=${FILTER_GROUPS_MAX_GEN} --env=GIT_BRANCH=${GIT_BRANCH} --env=GIT_COMMIT=${GIT_COMMIT} --env=DINGTALK_WEBHOOK=https://oapi.dingtalk.com/robot/send?access_token=f598ad33b071751bf79d2484d8e1acefe8df9d879e129cae40340a158854f9cb --env=DINGTALK_SECRET=SECc5b9e4f61f56b32b46abf1ecedc11bdcba10dc35fbba8fa0ff62c084a1cc6ad3" \
             --worker_count=${WORLD_SIZE} \
             --file.cluster_file=${CLUSTER_FILE} \
             --job_name=${JOB_NAME} \
@@ -264,6 +288,7 @@ for INCLUDE_SUCCESSFUL_ROLLOUTS in "${INCLUDE_SUCCESSFUL_ROLLOUTS_LIST[@]}"; do
         sleep 2
     fi
 
+done
 done
 done
 done

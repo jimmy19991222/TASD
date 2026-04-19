@@ -27,6 +27,7 @@ TEACHER_UPDATE_RATE="${TEACHER_UPDATE_RATE:-0.1}"
 CLIP_ADV="${CLIP_ADV:-true}"
 NORM_ADV_BY_STD="${NORM_ADV_BY_STD:-false}"
 ADV_STD_FLOOR="${ADV_STD_FLOOR:-0.0}"  # std下界：0 | auto | float
+ADV_ENTROPY_WEIGHT="${ADV_ENTROPY_WEIGHT:-none}"  # advantage 熵加权：none | hard_filter | teacher_conf | teacher_conf_filtered | certainty_diff_filtered
 CLIP_RATIO_HIGH="${CLIP_RATIO_HIGH:-10000}"  # DAPO 风格：不 clip 上界；用 0.2 可退回标准 PPO
 DISTILL_TOPK="${DISTILL_TOPK:-100}"
 DISTILL_TEMPERATURE="${DISTILL_TEMPERATURE:-1.0}"
@@ -81,6 +82,7 @@ echo "  REWARD_TYPE: ${REWARD_TYPE}"
 echo "  ENTROPY_GATE: ${ENTROPY_GATE}"
 echo "  CLIP_ADV: ${CLIP_ADV}, VALUE: ${CLIP_ADV_VALUE}, NORM_BY_STD: ${NORM_ADV_BY_STD}"
 echo "  CLIP_RATIO_HIGH: ${CLIP_RATIO_HIGH}, ENTROPY_COEFF: ${ENTROPY_COEFF}"
+echo "  ADV_ENTROPY_WEIGHT: ${ADV_ENTROPY_WEIGHT}"
 echo "  FILTER_GROUPS: enable=${FILTER_GROUPS_ENABLE}, metric=${FILTER_GROUPS_METRIC}, max_gen=${FILTER_GROUPS_MAX_GEN}"
 echo "  DISTILL_TOPK: ${DISTILL_TOPK}"
 echo "  SEED: ${SEED}"
@@ -119,6 +121,7 @@ python -m verl.trainer.main_ppo \
     algorithm.tasd.adv_std_floor=${ADV_STD_FLOOR} \
     algorithm.tasd.clip_adv=${CLIP_ADV} \
     algorithm.tasd.clip_adv_value=${CLIP_ADV_VALUE} \
+    algorithm.tasd.adv_entropy_weight=${ADV_ENTROPY_WEIGHT} \
     algorithm.tasd.use_self_as_teacher_on_success=${INCLUDE_SUCCESSFUL_ROLLOUTS} \
     algorithm.tasd.include_successful_rollouts=${INCLUDE_SUCCESSFUL_ROLLOUTS} \
     algorithm.tasd.success_reward_threshold=1.0 \

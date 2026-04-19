@@ -53,6 +53,17 @@ algorithm:
     clip_adv: true
     clip_adv_value: 2.0
     
+    # ── advantage entropy weighting ──────────────────────────
+    # 在 advantage 阶段按熵信息加权（不影响 group_mean），与 entropy_gate 互补
+    # entropy_gate 在 reward 阶段加权 → 扭曲 group_mean
+    # adv_entropy_weight 在 advantage 阶段加权 → 归一化 entropy_w 乘到 advantage 上
+    #   w 归一化到有效 token 均值=1，保证 loss 量级不变
+    #   被过滤的 token (w=0) → advantage=0 且 response_mask=False
+    # 统一范式：先过滤（teacher 比 student 更确定的位置才保留），再加权
+    # 但 teacher_conf 例外：不过滤，全部 token 按 teacher 确定性加权
+    # "none" | "hard_filter" | "teacher_conf" | "teacher_conf_filtered" | "certainty_diff_filtered"
+    adv_entropy_weight: "none"
+    
     # ── 成功 rollout 配置 ─────────────────────────────────────
     include_successful_rollouts: true
     use_self_as_teacher_on_success: true
