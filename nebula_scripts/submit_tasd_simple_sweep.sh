@@ -1,17 +1,16 @@
 #!/bin/bash
 # =============================================================================
-# TASD-DAPO - Nebula 批量提交脚本
+# TASD - Nebula 批量提交脚本
 #
 # TASD 核心：teacher distillation + token-level advantage
-# DAPO 稳定性：clip_ratio_high + filter_groups + entropy_coeff
+# 稳定性：clip_ratio_high (Clip-Higher) + clip_adv
 #
 # 实验设计：
 #   - reward_type: teacher_prob | teacher_log_prob
-#   - entropy_gate: none | hard | soft
-#   - clip_ratio_high: 10000 | 0.28 (DAPO Clip-Higher)
-#   - filter_groups: true | false (动态采样)
-#   - clip_adv: true | false
-#   - clip_adv_value: 2.0 (clip_adv=true 时生效)
+#   - entropy_gate: none | hard | soft_v2（筛选有效训练信号）
+#   - clip_ratio_high: 10000 (Clip-Higher)
+#   - clip_adv_value: advantage clip 范围扫描
+#   - ema update_rate: 0.1 | 1.0
 #
 # 使用方式：
 #   bash nebula_scripts/submit_tasd_simple_sweep.sh [--dry-run]
@@ -28,7 +27,7 @@ OSS_BUCKET="lazada-ai-model"
 CLUSTER_FILE="nebula_scripts/cluster.json"
 SCRIPT_PATH="nebula_scripts/tasd_simple/tasd_simple_parametric.sh"
 CUSTOM_DOCKER_IMAGE="${CUSTOM_DOCKER_IMAGE:-hub.docker.alibaba-inc.com/mdl/notebook_saved:loujieming.ljm_yueqiu_sdpo_env_torch260_20260324155942}"
-PROJECT_NAME="TASD_DAPO"
+PROJECT_NAME="TASD-v3"
 
 # ── 数据集配置 ──────────────────────────────────────────────────────
 DATASETS=(
@@ -52,25 +51,26 @@ fi
 
 # ── Reward Type ─────────────────────────────────────────────────────
 REWARD_TYPES=(
-    "teacher_prob"
-    # "teacher_log_prob"
+    # "teacher_prob"
+    "teacher_log_prob"
 )
 
 # ── Entropy Gate ─────────────────────────────────────────────────────
 ENTROPY_GATE_LIST=(
-    "none"
+    # "none"
     "hard"
     # "soft"
-    "soft_v2"
+    # "soft_v2"
 )
 
 # ── Clip Adv ─────────────────────────────────────────────────────────
-# clip_adv: 是否 clip advantage 到 [-clip_adv_value, +clip_adv_value]
-CLIP_ADV_LIST=(
-    "true"
-    # "false"
+# clip_adv 固定为 true，扫描 clip_adv_value
+CLIP_ADV="true"
+CLIP_ADV_VALUE_LIST=(
+    "1.0"
+    "2.0"
+    # "5.0"
 )
-CLIP_ADV_VALUE="1.0"   # clip 范围（仅 clip_adv=true 时生效）
 
 # ── Distill Topk ──────────────────────────────────────────────────────
 DISTILL_TOPK_LIST=(
@@ -81,8 +81,8 @@ DISTILL_TOPK_LIST=(
 
 # ── Repetition Penalty ───────────────────────────────────────────────
 REPETITION_PENALTY_LIST=(
-    # "1.0"
-    "1.05"
+    "1.0"
+    # "1.05"
 )
 
 # ── Norm Adv By Std ─────────────────────────────────────────────────
@@ -94,37 +94,35 @@ NORM_ADV_BY_STD_LIST=(
 # ── Adv Std Floor ───────────────────────────────────────────────────
 # std下界：none | auto | float（仅在 norm_adv_by_std=true 时生效）
 ADV_STD_FLOOR_LIST=(
-    # "none"
-    "auto"
+    "none"
+    # "auto"
     # "0.1"
 )
 
-# ── DAPO 风格参数 ─────────────────────────────────────────────────────
-# Clip Ratio High: DAPO 核心参数，不 clip 上界让好 token 充分学习
+# ── Clip Ratio High ──────────────────────────────────────────────────
+# 10000 = Clip-Higher（不 clip 上界），0.2 = 标准 PPO（关闭 Clip-Higher）
 CLIP_RATIO_HIGH_LIST=(
-    "10000"   # 等效于不 clip 上界
-    # "0.28"   # DAPO 原论文设置
-    # "0.2"    # 退回标准 PPO（上下对称 clip）
+    # "10000"
+    "0.2"
 )
 
-# Filter Groups: 动态采样，过滤全对/全错的 group
-FILTER_GROUPS_ENABLE_LIST=(
-    # "true"
-    "false"
-)
+# Filter Groups: 关闭动态采样
+FILTER_GROUPS_ENABLE="false"
+FILTER_GROUPS_METRIC="acc"
+FILTER_GROUPS_MAX_GEN="0"
 
-# ── Include Successful Rollouts ─────────────────────────────────────
-# True: 成功的 rollout 也参与训练；False: 只用失败的 rollout
+# Include Successful Rollouts: 成功的 rollout 也参与训练
 INCLUDE_SUCCESSFUL_ROLLOUTS_LIST=(
-    # "True"
+    "True"
     "False"
 )
 
 # ── Teacher Update Rate ─────────────────────────────────────────────
 # EMA 更新率：1.0 = 完全跟随 student，0.1 = 缓慢跟踪
 TEACHER_UPDATE_RATE_LIST=(
-    # "0.1"
-    "1.0"
+    "0.1"
+    # "0.5"
+    # "1.0"
 )
 
 # ── 固定参数 ────────────────────────────────────────────────────────────
@@ -133,15 +131,12 @@ SEED="42"
 # Git 信息（在本地获取，传递给 Nebula）
 GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
 GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
-ENTROPY_COEFF="0.05"       # DAPO: 保持探索
+ENTROPY_COEFF="0.0"
 TEACHER_REG="ema"
 TRAIN_BATCH_SIZE="32"
 MINI_BATCH_SIZE="32"
 ROLLOUT_N="8"
 MODEL="Qwen3-8B"
-# Filter Groups 固定参数
-FILTER_GROUPS_METRIC="acc"
-FILTER_GROUPS_MAX_GEN="0"
 
 # =============================================================================
 # 提交循环
@@ -152,15 +147,14 @@ SUBMITTED=0
 for DATASET in "${DATASETS[@]}"; do
 for REWARD_TYPE in "${REWARD_TYPES[@]}"; do
 for ENTROPY_GATE in "${ENTROPY_GATE_LIST[@]}"; do
-for CLIP_ADV in "${CLIP_ADV_LIST[@]}"; do
+for CLIP_ADV_VALUE in "${CLIP_ADV_VALUE_LIST[@]}"; do
 for DISTILL_TOPK in "${DISTILL_TOPK_LIST[@]}"; do
 for REPETITION_PENALTY in "${REPETITION_PENALTY_LIST[@]}"; do
 for NORM_ADV_BY_STD in "${NORM_ADV_BY_STD_LIST[@]}"; do
 for ADV_STD_FLOOR in "${ADV_STD_FLOOR_LIST[@]}"; do
 for CLIP_RATIO_HIGH in "${CLIP_RATIO_HIGH_LIST[@]}"; do
-for FILTER_GROUPS_ENABLE in "${FILTER_GROUPS_ENABLE_LIST[@]}"; do
-for INCLUDE_SUCCESSFUL_ROLLOUTS in "${INCLUDE_SUCCESSFUL_ROLLOUTS_LIST[@]}"; do
 for TEACHER_UPDATE_RATE in "${TEACHER_UPDATE_RATE_LIST[@]}"; do
+for INCLUDE_SUCCESSFUL_ROLLOUTS in "${INCLUDE_SUCCESSFUL_ROLLOUTS_LIST[@]}"; do
 
     TOTAL=$((TOTAL + 1))
 
@@ -198,7 +192,6 @@ for TEACHER_UPDATE_RATE in "${TEACHER_UPDATE_RATE_LIST[@]}"; do
         STD_TAG=""
     fi
 
-    # DAPO 风格标签
     # clip_ratio_high 标签
     if [ "$CLIP_RATIO_HIGH" = "10000" ]; then
         CLIP_TAG="-clipHigh"
@@ -206,12 +199,11 @@ for TEACHER_UPDATE_RATE in "${TEACHER_UPDATE_RATE_LIST[@]}"; do
         CLIP_TAG="-clipH${CLIP_RATIO_HIGH}"
     fi
 
-    # filter_groups 标签
-    if [ "$FILTER_GROUPS_ENABLE" = "true" ]; then
-        FG_TAG="-dynSamp"
-    else
-        FG_TAG=""
-    fi
+    # clip_adv 标签
+    CLIP_ADV_TAG="-clipAdv${CLIP_ADV_VALUE}"
+
+    # EMA update rate 标签
+    EMA_TAG="-ema${TEACHER_UPDATE_RATE}"
 
     # include_successful_rollouts 标签
     if [ "$INCLUDE_SUCCESSFUL_ROLLOUTS" = "True" ]; then
@@ -220,34 +212,18 @@ for TEACHER_UPDATE_RATE in "${TEACHER_UPDATE_RATE_LIST[@]}"; do
         ISR_TAG=""
     fi
 
-    # EMA update rate 标签
-    if [ "$TEACHER_UPDATE_RATE" = "0.1" ]; then
-        EMA_TAG="-ema0.1"
-    elif [ "$TEACHER_UPDATE_RATE" = "1.0" ]; then
-        EMA_TAG="-ema1.0"
-    else
-        EMA_TAG="-ema${TEACHER_UPDATE_RATE}"
-    fi
-
     CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
-    # clip_adv 标签
-    if [ "$CLIP_ADV" = "false" ]; then
-        CLIP_ADV_TAG="-noClipAdv"
-    else
-        CLIP_ADV_TAG="-clipAdv${CLIP_ADV_VALUE}"
-    fi
-
     EC_TAG="-ec${ENTROPY_COEFF}"
-    JOB_NAME="TASD-DAPO-${DATASET_SHORT}-rt_${REWARD_TYPE}${ENTROPY_TAG}${TOPK_TAG}${REP_TAG}${STD_TAG}${CLIP_TAG}${FG_TAG}${ISR_TAG}${CLIP_ADV_TAG}${EMA_TAG}${EC_TAG}-${MODEL_SHORT}-${CURRENT_TIME}"
+    JOB_NAME="TASD-${DATASET_SHORT}-rt_${REWARD_TYPE}${ENTROPY_TAG}${TOPK_TAG}${REP_TAG}${STD_TAG}${CLIP_TAG}${CLIP_ADV_TAG}${EMA_TAG}${ISR_TAG}${EC_TAG}-${MODEL_SHORT}-${CURRENT_TIME}"
 
     # ── 提交 ────────────────────────────────────────────────────────
     if [ "$DRY_RUN" = true ]; then
         echo "------------------------------------------------------------"
         echo "Job #${TOTAL}: ${JOB_NAME}"
         echo "  REWARD_TYPE=$REWARD_TYPE ENTROPY_GATE=$ENTROPY_GATE"
-        echo "  CLIP_ADV=$CLIP_ADV CLIP_ADV_VALUE=$CLIP_ADV_VALUE DISTILL_TOPK=$DISTILL_TOPK"
+        echo "  CLIP_ADV_VALUE=$CLIP_ADV_VALUE DISTILL_TOPK=$DISTILL_TOPK"
         echo "  REPETITION_PENALTY=$REPETITION_PENALTY NORM_ADV_BY_STD=$NORM_ADV_BY_STD ADV_STD_FLOOR=$ADV_STD_FLOOR"
-        echo "  CLIP_RATIO_HIGH=$CLIP_RATIO_HIGH FILTER_GROUPS=$FILTER_GROUPS_ENABLE"
+        echo "  TEACHER_UPDATE_RATE=$TEACHER_UPDATE_RATE"
     else
         echo "提交 Job #${TOTAL}: ${JOB_NAME}"
 
@@ -262,6 +238,8 @@ for TEACHER_UPDATE_RATE in "${TEACHER_UPDATE_RATE_LIST[@]}"; do
             --job_name=${JOB_NAME} \
             --env=OPENLM_TOKEN=${OPENLM_TOKEN} \
             --env=SWANLAB_API_KEY=${SWANLAB_API_KEY:-M5oC00EEt8G1wC0XaHkal} \
+            --env=DINGTALK_WEBHOOK=https://oapi.dingtalk.com/robot/send?access_token=f598ad33b071751bf79d2484d8e1acefe8df9d879e129cae40340a158854f9cb \
+            --env=DINGTALK_SECRET=SECc5b9e4f61f56b32b46abf1ecedc11bdcba10dc35fbba8fa0ff62c084a1cc6ad3 \
             --custom_docker_image=${CUSTOM_DOCKER_IMAGE} \
             --requirements_file_name=requirements_nebula.txt \
             --oss_access_id=${OSS_ACCESS_ID} \
@@ -280,7 +258,6 @@ for TEACHER_UPDATE_RATE in "${TEACHER_UPDATE_RATE_LIST[@]}"; do
         sleep 2
     fi
 
-done
 done
 done
 done

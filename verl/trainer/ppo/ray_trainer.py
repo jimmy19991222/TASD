@@ -1345,6 +1345,7 @@ class RayPPOTrainer:
             return
         if self._best_val_metric is None or metric_val > self._best_val_metric:
             self._best_val_metric = metric_val
+            self._best_val_step = self.global_steps
             print(
                 f"[BestCkpt] New best {metric_key}={metric_val:.4f} at step {self.global_steps}, saving best checkpoint."
             )
@@ -1822,6 +1823,7 @@ class RayPPOTrainer:
 
         self.global_steps = 0
         self._best_val_metric = None  # track best val metric for best checkpoint saving
+        self._best_val_step = None     # step at which best metric was achieved
 
         # load checkpoint before doing anything
         self._load_checkpoint()
@@ -1844,6 +1846,17 @@ class RayPPOTrainer:
 
         # add tqdm
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
+
+        # Send DingTalk notification: training started
+        from verl.utils.tracking import send_dingtalk_alert
+        _exp_name = self.config.trainer.get("experiment_name", "")
+        _total_steps = self.total_training_steps
+        _total_epochs = self.config.trainer.get("total_epochs", "?")
+        send_dingtalk_alert(
+            f"🟢 Training started!\n"
+            f"  experiment: {_exp_name}\n"
+            f"  total_steps: {_total_steps}, total_epochs: {_total_epochs}"
+        )
 
         # we start from step 1
         self.global_steps += 1
@@ -2405,6 +2418,14 @@ class RayPPOTrainer:
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 
+                # Check for training anomalies and send DingTalk alerts
+                from verl.utils.tracking import check_training_anomalies
+                check_training_anomalies(
+                    metrics=metrics,
+                    step=self.global_steps,
+                    experiment_name=self.config.trainer.get("experiment_name", ""),
+                )
+
                 progress_bar.update(1)
                 self.global_steps += 1
 
@@ -2421,6 +2442,33 @@ class RayPPOTrainer:
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
+
+                    # Send DingTalk notification: training completed
+                    from verl.utils.tracking import send_dingtalk_alert
+                    _exp_name = self.config.trainer.get("experiment_name", "")
+                    _msg_lines = [f"✅ Training completed!", f"  experiment: {_exp_name}", f"  total_steps: {self.global_steps}"]
+                    # Add last val metrics
+                    if last_val_metrics:
+                        _msg_lines.append("  ── Last val metrics ──")
+                        for _k in sorted(last_val_metrics.keys()):
+                            if "val-core" in _k or "val-aux/sciknoweval/acc/mean" in _k:
+                                _v = last_val_metrics[_k]
+                                if isinstance(_v, float):
+                                    _msg_lines.append(f"  {_k}: {_v:.4f}")
+                                else:
+                                    _msg_lines.append(f"  {_k}: {_v}")
+                    # Add best historical metric
+                    if self._best_val_metric is not None:
+                        _best_metric_key = self.config.trainer.get("save_best_metric", "val-core/acc/mean@16")
+                        _msg_lines.append(f"  ── Best historical ──")
+                        _msg_lines.append(f"  {_best_metric_key}: {self._best_val_metric:.4f} (step {self._best_val_step})")
+                    # Add training time
+                    _timing = metrics.get("timing_s/step", None)
+                    if _timing is not None:
+                        _total_time_h = _timing * self.global_steps / 3600
+                        _msg_lines.append(f"  total_time: ~{_total_time_h:.1f}h")
+                    send_dingtalk_alert("\n".join(_msg_lines))
+
                     return
 
                 # this is experimental and may be changed/removed in the future

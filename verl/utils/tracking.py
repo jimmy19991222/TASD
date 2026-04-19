@@ -26,6 +26,100 @@ from typing import Any
 import orjson
 
 
+# ── DingTalk Alert Utility ──────────────────────────────────────────────────
+import hashlib
+import hmac
+import base64
+import time
+import urllib.parse
+
+
+def _sign_dingtalk_secret(secret: str) -> tuple:
+    """Generate DingTalk signing headers. Returns (timestamp, sign)."""
+    timestamp = str(round(time.time() * 1000))
+    string_to_sign = f"{timestamp}\n{secret}"
+    hmac_code = hmac.new(secret.encode("utf-8"), string_to_sign.encode("utf-8"), digestmod=hashlib.sha256).digest()
+    sign = urllib.parse.quote_plus(base64.b64encode(hmac_code))
+    return timestamp, sign
+
+
+def send_dingtalk_alert(content: str):
+    """Send a DingTalk alert message via webhook API directly.
+    No-op if DINGTALK_WEBHOOK or DINGTALK_SECRET is not set.
+    """
+    webhook = os.environ.get("DINGTALK_WEBHOOK", "")
+    secret = os.environ.get("DINGTALK_SECRET", "")
+    if not webhook or not secret:
+        return
+    try:
+        import requests
+        timestamp, sign = _sign_dingtalk_secret(secret)
+        url = f"{webhook}&timestamp={timestamp}&sign={sign}"
+        payload = {
+            "msgtype": "text",
+            "text": {"content": content}
+        }
+        resp = requests.post(url, json=payload, timeout=10)
+        if resp.status_code == 200:
+            result = resp.json()
+            if result.get("errcode") != 0:
+                print(f"[DingTalk] Send failed: {result}")
+        else:
+            print(f"[DingTalk] HTTP error: {resp.status_code}")
+    except Exception as e:
+        print(f"[DingTalk] Alert send failed: {e}")
+
+
+def check_training_anomalies(metrics: dict, step: int, experiment_name: str = ""):
+    """Check training metrics for anomalies and send DingTalk alerts.
+
+    Alert conditions:
+    1. Entropy collapse: actor/entropy < 0.005 (model too deterministic)
+    2. Gate retention too low: tasd/gate_retention_ratio_mean < 0.1 (almost all tokens filtered)
+    3. Token reward all negative: tasd/token_reward_pos_rate == 0.0
+    4. Gradient explosion: actor/grad_norm > 100
+    5. Repetition /复读机: response_length/clip_ratio > 0.3
+    6. High abort ratio: response/aborted_ratio > 0.3
+    """
+    alerts = []
+    prefix = f"[TASD Alert] step={step}" + (f" exp={experiment_name}" if experiment_name else "")
+
+    # 1. Entropy collapse
+    entropy = metrics.get("actor/entropy")
+    if entropy is not None and entropy < 0.005:
+        alerts.append(f"🔴 Entropy collapse: {entropy:.6f} < 0.005 — model is too deterministic")
+
+    # 2. Gate retention too low (entropy gate filtering almost everything)
+    gate_ret = metrics.get("tasd/gate_retention_ratio_mean")
+    if gate_ret is not None and gate_ret < 0.1:
+        alerts.append(f"🔴 Gate retention too low: {gate_ret:.4f} < 0.1 — almost all tokens filtered by entropy gate")
+
+    # 3. Token reward all negative
+    pos_rate = metrics.get("tasd/token_reward_pos_rate")
+    if pos_rate is not None and pos_rate == 0.0:
+        alerts.append(f"🔴 Token reward pos_rate = 0.0 — no positive reward signal at all")
+
+    # 4. Gradient explosion
+    grad_norm = metrics.get("actor/grad_norm")
+    if grad_norm is not None and grad_norm > 100:
+        alerts.append(f"🔴 Gradient explosion: grad_norm={grad_norm:.1f} > 100")
+
+    # 5. Repetition /复读机: high clip_ratio means responses hitting max length
+    clip_ratio = metrics.get("response_length/clip_ratio")
+    if clip_ratio is not None and clip_ratio > 0.3:
+        alerts.append(f"🔴 Repetition detected: clip_ratio={clip_ratio:.2f} > 0.3 — responses hitting max length (复读机)")
+
+    # 6. High abort ratio: model failing to generate valid responses
+    aborted_ratio = metrics.get("response/aborted_ratio")
+    if aborted_ratio is not None and aborted_ratio > 0.3:
+        alerts.append(f"🔴 High abort ratio: {aborted_ratio:.2f} > 0.3 — model failing to generate valid responses")
+
+    if alerts:
+        msg = prefix + "\n" + "\n".join(alerts)
+        print(msg)
+        send_dingtalk_alert(msg)
+
+
 class Tracking:
     """A unified tracking interface for logging experiment data to multiple backends.
 
@@ -131,6 +225,25 @@ class Tracking:
                 swanlab_init_kwargs["group"] = group_name
             if tags:
                 swanlab_init_kwargs["tags"] = tags if isinstance(tags, list) else [tags]
+
+            # DingTalk notification callback
+            _callbacks = []
+            DINGTALK_WEBHOOK = os.environ.get("DINGTALK_WEBHOOK", None)
+            DINGTALK_SECRET = os.environ.get("DINGTALK_SECRET", None)
+            if DINGTALK_WEBHOOK and DINGTALK_SECRET:
+                try:
+                    from swanlab.plugin.notification import DingTalkCallback
+                    dingtalk_callback = DingTalkCallback(
+                        webhook_url=DINGTALK_WEBHOOK,
+                        secret=DINGTALK_SECRET,
+                    )
+                    _callbacks.append(dingtalk_callback)
+                    print(f"[SwanLab] DingTalk notification enabled")
+                except Exception as e:
+                    print(f"[SwanLab] Failed to init DingTalk callback: {e}")
+            if _callbacks:
+                swanlab_init_kwargs["callbacks"] = _callbacks
+
             swanlab.init(**swanlab_init_kwargs)
             self.logger["swanlab"] = swanlab
 
