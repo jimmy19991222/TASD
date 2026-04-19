@@ -25,7 +25,7 @@ if [ $# -gt 0 ] && [[ "$1" == "--dry-run" ]]; then
 fi
 
 # =============================================================================
-# 重提实验参数（精确对应 TASD-sciknoweval-biology-rt_teacher_log_prob-noGate-rep1.0-normStd-clipH0.2-clipAdv2.0-ema0.1-ec0.0-Qwen3-8B-20260419_162035）
+# 重提实验参数（精确对应 TASD-sciknoweval-biology-rt_teacher_log_prob-noGate-rep1.0-normStd-clipH0.2-clipAdv2.0-ema0.1-ec0.0-Qwen3-8B-20260419_175631）
 # =============================================================================
 DATASET="sciknoweval/biology"
 REWARD_TYPE="teacher_log_prob"
