@@ -62,12 +62,14 @@ def send_dingtalk_alert(content: str):
         resp = requests.post(url, json=payload, timeout=10)
         if resp.status_code == 200:
             result = resp.json()
-            if result.get("errcode") != 0:
-                print(f"[DingTalk] Send failed: {result}")
+            if result.get("errcode") == 0:
+                print(f"[DingTalk] ✅ Sent: {content[:80]}")
+            else:
+                print(f"[DingTalk] ❌ Send failed: {result}")
         else:
-            print(f"[DingTalk] HTTP error: {resp.status_code}")
+            print(f"[DingTalk] ❌ HTTP error: {resp.status_code}")
     except Exception as e:
-        print(f"[DingTalk] Alert send failed: {e}")
+        print(f"[DingTalk] ❌ Alert send failed: {e}")
 
 
 def check_training_anomalies(metrics: dict, step: int, experiment_name: str = ""):
