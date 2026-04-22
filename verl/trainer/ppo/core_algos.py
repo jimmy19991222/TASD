@@ -2549,12 +2549,6 @@ def compute_tasd_advantage(
                     adv_i = adv_i / group_std
                 advantages[i] = adv_i * effective_mask[i]
         
-        # ── Advantage clipping ──────────────────────────────────────────────
-        valid_mask = effective_mask.bool()
-        if clip_adv:
-            clipped = torch.clamp(advantages, min=-clip_adv_value, max=clip_adv_value)
-            advantages = torch.where(valid_mask, clipped, advantages)
-        
         # ── Adv entropy weighting ──────────────────────────────────────────
         # 在 advantage 阶段按熵信息加权，不影响 group_mean 计算
         # 与 entropy_gate 的区别：entropy_gate 在 reward 阶段乘权重 → 扭曲 group_mean
@@ -2635,6 +2629,14 @@ def compute_tasd_advantage(
             filtered_response_mask = response_mask * (entropy_w > 0).float()
         else:
             filtered_response_mask = response_mask
+        
+        # ── Advantage clipping（在 adv_entropy_weight 之后）──────────────────
+        # 必须在加权之后再 clip：归一化 entropy_w 均值=1，但局部 w 可能 > 1
+        # 例如 hard_filter 过滤 50% token → w≈2 → clip前的 3.0×2=6.0 超出
+        valid_mask = effective_mask.bool()
+        if clip_adv:
+            clipped = torch.clamp(advantages, min=-clip_adv_value, max=clip_adv_value)
+            advantages = torch.where(valid_mask, clipped, advantages)
         
         # 保护：处理可能的 NaN/Inf 值
         advantages = torch.where(torch.isfinite(advantages), advantages, torch.zeros_like(advantages))

@@ -66,8 +66,8 @@ ENTROPY_GATE_LIST=(
 # ── Clip Adv ─────────────────────────────────────────────────────────
 # clip_adv 开关遍历：true = clip advantage，false = 不 clip
 CLIP_ADV_LIST=(
-    # "true"
-    "false"
+    "true"
+    # "false"
 )
 CLIP_ADV_VALUE_LIST=(
     # "1.0"
@@ -120,7 +120,8 @@ ADV_ENTROPY_WEIGHT_LIST=(
 # ── Clip Ratio High ──────────────────────────────────────────────────
 # 10000 = Clip-Higher（不 clip 上界），0.2 = 标准 PPO（关闭 Clip-Higher）
 CLIP_RATIO_HIGH_LIST=(
-    "10000"
+    # "10000"
+    "0.28"
     # "0.2"
 )
 
@@ -245,7 +246,8 @@ for INCLUDE_SUCCESSFUL_ROLLOUTS in "${INCLUDE_SUCCESSFUL_ROLLOUTS_LIST[@]}"; do
 
     CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
     EC_TAG="-ec${ENTROPY_COEFF}"
-    JOB_NAME="TASD-${DATASET_SHORT}-rt_${REWARD_TYPE}${ENTROPY_TAG}${TOPK_TAG}${REP_TAG}${STD_TAG}${CLIP_TAG}${CLIP_ADV_TAG}${EMA_TAG}${ISR_TAG}${AEW_TAG}${EC_TAG}-${MODEL_SHORT}-${CURRENT_TIME}"
+    # v2: clip_adv 移到 adv_entropy_weight 之后，修复归一化放大突破 clip 上界的问题
+    JOB_NAME="TASD-${DATASET_SHORT}-rt_${REWARD_TYPE}${ENTROPY_TAG}${TOPK_TAG}${REP_TAG}${STD_TAG}${CLIP_TAG}${CLIP_ADV_TAG}${EMA_TAG}${ISR_TAG}${AEW_TAG}${EC_TAG}-v2-${MODEL_SHORT}-${CURRENT_TIME}"
 
     # ── 提交 ────────────────────────────────────────────────────────
     if [ "$DRY_RUN" = true ]; then
