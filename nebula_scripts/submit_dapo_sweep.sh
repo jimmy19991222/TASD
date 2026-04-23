@@ -17,7 +17,7 @@ OSS_BUCKET="lazada-ai-model"
 CLUSTER_FILE="nebula_scripts/cluster.json"
 SCRIPT_PATH="nebula_scripts/dapo/dapo_sciknoweval_parametric.sh"
 CUSTOM_DOCKER_IMAGE="${CUSTOM_DOCKER_IMAGE:-hub.docker.alibaba-inc.com/mdl/notebook_saved:loujieming.ljm_yueqiu_sdpo_env_torch260_20260324155942}"
-PROJECT_NAME="DAPO"
+PROJECT_NAME="TASD-v3"
 
 # ── 数据集配置 ──────────────────────────────────────────────────────
 DATASETS=(
@@ -49,7 +49,7 @@ ENTROPY_COEFF_LIST=(
 # ── Clip Ratio High ──────────────────────────────────────────────────
 # DAPO 原论文推荐 clip_high >> clip_low（如 0.28 或 10000）
 CLIP_RATIO_HIGH_LIST=(
-    "10000"   # 等效于不 clip 上界
+    # "10000"   # 等效于不 clip 上界
     "0.28"  # DAPO 原论文设置
     # "0.2"   # 退回标准 PPO（上下对称 clip）
 )
@@ -64,7 +64,7 @@ FILTER_GROUPS_ENABLE_LIST=(
 # ── Repetition Penalty ───────────────────────────────────────────────
 REPETITION_PENALTY_LIST=(
     "1.05"
-    # "1.0"
+    "1.0"
 )
 
 # ── 固定参数 ────────────────────────────────────────────────────────────

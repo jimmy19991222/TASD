@@ -122,7 +122,7 @@ ADV_ENTROPY_WEIGHT_LIST=(
 #   "token"：所有有效 token 打平统计（原有方式，存在 length bias）
 #   "seq"  ：先 per-seq 取 token 均值，再在 seq 上统计（消除 length bias）
 GROUP_MEAN_MODE_LIST=(
-    "token"
+    # "token"
     "seq"
 )
 

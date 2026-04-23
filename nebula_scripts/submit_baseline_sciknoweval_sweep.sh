@@ -18,7 +18,7 @@ OSS_ENDPOINT="oss-cn-hangzhou-zmf.aliyuncs.com"
 OSS_BUCKET="lazada-ai-model"
 CLUSTER_FILE="nebula_scripts/cluster.json"
 CUSTOM_DOCKER_IMAGE="${CUSTOM_DOCKER_IMAGE:-hub.docker.alibaba-inc.com/mdl/notebook_saved:loujieming.ljm_yueqiu_sdpo_env_torch260_20260324155942}"
-PROJECT_NAME="Baselines_clean"
+PROJECT_NAME="TASD-v3"
 
 # ── 命令行参数解析 ──────────────────────────────────────────────────────
 DRY_RUN=false
