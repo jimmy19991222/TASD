@@ -28,6 +28,7 @@ CLIP_ADV="${CLIP_ADV:-true}"
 NORM_ADV_BY_STD="${NORM_ADV_BY_STD:-false}"
 ADV_STD_FLOOR="${ADV_STD_FLOOR:-0.0}"  # std下界：0 | auto | float
 ADV_ENTROPY_WEIGHT="${ADV_ENTROPY_WEIGHT:-none}"  # advantage 熵加权：none | hard_filter | teacher_conf | teacher_conf_filtered | certainty_diff_filtered
+GROUP_MEAN_MODE="${GROUP_MEAN_MODE:-token}"  # group mean/std 统计粒度：token（原有，存在length bias）| seq（per-seq均值后统计，消除length bias）
 CLIP_RATIO_HIGH="${CLIP_RATIO_HIGH:-10000}"  # DAPO 风格：不 clip 上界；用 0.2 可退回标准 PPO
 DISTILL_TOPK="${DISTILL_TOPK:-100}"
 DISTILL_TEMPERATURE="${DISTILL_TEMPERATURE:-1.0}"
@@ -122,6 +123,7 @@ python -m verl.trainer.main_ppo \
     algorithm.tasd.clip_adv=${CLIP_ADV} \
     algorithm.tasd.clip_adv_value=${CLIP_ADV_VALUE} \
     algorithm.tasd.adv_entropy_weight=${ADV_ENTROPY_WEIGHT} \
+    algorithm.tasd.group_mean_mode=${GROUP_MEAN_MODE} \
     algorithm.tasd.use_self_as_teacher_on_success=${INCLUDE_SUCCESSFUL_ROLLOUTS} \
     algorithm.tasd.include_successful_rollouts=${INCLUDE_SUCCESSFUL_ROLLOUTS} \
     algorithm.tasd.success_reward_threshold=1.0 \

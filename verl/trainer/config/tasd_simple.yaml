@@ -52,6 +52,10 @@ algorithm:
     adv_std_floor: 0.0              # std下界：0.0 | auto | float，防止 group_std 过小导致 adv 爆炸
     clip_adv: true
     clip_adv_value: 2.0
+    # group_mean_mode: group mean/std 的统计粒度
+    #   "token"：所有有效 token 打平统计（默认，原有方式，存在 length bias）
+    #   "seq"  ：先 per-seq 取 token 均值，再在 seq 上统计（消除 length bias，长短 response 各占 1 票）
+    group_mean_mode: "token"
     
     # ── advantage entropy weighting ──────────────────────────
     # 在 advantage 阶段按熵信息加权（不影响 group_mean），与 entropy_gate 互补

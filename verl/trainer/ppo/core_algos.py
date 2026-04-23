@@ -2484,6 +2484,11 @@ def compute_tasd_advantage(
     clip_adv_value = tasd_cfg.get("clip_adv_value", 2.0)
     norm_adv_by_std = tasd_cfg.get("norm_adv_by_std", False)
     adv_entropy_weight = tasd_cfg.get("adv_entropy_weight", "none")
+    # group_mean_mode: 控制 group mean/std 的统计粒度
+    #   "token"：所有有效 token 打平后统计（原有方式，存在 length bias）
+    #   "seq"  ：先 per-sequence 取 token 均值得到标量 reward，再在 seq 上统计
+    #            消除 length bias（长短 response 各占 1 票），baseline 更公平
+    group_mean_mode = tasd_cfg.get("group_mean_mode", "token")
     
     # 解析 adv_std_floor：三态配置（0 / auto / 数字）
     adv_std_floor_raw = tasd_cfg.get("adv_std_floor", 0.0)
@@ -2517,37 +2522,63 @@ def compute_tasd_advantage(
             uid_to_indices[index[i]].append(i)
         
         for uid, indices in uid_to_indices.items():
-            # 收集有效 token 的 reward（仅 effective_mask=1 的位置）
-            valid_rewards = []
+            # 收集每条 sequence 有效位置的 reward
+            valid_rewards_per_seq = []  # List[Tensor] - 每条 seq 的有效 token rewards
+            valid_seq_indices = []      # 对应的 batch index
             for i in indices:
                 valid_r = token_level_rewards[i][effective_mask[i].bool()]
                 if valid_r.numel() > 0:
-                    valid_rewards.append(valid_r)
+                    valid_rewards_per_seq.append(valid_r)
+                    valid_seq_indices.append(i)
             
-            if len(valid_rewards) == 0:
+            if len(valid_rewards_per_seq) == 0:
                 continue
             
-            all_rewards = torch.cat(valid_rewards)
-            group_mean = all_rewards.mean()
-            
-            # 可选：除以 group std（带 adv_std_floor 保护）
-            if norm_adv_by_std:
-                # 计算 std floor：auto 模式下根据 group_size 自动计算
-                if adv_std_floor_auto:
-                    group_size = len(valid_rewards)
-                    std_floor = 1.0 / (group_size ** 0.5) if group_size > 1 else 1.0
+            if group_mean_mode == "seq":
+                # ── seq 模式：先 per-seq 均值，再 group-level mean/std ────────
+                # 每条 seq 先取 token 均值得到标量 reward（长短 response 各占 1 票）
+                # 消除 length bias：较长的 response 不会因 token 数多而影响 baseline
+                seq_mean_rewards = torch.stack([r.mean() for r in valid_rewards_per_seq])  # (N_valid_seq,)
+                group_mean = seq_mean_rewards.mean()
+                
+                if norm_adv_by_std:
+                    if adv_std_floor_auto:
+                        group_size = len(valid_rewards_per_seq)
+                        std_floor = 1.0 / (group_size ** 0.5) if group_size > 1 else 1.0
+                    else:
+                        std_floor = max(1e-8, adv_std_floor_fixed)
+                    group_std = seq_mean_rewards.std(unbiased=False).clamp(min=std_floor)
                 else:
-                    std_floor = max(1e-8, adv_std_floor_fixed)
-                group_std = all_rewards.std(unbiased=False).clamp(min=std_floor)
-            else:
-                group_std = None
+                    group_std = None
+                
+                # advantage = (seq_mean_reward - group_mean) [/ group_std]，广播回所有 token
+                for i, seq_mean in zip(valid_seq_indices, seq_mean_rewards):
+                    adv_scalar = seq_mean - group_mean
+                    if norm_adv_by_std and group_std is not None:
+                        adv_scalar = adv_scalar / group_std
+                    # 广播：该 seq 所有有效 token 使用相同的 advantage（基于 seq-level 信号）
+                    advantages[i] = adv_scalar * effective_mask[i]
             
-            # 计算 advantage = (reward - group_mean) [/ group_std]
-            for i in indices:
-                adv_i = token_level_rewards[i] - group_mean
-                if norm_adv_by_std and group_std is not None:
-                    adv_i = adv_i / group_std
-                advantages[i] = adv_i * effective_mask[i]
+            else:
+                # ── token 模式（默认）：所有有效 token 打平后统计 group mean/std ─
+                all_rewards = torch.cat(valid_rewards_per_seq)
+                group_mean = all_rewards.mean()
+                
+                if norm_adv_by_std:
+                    if adv_std_floor_auto:
+                        group_size = len(valid_rewards_per_seq)
+                        std_floor = 1.0 / (group_size ** 0.5) if group_size > 1 else 1.0
+                    else:
+                        std_floor = max(1e-8, adv_std_floor_fixed)
+                    group_std = all_rewards.std(unbiased=False).clamp(min=std_floor)
+                else:
+                    group_std = None
+                
+                for i in valid_seq_indices:
+                    adv_i = token_level_rewards[i] - group_mean
+                    if norm_adv_by_std and group_std is not None:
+                        adv_i = adv_i / group_std
+                    advantages[i] = adv_i * effective_mask[i]
         
         # ── Adv entropy weighting ──────────────────────────────────────────
         # 在 advantage 阶段按熵信息加权，不影响 group_mean 计算
