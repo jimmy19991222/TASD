@@ -2535,9 +2535,11 @@ def compute_tasd_advantage(
                 continue
             
             if group_mean_mode == "seq":
-                # ── seq 模式：先 per-seq 均值，再 group-level mean/std ────────
-                # 每条 seq 先取 token 均值得到标量 reward（长短 response 各占 1 票）
-                # 消除 length bias：较长的 response 不会因 token 数多而影响 baseline
+                # ── seq 模式：group mean/std 用 seq 粒度估计，advantage 仍在 token 上 ─
+                # 每条 seq 先取 token 均值得到标量（长短 response 各占 1 票）
+                # 消除 length bias：baseline 不被长 response 的大量 token 拉偏
+                # advantage 仍然 token 级：adv[i,t] = (r[i,t] - group_mean_seq) / std_seq
+                # 保留 token 间相对差异，只是 baseline 和 scale 更公平
                 seq_mean_rewards = torch.stack([r.mean() for r in valid_rewards_per_seq])  # (N_valid_seq,)
                 group_mean = seq_mean_rewards.mean()
                 
@@ -2551,13 +2553,12 @@ def compute_tasd_advantage(
                 else:
                     group_std = None
                 
-                # advantage = (seq_mean_reward - group_mean) [/ group_std]，广播回所有 token
-                for i, seq_mean in zip(valid_seq_indices, seq_mean_rewards):
-                    adv_scalar = seq_mean - group_mean
+                # token 级 advantage：用 seq-level 估计的 group_mean/std 做归一化
+                for i in valid_seq_indices:
+                    adv_i = token_level_rewards[i] - group_mean
                     if norm_adv_by_std and group_std is not None:
-                        adv_scalar = adv_scalar / group_std
-                    # 广播：该 seq 所有有效 token 使用相同的 advantage（基于 seq-level 信号）
-                    advantages[i] = adv_scalar * effective_mask[i]
+                        adv_i = adv_i / group_std
+                    advantages[i] = adv_i * effective_mask[i]
             
             else:
                 # ── token 模式（默认）：所有有效 token 打平后统计 group mean/std ─
