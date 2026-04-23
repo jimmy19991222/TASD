@@ -27,7 +27,7 @@ OSS_BUCKET="lazada-ai-model"
 CLUSTER_FILE="nebula_scripts/cluster.json"
 SCRIPT_PATH="nebula_scripts/tasd_simple/tasd_simple_parametric.sh"
 CUSTOM_DOCKER_IMAGE="${CUSTOM_DOCKER_IMAGE:-hub.docker.alibaba-inc.com/mdl/notebook_saved:loujieming.ljm_yueqiu_sdpo_env_torch260_20260324155942}"
-PROJECT_NAME="TASD-v3"
+PROJECT_NAME="TASD-v5"
 
 # ── 数据集配置 ──────────────────────────────────────────────────────
 DATASETS=(
@@ -86,7 +86,7 @@ DISTILL_TOPK_LIST=(
 # ── Repetition Penalty ───────────────────────────────────────────────
 REPETITION_PENALTY_LIST=(
     "1.0"
-    # "1.05"
+    "1.05"
 )
 
 # ── Norm Adv By Std ─────────────────────────────────────────────────
@@ -110,10 +110,10 @@ ADV_STD_FLOOR_LIST=(
 # teacher_conf_filtered: 先过滤, 再按teacher确定性加权 mask×(1-H_t)
 # certainty_diff_filtered: 先过滤, 再按熵差加权
 ADV_ENTROPY_WEIGHT_LIST=(
-    # "none"
-    "hard_filter"
-    "teacher_conf"
-    "teacher_conf_filtered"
+    "none"
+    # "hard_filter"
+    # "teacher_conf"
+    # "teacher_conf_filtered"
     "certainty_diff_filtered"
 )
 
