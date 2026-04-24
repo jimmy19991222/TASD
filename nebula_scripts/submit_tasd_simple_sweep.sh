@@ -61,9 +61,9 @@ REWARD_TYPES=(
 # hard: 过滤影响 reward（置零）和 advantage
 # hard_keep_reward: 过滤只影响 advantage，reward 保持不变（group_mean/std 基于所有token）
 ENTROPY_GATE_LIST=(
-    "none"
-    "hard"
-    # "hard_keep_reward"
+    # "none"
+    # "hard"
+    "hard_keep_reward"
 )
 ENTROPY_GATE_RATIO_LIST=(
     "1.0"
@@ -113,8 +113,8 @@ ADV_STD_FLOOR_LIST=(
 # teacher_conf: 按 teacher 确定性加权 w = 1 - H_t_norm，关注 teacher 更确定的token
 # certainty_diff: 按 teacher-student 熵差加权 w = norm(H_s - H_t)，关注 teacher 和 student 熵差较大的token
 ADV_ENTROPY_WEIGHT_LIST=(
-    # "none"
-    # "teacher_conf"
+    "none"
+    "teacher_conf"
     "certainty_diff"
 )
 
