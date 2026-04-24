@@ -106,8 +106,8 @@ ADV_STD_FLOOR_LIST=(
 # ── Adv Entropy Weight ──────────────────────────────────────────────
 # advantage 阶段熵加权（纯加权，不过滤；过滤由 ENTROPY_GATE 统一控制）
 # none: 不加权
-# teacher_conf: 按 teacher 确定性加权 w = 1 - H_t_norm
-# certainty_diff: 按 teacher-student 熵差加权 w = norm(H_s - H_t)
+# teacher_conf: 按 teacher 确定性加权 w = 1 - H_t_norm，关注 teacher 更确定的token
+# certainty_diff: 按 teacher-student 熵差加权 w = norm(H_s - H_t)，关注 teacher 和 student 熵差较大的token
 ADV_ENTROPY_WEIGHT_LIST=(
     "none"
     # "teacher_conf"

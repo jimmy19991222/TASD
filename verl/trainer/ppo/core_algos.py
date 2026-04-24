@@ -2637,11 +2637,10 @@ def compute_tasd_advantage(
             
             # 乘到 advantage 上（量级不变）
             advantages = advantages * entropy_w_normalized
-            
-            # response_mask 不变：过滤职责已由 ENTROPY_GATE 通过 effective_mask 承担
-            filtered_response_mask = response_mask
-        else:
-            filtered_response_mask = response_mask
+        
+        # filtered_response_mask 使用 effective_mask，确保 gate_mask 和 self_distillation_mask
+        # 的过滤都体现在 loss 聚合中（被过滤的 token 不计入分母）
+        filtered_response_mask = effective_mask
         
         # ── Advantage clipping（在 adv_entropy_weight 之后）──────────────────
         # 必须在加权之后再 clip：归一化 entropy_w 均值=1，但局部 w 可能 > 1

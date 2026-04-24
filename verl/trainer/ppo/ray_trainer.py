@@ -367,12 +367,9 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
-        # adv_entropy_weight: 归一化 entropy_w 乘到 advantage 上（均值=1，量级不变）
-        # 被过滤的 token (w=0) → advantage=0 且 response_mask=False → 不贡献梯度也不计入分母
-        _tasd_cfg = config.algorithm.get("tasd", {}) if hasattr(config, "algorithm") else {}
-        _adv_entropy_weight = _tasd_cfg.get("adv_entropy_weight", "none") if _tasd_cfg else "none"
-        if _adv_entropy_weight != "none":
-            data.batch["response_mask"] = filtered_response_mask
+        # filtered_response_mask 包含 effective_mask 的过滤（gate_mask + self_distillation_mask）
+        # 被过滤的 token → advantage=0 且 response_mask=False → 不贡献梯度也不计入分母
+        data.batch["response_mask"] = filtered_response_mask
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
