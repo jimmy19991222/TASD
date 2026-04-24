@@ -59,14 +59,14 @@ algorithm:
     group_mean_mode: "token"
     
     # ── advantage entropy weighting ──────────────────────────
-    # 在 advantage 阶段按熵信息加权（不影响 group_mean），与 entropy_gate 互补
-    # entropy_gate 在 reward 阶段加权 → 扭曲 group_mean
-    # adv_entropy_weight 在 advantage 阶段加权 → 归一化 entropy_w 乘到 advantage 上
-    #   w 归一化到有效 token 均值=1，保证 loss 量级不变
-    #   被过滤的 token (w=0) → advantage=0 且 response_mask=False
-    # 统一范式：先过滤（teacher 比 student 更确定的位置才保留），再加权
-    # 但 teacher_conf 例外：不过滤，全部 token 按 teacher 确定性加权
-    # "none" | "hard_filter" | "teacher_conf" | "teacher_conf_filtered" | "certainty_diff_filtered"
+    # 在 advantage 阶段按熵信息加权（不影响 group_mean）
+    # 
+    # 职责分离：
+    #   - ENTROPY_GATE（reward 阶段）：控制哪些 token 参与训练（hard filter）
+    #   - ADV_ENTROPY_WEIGHT（advantage 阶段）：对参与训练的 token 做软加权
+    # 
+    # adv_entropy_weight 只做加权，不过滤。过滤由 ENTROPY_GATE 通过 effective_mask 统一控制。
+    # "none" | "teacher_conf" | "certainty_diff"
     adv_entropy_weight: "none"
     
     # ── 成功 rollout 配置 ─────────────────────────────────────

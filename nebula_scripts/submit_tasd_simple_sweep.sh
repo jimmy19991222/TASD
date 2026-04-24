@@ -66,8 +66,8 @@ ENTROPY_GATE_LIST=(
 # ── Clip Adv ─────────────────────────────────────────────────────────
 # clip_adv 开关遍历：true = clip advantage，false = 不 clip
 CLIP_ADV_LIST=(
-    "true"
-    # "false"
+    # "true"
+    "false"
 )
 CLIP_ADV_VALUE_LIST=(
     # "1.0"
@@ -104,17 +104,14 @@ ADV_STD_FLOOR_LIST=(
 )
 
 # ── Adv Entropy Weight ──────────────────────────────────────────────
-# advantage 阶段熵加权：none | hard_filter | teacher_conf | teacher_conf_filtered | certainty_diff_filtered
-# hard_filter: 先过滤(teacher更确定的位置), 不额外加权
-# teacher_conf: 不过滤, 全部token按teacher确定性加权(1-H_t)
-# teacher_conf_filtered: 先过滤, 再按teacher确定性加权 mask×(1-H_t)
-# certainty_diff_filtered: 先过滤, 再按熵差加权
+# advantage 阶段熵加权（纯加权，不过滤；过滤由 ENTROPY_GATE 统一控制）
+# none: 不加权
+# teacher_conf: 按 teacher 确定性加权 w = 1 - H_t_norm
+# certainty_diff: 按 teacher-student 熵差加权 w = norm(H_s - H_t)
 ADV_ENTROPY_WEIGHT_LIST=(
     "none"
-    # "hard_filter"
     # "teacher_conf"
-    # "teacher_conf_filtered"
-    "certainty_diff_filtered"
+    # "certainty_diff"
 )
 
 # ── Group Mean Mode ───────────────────────────────────────────────────

@@ -2344,9 +2344,9 @@ def compute_tasd_token_rewards(
             - hard: 二值 mask，teacher 更确定时保留
             - soft: 连续权重，基于熵差
             - soft_v2: 两阶段策略，mask + teacher 确定性权重
-        adv_entropy_weight: "none" | "hard_filter" | "teacher_conf" | "teacher_conf_filtered" | "certainty_diff_filtered"
-            通过归一化 entropy_w 乘到 advantage 上实现加权，w 归一化到均值=1 保证量级不变
-            被过滤的 token (w=0) 同时从 response_mask 中排除
+        adv_entropy_weight: "none" | "teacher_conf" | "certainty_diff"
+            纯加权，不过滤。通过归一化 entropy_w 乘到 advantage 上实现加权，w 归一化到均值=1 保证量级不变
+            过滤职责由 ENTROPY_GATE 通过 effective_mask 承担
     
     Returns:
         reward: (B, T) - token-level reward
@@ -2453,14 +2453,12 @@ def compute_tasd_advantage(
         - "none" or 0.0: 不使用 floor
     - advantage clipping
     - gate_mask：被 entropy gate 掉的 token 不参与 group_mean，advantage 置 0，无梯度
-    - adv_entropy_weight：通过归一化 entropy_w 乘到 advantage 上实现加权
+    - adv_entropy_weight：通过归一化 entropy_w 乘到 advantage 上实现加权（纯加权，不过滤）
         entropy_w 归一化到有效 token 上均值为 1，保证 loss 量级不变
-        被过滤的 token (w=0) 同时从 response_mask 中排除
+        过滤职责由 ENTROPY_GATE 承担（通过 effective_mask），adv_entropy_weight 只做加权
         - "none": 不加权（默认）
-        - "hard_filter": 只过滤 teacher 更确定的位置（w=1），不额外加权
-        - "teacher_conf": 不过滤，全部 token 按 teacher 确定性加权 w = 1 - H_t_norm
-        - "teacher_conf_filtered": 先过滤(H_t<H_s)，再按 teacher 确定性加权 w = mask × (1 - H_t_norm)
-        - "certainty_diff_filtered": 先过滤(H_t<H_s)，再按熵差加权 w = mask × norm(H_s - H_t_norm)
+        - "teacher_conf": 按 teacher 确定性加权 w = 1 - H_t_norm
+        - "certainty_diff": 按 teacher-student 熵差加权 w = norm(H_s - H_t)
     
     Args:
         token_level_rewards: (B, T) - token-level rewards
@@ -2583,63 +2581,46 @@ def compute_tasd_advantage(
         
         # ── Adv entropy weighting ──────────────────────────────────────────
         # 在 advantage 阶段按熵信息加权，不影响 group_mean 计算
-        # 与 entropy_gate 的区别：entropy_gate 在 reward 阶段乘权重 → 扭曲 group_mean
-        # adv_entropy_weight 在 advantage 阶段乘 → 只影响梯度幅度，不影响 baseline
-        #
-        # 统一范式：先过滤（只有 teacher 比 student 更确定的位置才加权），
-        #          再按不同策略加权
-        # - 不过滤的位置：权重=0（不产生梯度）
+        # 
+        # 职责分离原则：
+        #   - ENTROPY_GATE（reward 阶段）：控制哪些 token 参与训练（hard filter）
+        #   - ADV_ENTROPY_WEIGHT（advantage 阶段）：对参与训练的 token 做软加权
+        # 
+        # adv_entropy_weight 只做加权，不过滤。过滤由 ENTROPY_GATE 通过
+        # effective_mask 统一控制。这样避免了两处过滤的冗余和语义混乱。
         if adv_entropy_weight != "none":
             assert teacher_entropy_norm is not None and student_entropy_norm is not None, \
                 f"adv_entropy_weight={adv_entropy_weight} requires teacher/student entropy " \
                 f"(set entropy_gate != 'none' or ensure topk is provided)"
             
-            # 统一 hard filter：只有 teacher 比 student 更确定的位置才参与
-            hard_mask = (teacher_entropy_norm < student_entropy_norm).float()
-            
-            if adv_entropy_weight == "hard_filter":
-                # 只过滤，不额外加权
-                # teacher 比 student 更确定 → adv 保留，否则 adv=0
-                entropy_w = hard_mask
-            
-            elif adv_entropy_weight == "teacher_conf":
-                # 不过滤，全部 token 按 teacher 确定性加权
-                # teacher 越确定（H_t 越低），权重越大
+            if adv_entropy_weight == "teacher_conf":
+                # 按 teacher 确定性加权：teacher 越确定（H_t 越低），权重越大
                 # w = 1 - H_t_norm ∈ [0, 1]
-                # 没有 hard_mask，所有 token 都参与训练，只是梯度幅度不同
                 entropy_w = 1.0 - teacher_entropy_norm
             
-            elif adv_entropy_weight == "teacher_conf_filtered":
-                # 先过滤，再按 teacher 确定性加权
-                # 只有 teacher 比 student 更确定的位置参与
-                # w = hard_mask × (1 - H_t_norm)
-                entropy_w = hard_mask * (1.0 - teacher_entropy_norm)
-            
-            elif adv_entropy_weight == "certainty_diff_filtered":
-                # 先过滤，再按熵差加权
+            elif adv_entropy_weight == "certainty_diff":
+                # 按 teacher-student 熵差加权
                 # teacher 比 student 多确定多少，diff 越大权重越大
-                # w = hard_mask × norm(H_s_norm - H_t_norm)
                 diff = (student_entropy_norm - teacher_entropy_norm).clamp(min=0.0)
                 # 归一化到 [0, 1]：除以最大值
                 nonzero_mask = diff > 0
                 if nonzero_mask.any():
                     max_diff = diff[nonzero_mask].max().clamp(min=1e-6)
                     diff = diff / max_diff
-                entropy_w = hard_mask * diff
+                entropy_w = diff
             
             else:
                 raise ValueError(
                     f"Unknown adv_entropy_weight: {adv_entropy_weight}. "
-                    f"Supported: none, hard_filter, teacher_conf, teacher_conf_filtered, certainty_diff_filtered"
+                    f"Supported: none, teacher_conf, certainty_diff"
                 )
             
-            # 将 entropy_w 应用到 advantage 和 response_mask 上
+            # 将 entropy_w 应用到 advantage 上
             # 
             # 方案：entropy_w 归一化到有效 token 上均值为 1，再乘到 advantage 上
             # - 均值归一化保证 loss 量级不变（与不加权时相当）
             # - entropy_w 只影响 token 间相对重要性（teacher 越确定 → 梯度越大）
-            # - 被过滤的 token (entropy_w=0) → advantage=0 且 response_mask=False
-            #   → 不贡献梯度，不计入 token-mean 分母
+            # - effective_mask 已经排除了 ENTROPY_GATE 过滤的 token，无需重复过滤
             #
             # 为什么不能把 entropy_w 乘到 response_mask 上做 weighted-mean？
             # 因为 loss 计算时 response_mask 会被 .to(bool) 转成 bool（4处），
@@ -2657,14 +2638,14 @@ def compute_tasd_advantage(
             # 乘到 advantage 上（量级不变）
             advantages = advantages * entropy_w_normalized
             
-            # 更新 response_mask：被过滤的 token (entropy_w=0) 从 mask 中排除
-            filtered_response_mask = response_mask * (entropy_w > 0).float()
+            # response_mask 不变：过滤职责已由 ENTROPY_GATE 通过 effective_mask 承担
+            filtered_response_mask = response_mask
         else:
             filtered_response_mask = response_mask
         
         # ── Advantage clipping（在 adv_entropy_weight 之后）──────────────────
         # 必须在加权之后再 clip：归一化 entropy_w 均值=1，但局部 w 可能 > 1
-        # 例如 hard_filter 过滤 50% token → w≈2 → clip前的 3.0×2=6.0 超出
+        # 例如 entropy_w 归一化后局部 w≈2 → clip前的 3.0×2=6.0 超出
         valid_mask = effective_mask.bool()
         if clip_adv:
             clipped = torch.clamp(advantages, min=-clip_adv_value, max=clip_adv_value)
