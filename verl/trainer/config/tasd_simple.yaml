@@ -41,7 +41,11 @@ algorithm:
     reward_type: "teacher_prob"     # "teacher_prob" | "teacher_log_prob"
     
     # ── entropy gate: 熵门控，筛选有效训练信号 ──────────────────
-    entropy_gate: "none"            # "none" | "hard" | "soft"
+    # none: 无门控
+    # hard: 硬过滤，被过滤的 token reward=0 且不产生梯度（影响 mean/std）
+    # hard_keep_reward: 硬过滤但保留 reward，只在 advantage 阶段过滤（不影响 mean/std）
+    # soft: 软门控，按熵差加权 reward
+    entropy_gate: "none"            # "none" | "hard" | "hard_keep_reward" | "soft"
     entropy_gate_ratio: 1.0         # hard gate 保留比例（默认 1.0 = 原始 hard gate）
                                     # 0.8 = 保留熵差 top 80%，0.5 = 保留 top 50%
                                     # 仅在 entropy_gate="hard" 时生效

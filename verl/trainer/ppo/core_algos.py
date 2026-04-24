@@ -2405,7 +2405,7 @@ def compute_tasd_token_rewards(
         teacher_entropy_norm = teacher_entropy / H_max
         student_entropy_norm = student_entropy / H_max
         
-        if entropy_gate == "hard":
+        if entropy_gate in ("hard", "hard_keep_reward"):
             # 硬筛选：teacher 比 student 显著更确定才保留
             diff = (student_entropy_norm - teacher_entropy_norm).clamp(min=0.0)
             positive_mask = diff > 0
@@ -2417,7 +2417,11 @@ def compute_tasd_token_rewards(
             else:
                 gate_mask = positive_mask.float()
             
-            reward = reward * gate_mask
+            # hard: 过滤同时影响 reward（置零）和 advantage（effective_mask）
+            # hard_keep_reward: 只影响 advantage，reward 保持不变
+            #   → group_mean/std 基于所有 token 计算，过滤只控制哪些 token 产生梯度
+            if entropy_gate == "hard":
+                reward = reward * gate_mask
         
         elif entropy_gate == "soft":
             # 软门控：归一化熵差作为权重
