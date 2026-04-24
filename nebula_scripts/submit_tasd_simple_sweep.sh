@@ -56,24 +56,25 @@ REWARD_TYPES=(
 )
 
 # ── Entropy Gate ─────────────────────────────────────────────────────
+# 核心测试变量：entropy_gate + entropy_gate_ratio
+# ratio 仅在 hard 模式生效：1.0=原始hard | 0.8=保留top80% | 0.5=保留top50%
 ENTROPY_GATE_LIST=(
     "none"
-    # "hard"
-    # "soft"
-    # "soft_v2"
+    "hard"
+)
+ENTROPY_GATE_RATIO_LIST=(
+    "1.0"
+    "0.8"
+    "0.5"
 )
 
 # ── Clip Adv ─────────────────────────────────────────────────────────
-# clip_adv 开关遍历：true = clip advantage，false = 不 clip
+# v5 最优：clipAdv=true + value=2.0
 CLIP_ADV_LIST=(
-    # "true"
-    "false"
+    "true"
 )
 CLIP_ADV_VALUE_LIST=(
-    # "1.0"
     "2.0"
-    # "3.0"
-    # "5.0"
 )
 
 # ── Distill Topk ──────────────────────────────────────────────────────
@@ -84,8 +85,8 @@ DISTILL_TOPK_LIST=(
 )
 
 # ── Repetition Penalty ───────────────────────────────────────────────
+# v5 最优：rep=1.05（gmSeq + aew=none 下 best_acc=0.6325）
 REPETITION_PENALTY_LIST=(
-    "1.0"
     "1.05"
 )
 
@@ -172,6 +173,7 @@ SUBMITTED=0
 for DATASET in "${DATASETS[@]}"; do
 for REWARD_TYPE in "${REWARD_TYPES[@]}"; do
 for ENTROPY_GATE in "${ENTROPY_GATE_LIST[@]}"; do
+for ENTROPY_GATE_RATIO in "${ENTROPY_GATE_RATIO_LIST[@]}"; do
 for CLIP_ADV in "${CLIP_ADV_LIST[@]}"; do
 for CLIP_ADV_VALUE in "${CLIP_ADV_VALUE_LIST[@]}"; do
 for DISTILL_TOPK in "${DISTILL_TOPK_LIST[@]}"; do
@@ -183,6 +185,10 @@ for CLIP_RATIO_HIGH in "${CLIP_RATIO_HIGH_LIST[@]}"; do
 for TEACHER_UPDATE_RATE in "${TEACHER_UPDATE_RATE_LIST[@]}"; do
 for INCLUDE_SUCCESSFUL_ROLLOUTS in "${INCLUDE_SUCCESSFUL_ROLLOUTS_LIST[@]}"; do
 for GROUP_MEAN_MODE in "${GROUP_MEAN_MODE_LIST[@]}"; do
+    # 当 gate=none 时，跳过非 1.0 的 ratio（ratio 仅在 hard 时生效）
+    if [ "$ENTROPY_GATE" = "none" ] && [ "$ENTROPY_GATE_RATIO" != "1.0" ]; then
+        continue
+    fi
 
     TOTAL=$((TOTAL + 1))
 
@@ -280,7 +286,7 @@ for GROUP_MEAN_MODE in "${GROUP_MEAN_MODE_LIST[@]}"; do
             --engine=xdl \
             --queue=${QUEUE} \
             --entry=nebula_scripts/entry.py \
-            --user_params="--script_path=${SCRIPT_PATH} --world_size=${WORLD_SIZE} --job_name=${JOB_NAME} --env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=DATASET=${DATASET} --env=MODEL=${MODEL} --env=MODEL_PATH=${MODEL_PATH} --env=REWARD_TYPE=${REWARD_TYPE} --env=ENTROPY_GATE=${ENTROPY_GATE} --env=CLIP_ADV=${CLIP_ADV} --env=CLIP_ADV_VALUE=${CLIP_ADV_VALUE} --env=DISTILL_TOPK=${DISTILL_TOPK} --env=REPETITION_PENALTY=${REPETITION_PENALTY} --env=LR=${LR} --env=SEED=${SEED} --env=ENTROPY_COEFF=${ENTROPY_COEFF} --env=TEACHER_REG=${TEACHER_REG} --env=TEACHER_UPDATE_RATE=${TEACHER_UPDATE_RATE} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=MINI_BATCH_SIZE=${MINI_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=INCLUDE_SUCCESSFUL_ROLLOUTS=${INCLUDE_SUCCESSFUL_ROLLOUTS} --env=NORM_ADV_BY_STD=${NORM_ADV_BY_STD} --env=ADV_STD_FLOOR=${ADV_STD_FLOOR} --env=ADV_ENTROPY_WEIGHT=${ADV_ENTROPY_WEIGHT} --env=GROUP_MEAN_MODE=${GROUP_MEAN_MODE} --env=CLIP_RATIO_HIGH=${CLIP_RATIO_HIGH} --env=FILTER_GROUPS_ENABLE=${FILTER_GROUPS_ENABLE} --env=FILTER_GROUPS_METRIC=${FILTER_GROUPS_METRIC} --env=FILTER_GROUPS_MAX_GEN=${FILTER_GROUPS_MAX_GEN} --env=GIT_BRANCH=${GIT_BRANCH} --env=GIT_COMMIT=${GIT_COMMIT} --env=DINGTALK_WEBHOOK=https://oapi.dingtalk.com/robot/send?access_token=f598ad33b071751bf79d2484d8e1acefe8df9d879e129cae40340a158854f9cb --env=DINGTALK_SECRET=SECc5b9e4f61f56b32b46abf1ecedc11bdcba10dc35fbba8fa0ff62c084a1cc6ad3" \
+            --user_params="--script_path=${SCRIPT_PATH} --world_size=${WORLD_SIZE} --job_name=${JOB_NAME} --env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=DATASET=${DATASET} --env=MODEL=${MODEL} --env=MODEL_PATH=${MODEL_PATH} --env=REWARD_TYPE=${REWARD_TYPE} --env=ENTROPY_GATE=${ENTROPY_GATE} --env=ENTROPY_GATE_RATIO=${ENTROPY_GATE_RATIO} --env=CLIP_ADV=${CLIP_ADV} --env=CLIP_ADV_VALUE=${CLIP_ADV_VALUE} --env=DISTILL_TOPK=${DISTILL_TOPK} --env=REPETITION_PENALTY=${REPETITION_PENALTY} --env=LR=${LR} --env=SEED=${SEED} --env=ENTROPY_COEFF=${ENTROPY_COEFF} --env=TEACHER_REG=${TEACHER_REG} --env=TEACHER_UPDATE_RATE=${TEACHER_UPDATE_RATE} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=MINI_BATCH_SIZE=${MINI_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=INCLUDE_SUCCESSFUL_ROLLOUTS=${INCLUDE_SUCCESSFUL_ROLLOUTS} --env=NORM_ADV_BY_STD=${NORM_ADV_BY_STD} --env=ADV_STD_FLOOR=${ADV_STD_FLOOR} --env=ADV_ENTROPY_WEIGHT=${ADV_ENTROPY_WEIGHT} --env=GROUP_MEAN_MODE=${GROUP_MEAN_MODE} --env=CLIP_RATIO_HIGH=${CLIP_RATIO_HIGH} --env=FILTER_GROUPS_ENABLE=${FILTER_GROUPS_ENABLE} --env=FILTER_GROUPS_METRIC=${FILTER_GROUPS_METRIC} --env=FILTER_GROUPS_MAX_GEN=${FILTER_GROUPS_MAX_GEN} --env=GIT_BRANCH=${GIT_BRANCH} --env=GIT_COMMIT=${GIT_COMMIT} --env=DINGTALK_WEBHOOK=https://oapi.dingtalk.com/robot/send?access_token=f598ad33b071751bf79d2484d8e1acefe8df9d879e129cae40340a158854f9cb --env=DINGTALK_SECRET=SECc5b9e4f61f56b32b46abf1ecedc11bdcba10dc35fbba8fa0ff62c084a1cc6ad3" \
             --worker_count=${WORLD_SIZE} \
             --file.cluster_file=${CLUSTER_FILE} \
             --job_name=${JOB_NAME} \

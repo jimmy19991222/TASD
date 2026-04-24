@@ -2328,6 +2328,7 @@ def compute_tasd_token_rewards(
     teacher_topk_log_probs: Optional[torch.Tensor] = None,
     reward_type: str = "teacher_prob",
     entropy_gate: str = "none",
+    entropy_gate_ratio: float = 1.0,
     adv_entropy_weight: str = "none",
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
@@ -2341,9 +2342,14 @@ def compute_tasd_token_rewards(
         reward_type: "teacher_prob" | "teacher_log_prob"
         entropy_gate: "none" | "hard" | "soft" | "soft_v2" - 熵门控模式
             - none: 无门控
-            - hard: 二值 mask，teacher 更确定时保留
+            - hard: 二值 mask，teacher 显著更确定时保留（受 entropy_gate_ratio 控制）
             - soft: 连续权重，基于熵差
             - soft_v2: 两阶段策略，mask + teacher 确定性权重
+        entropy_gate_ratio: float - hard gate 保留比例（默认 1.0）
+            - 1.0: 保留所有 teacher 更确定的 token（原始 hard gate）
+            - 0.8: 保留熵差 top 80%（过滤"勉强更确定"的 token）
+            - 0.5: 只保留熵差 top 50%（最显著的信号）
+            仅在 entropy_gate="hard" 时生效
         adv_entropy_weight: "none" | "teacher_conf" | "certainty_diff"
             纯加权，不过滤。通过归一化 entropy_w 乘到 advantage 上实现加权，w 归一化到均值=1 保证量级不变
             过滤职责由 ENTROPY_GATE 通过 effective_mask 承担
@@ -2400,8 +2406,17 @@ def compute_tasd_token_rewards(
         student_entropy_norm = student_entropy / H_max
         
         if entropy_gate == "hard":
-            # 硬筛选：只有 teacher 更确定的位置才保留信号
-            gate_mask = (teacher_entropy_norm < student_entropy_norm).float()
+            # 硬筛选：teacher 比 student 显著更确定才保留
+            diff = (student_entropy_norm - teacher_entropy_norm).clamp(min=0.0)
+            positive_mask = diff > 0
+            
+            if entropy_gate_ratio < 1.0 and positive_mask.sum() > 0:
+                # 在 teacher 更确定的 token 中，保留 diff top-k%
+                threshold = diff[positive_mask].quantile(1.0 - entropy_gate_ratio)
+                gate_mask = (diff >= threshold).float()
+            else:
+                gate_mask = positive_mask.float()
+            
             reward = reward * gate_mask
         
         elif entropy_gate == "soft":

@@ -15,6 +15,7 @@ OSS_ROOT="/data/oss_bucket_0/ad/loujieming.ljm"
 : "${DATASET:?DATASET is not set}"
 : "${REWARD_TYPE:?REWARD_TYPE is not set}"      # teacher_prob | teacher_log_prob
 : "${ENTROPY_GATE:?ENTROPY_GATE is not set}"     # none | hard | soft
+: "${ENTROPY_GATE_RATIO:?ENTROPY_GATE_RATIO is not set}"  # hard gate 保留比例：1.0=原始 | 0.8=top80% | 0.5=top50%
 : "${CLIP_ADV_VALUE:?CLIP_ADV_VALUE is not set}"
 : "${MODEL_PATH:?MODEL_PATH is not set}"
 
@@ -116,6 +117,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.seed=${SEED} \
     algorithm.tasd.reward_type=${REWARD_TYPE} \
     algorithm.tasd.entropy_gate=${ENTROPY_GATE} \
+    algorithm.tasd.entropy_gate_ratio=${ENTROPY_GATE_RATIO} \
     algorithm.tasd.distill_topk=${DISTILL_TOPK} \
     algorithm.tasd.distill_temperature=${DISTILL_TEMPERATURE} \
     algorithm.tasd.norm_adv_by_std=${NORM_ADV_BY_STD} \

@@ -1886,6 +1886,7 @@ class RayPPOTrainer:
             _tasd_cfg = self.config.algorithm.get("tasd", {})
             tasd_reward_type = _tasd_cfg.get("reward_type", "teacher_prob")
             tasd_entropy_gate = _tasd_cfg.get("entropy_gate", "none")
+            tasd_entropy_gate_ratio = _tasd_cfg.get("entropy_gate_ratio", 1.0)
             tasd_adv_entropy_weight = _tasd_cfg.get("adv_entropy_weight", "none")
             tasd_temperature = _tasd_cfg.get("distill_temperature", None) or self.config.actor_rollout_ref.rollout.temperature
             tasd_micro_batch_size = self.config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu
@@ -2127,6 +2128,7 @@ class RayPPOTrainer:
                                 teacher_topk_log_probs=teacher_result.batch.get("teacher_topk_log_probs"),
                                 reward_type=tasd_reward_type,
                                 entropy_gate=tasd_entropy_gate,
+                                entropy_gate_ratio=tasd_entropy_gate_ratio,
                                 adv_entropy_weight=tasd_adv_entropy_weight,
                             )
 

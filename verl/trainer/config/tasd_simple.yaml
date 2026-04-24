@@ -42,6 +42,9 @@ algorithm:
     
     # ── entropy gate: 熵门控，筛选有效训练信号 ──────────────────
     entropy_gate: "none"            # "none" | "hard" | "soft"
+    entropy_gate_ratio: 1.0         # hard gate 保留比例（默认 1.0 = 原始 hard gate）
+                                    # 0.8 = 保留熵差 top 80%，0.5 = 保留 top 50%
+                                    # 仅在 entropy_gate="hard" 时生效
     
     # ── distill topk（熵门控需要）─────────────────────────────
     distill_topk: 100
