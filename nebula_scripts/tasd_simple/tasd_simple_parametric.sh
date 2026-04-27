@@ -51,7 +51,20 @@ model_path="${MODEL_PATH}"
 save_path="${OSS_ROOT}/models/${JOB_NAME:-tasd_simple}"
 
 # ── 环境 ────────────────────────────────────────────────────────────────
-export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
+# 优先使用 git 仓库根目录作为 PYTHONPATH，确保加载最新代码（而非 train_package 中的旧代码）
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if git -C "${SCRIPT_DIR}" rev-parse --show-toplevel &>/dev/null; then
+    GIT_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
+    export PYTHONPATH="${GIT_ROOT}:${PYTHONPATH:-}"
+    echo "[PYTHONPATH] Using git root: ${GIT_ROOT}"
+elif [ -d "${SCRIPT_DIR}/../../verl" ]; then
+    # 如果脚本在 nebula_scripts/tasd_simple/ 下，向上两级是 git 根目录
+    export PYTHONPATH="${SCRIPT_DIR}/../..:${PYTHONPATH:-}"
+    echo "[PYTHONPATH] Using script relative path: ${SCRIPT_DIR}/../.."
+else
+    export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
+    echo "[PYTHONPATH] Using pwd: $(pwd)"
+fi
 unset VLLM_ATTENTION_BACKEND
 # VLLM_USE_V1 在 vLLM 0.8.4 不支持，移除避免警告
 # export VLLM_USE_V1=1

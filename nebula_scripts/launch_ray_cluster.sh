@@ -41,7 +41,15 @@ fi
 
 # 1. PYTHONPATH: 让 worker 加载 SDPO 自定义的 verl
 # 注意：将 $(pwd) 放在最前面，确保覆盖 train_package 中的旧版 verl
-export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
+# 尝试找到 git 仓库根目录（优先使用 git 仓库，确保是最新代码）
+if git rev-parse --show-toplevel &>/dev/null; then
+    GIT_ROOT=$(git rev-parse --show-toplevel)
+    export PYTHONPATH="${GIT_ROOT}:$(pwd):${PYTHONPATH:-}"
+    echo "[launch_ray_cluster] Using git root: ${GIT_ROOT}"
+else
+    export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
+    echo "[launch_ray_cluster] Using pwd: $(pwd)"
+fi
 
 # 2. CUDA 环境 ───────────────────────────────────────────────────
 #    确保 Ray worker 继承正确的 CUDA 环境
