@@ -2673,18 +2673,18 @@ def compute_tasd_advantage(
             advantages = advantages * entropy_w_normalized
         
         # filtered_response_mask 决定 loss 聚合的分母范围
-        # - 正常情况：使用 effective_mask（排除 gate/distillation 过滤的 token）
-        # - 退化情况（effective_mask 全为 0，即没有 good case）：
-        #   保留原始 response_mask，因为 advantages 已经全为 0，
-        #   PPO loss = ratio * 0 = 0（梯度自然为 0，无需靠 mask 屏蔽）
-        #   而保留 response_mask 使得：
-        #     1. 下游 metrics 正常计算（避免 inhomogeneous shape 报错）
-        #     2. entropy 正则化仍生效（即使无学习信号也能防过拟合）
-        if effective_mask.any():
-            filtered_response_mask = effective_mask
-        else:
-            filtered_response_mask = response_mask.float()
-            print(f"[TASD Warning] effective_mask 全为 0（无 good case），保留原始 response_mask")
+        # Per-sample 处理：某些 sample 的 effective_mask 全零（self_distillation_mask=0），
+        # 但整个 batch 的 effective_mask 非全零。当 ppo_micro_batch_size_per_gpu=1 时，
+        # 这些 sample 会单独成为 micro-batch，导致 agg_loss 中 0/0=NaN。
+        # 修复：per-sample 判断，全零的 sample 保留原始 response_mask。
+        # 原理：advantages 已为 0 → PPO loss=ratio*0=0，保留 mask 只为 metrics 和 entropy 正常
+        sample_has_effective = effective_mask.sum(dim=-1, keepdim=True) > 0  # (B, 1)
+        filtered_response_mask = torch.where(
+            sample_has_effective, effective_mask, response_mask.float()
+        )
+        n_empty = (~sample_has_effective.squeeze(-1)).sum().item()
+        if n_empty > 0:
+            print(f"[TASD Warning] {n_empty} samples have all-zero effective_mask, preserving original response_mask")
         
         # ── Advantage clipping（在 adv_entropy_weight 之后）──────────────────
         # 必须在加权之后再 clip：归一化 entropy_w 均值=1，但局部 w 可能 > 1
