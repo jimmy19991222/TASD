@@ -90,6 +90,13 @@ rm -rf /tmp/ray_session_* 2>/dev/null || true
 rm -rf ~/.ray 2>/dev/null || true
 sleep 3
 
+# ── 配置预检 ────────────────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+"${SCRIPT_DIR}/validate_config.sh" || {
+    echo "❌ 配置验证失败，终止实验"
+    exit 1
+}
+
 echo "============================================"
 echo "TASD 清爽版实验配置："
 echo "  DATASET: ${DATASET}"
