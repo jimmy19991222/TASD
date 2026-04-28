@@ -32,6 +32,7 @@ ADV_ENTROPY_WEIGHT="${ADV_ENTROPY_WEIGHT:-none}"  # advantage 熵加权：none |
 GROUP_MEAN_MODE="${GROUP_MEAN_MODE:-token}"  # group mean/std 统计粒度：token（原有，存在length bias）| seq（per-seq均值后统计，消除length bias）
 ENTROPY_FLOOR="${ENTROPY_FLOOR:-0.0}"  # student 归一化熵下界：0.0=不启用；低于此值的 token 被惩罚（建议 0.1~0.2）
 ENTROPY_PENALTY_COEFF="${ENTROPY_PENALTY_COEFF:-0.0}"  # 惩罚强度（建议 0.1~1.0）
+ENTROPY_GATE_TOLERANCE="${ENTROPY_GATE_TOLERANCE:-0.0}"  # hard gate 豁免阈值：0.0=原 hard gate；0.1=teacher 最多比 student 高 0.1 仍保留
 CLIP_RATIO_HIGH="${CLIP_RATIO_HIGH:-10000}"  # DAPO 风格：不 clip 上界；用 0.2 可退回标准 PPO
 DISTILL_TOPK="${DISTILL_TOPK:-100}"
 DISTILL_TEMPERATURE="${DISTILL_TEMPERATURE:-1.0}"
@@ -144,6 +145,7 @@ python -m verl.trainer.main_ppo \
     algorithm.tasd.reward_type=${REWARD_TYPE} \
     algorithm.tasd.entropy_gate=${ENTROPY_GATE} \
     algorithm.tasd.entropy_gate_ratio=${ENTROPY_GATE_RATIO} \
+    algorithm.tasd.entropy_gate_tolerance=${ENTROPY_GATE_TOLERANCE} \
     algorithm.tasd.distill_topk=${DISTILL_TOPK} \
     algorithm.tasd.distill_temperature=${DISTILL_TEMPERATURE} \
     algorithm.tasd.norm_adv_by_std=${NORM_ADV_BY_STD} \

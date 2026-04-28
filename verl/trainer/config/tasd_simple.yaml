@@ -49,6 +49,9 @@ algorithm:
     entropy_gate_ratio: 1.0         # hard gate 保留比例（默认 1.0 = 原始 hard gate）
                                     # 0.8 = 保留熵差 top 80%，0.5 = 保留 top 50%
                                     # 仅在 entropy_gate="hard" 时生效
+    entropy_gate_tolerance: 0.0     # hard gate 豁免阈值（默认 0.0 = 等价于原 hard gate）
+                                    # 0.1 = teacher 熵最多可比 student 高 0.1 仍保留（更宽松）
+                                    # 仅在 entropy_gate="hard" 时生效
     
     # ── distill topk（熵门控需要）─────────────────────────────
     distill_topk: 100

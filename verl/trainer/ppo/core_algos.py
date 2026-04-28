@@ -2329,6 +2329,7 @@ def compute_tasd_token_rewards(
     reward_type: str = "teacher_prob",
     entropy_gate: str = "none",
     entropy_gate_ratio: float = 1.0,
+    entropy_gate_tolerance: float = 0.0,    # hard gate 豁免阈值：teacher 熵最多比 student 高多少仍保留；0.0=原 hard gate
     adv_entropy_weight: str = "none",
     entropy_floor: float = 0.0,              # 归一化熵下界，0.0=不启用；低于此值的 token 位置被扣分
     entropy_penalty_coeff: float = 0.0,     # 惩罚强度
@@ -2351,6 +2352,10 @@ def compute_tasd_token_rewards(
             - 1.0: 保留所有 teacher 更确定的 token（原始 hard gate）
             - 0.8: 保留熵差 top 80%（过滤"勉强更确定"的 token）
             - 0.5: 只保留熵差 top 50%（最显著的信号）
+            仅在 entropy_gate="hard" 时生效
+        entropy_gate_tolerance: float - hard gate 豁免阈值（默认 0.0）
+            - 0.0: 等价于原 hard gate（teacher 熵必须 ≤ student 熵）
+            - 0.1: teacher 熵最多可比 student 高 0.1 仍保留（更宽松）
             仅在 entropy_gate="hard" 时生效
         adv_entropy_weight: "none" | "teacher_conf" | "certainty_diff"
             纯加权，不过滤。通过归一化 entropy_w 乘到 advantage 上实现加权，w 归一化到均值=1 保证量级不变
@@ -2408,22 +2413,26 @@ def compute_tasd_token_rewards(
         student_entropy_norm = student_entropy / H_max
         
         if entropy_gate in ("hard", "hard_keep_reward"):
-            # 硬筛选：teacher 比 student 显著更确定才保留
-            diff = (student_entropy_norm - teacher_entropy_norm).clamp(min=0.0)
-            positive_mask = diff > 0
-            
+            # 硬筛选：带豁免阈值的 teacher-vs-student 熵比较
+            # tolerance=0.0: 等价于原 hard gate（teacher_entropy <= student_entropy）
+            # tolerance=0.1: teacher_entropy <= student_entropy + 0.1 也保留（允许 teacher 略不确定）
+            diff = student_entropy_norm - teacher_entropy_norm
+            positive_mask = diff > -entropy_gate_tolerance  # 等价于 teacher_entropy < student_entropy + tolerance
+
             if entropy_gate_ratio < 1.0 and positive_mask.sum() > 0:
-                # 在 teacher 更确定的 token 中，保留 diff top-k%
-                threshold = diff[positive_mask].quantile(1.0 - entropy_gate_ratio)
+                # 在保留的 token 中，按 diff 排序保留 top-k%
+                keep_values = diff[positive_mask]
+                threshold = keep_values.quantile(1.0 - entropy_gate_ratio)
                 gate_mask = (diff >= threshold).float()
             else:
                 gate_mask = positive_mask.float()
-            
+
             # Debug: gate_mask 统计
             gate_total = gate_mask.sum().item()
             gate_possible = positive_mask.sum().item()
             all_tokens = student_log_probs.shape[0] * student_log_probs.shape[1]
             print(f"[TASD Debug] entropy_gate={entropy_gate}, ratio={entropy_gate_ratio}, "
+                  f"tolerance={entropy_gate_tolerance}, "
                   f"positive_tokens={gate_possible}/{all_tokens}({gate_possible/max(all_tokens,1):.1%}), "
                   f"kept_tokens={gate_total}, "
                   f"ratio_keep={gate_total/max(gate_possible, 1):.3f}")

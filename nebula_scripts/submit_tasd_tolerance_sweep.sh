@@ -1,14 +1,15 @@
 #!/bin/bash
 # =============================================================================
-# TASD - Entropy Coeff 扫描实验
+# TASD - Entropy Gate Tolerance 扫描实验
+#
+# 目的：验证 hard gate 豁免阈值在 biology 和 tooluse 上的效果
 #
 # 基准配置（当前 best）：
 #   - reward_type=teacher_log_prob
 #   - entropy_gate=hard_keep_reward, ratio=1.0, topk=256
-#   - rep=1.05, normStd, clipH0.28, clipAdv2.0, ema0.1, inclSucc, gmSeq
-#   - ec=0.001 (baseline)
+#   - rep=1.05, normStd, clipH0.28, clipAdv2.0, ema0.1, inclSucc, gmSeq, ec0.001
 #
-# 变量：entropy_coeff = [0.001, 0.005, 0.01]
+# 变量：entropy_gate_tolerance = [0.0, 0.1]
 # =============================================================================
 
 QUEUE="lazada_llm_ad_h20"
@@ -25,6 +26,7 @@ PROJECT_NAME="TASD-v5"
 
 DATASETS=(
     "sciknoweval/biology"
+    "tooluse"
 )
 
 DRY_RUN=false
@@ -37,9 +39,8 @@ fi
 REWARD_TYPE="teacher_log_prob"
 ENTROPY_GATE="hard_keep_reward"
 ENTROPY_GATE_RATIO="1.0"
-ENTROPY_GATE_TOLERANCE="0.0"     # hard gate 豁免阈值：0.0=原 hard gate；0.1=teacher 最多比 student 高 0.1 仍保留
 DISTILL_TOPK="256"
-REPETITION_PENALTY="1.0"
+REPETITION_PENALTY="1.05"
 NORM_ADV_BY_STD="true"
 ADV_STD_FLOOR="none"
 CLIP_RATIO_HIGH="0.28"
@@ -53,6 +54,7 @@ ADV_ENTROPY_WEIGHT="none"
 TEMPERATURE="1.0"
 ENTROPY_FLOOR="0.0"
 ENTROPY_PENALTY_COEFF="0.0"
+ENTROPY_COEFF="0.001"
 LR="1e-5"
 SEED="42"
 TRAIN_BATCH_SIZE="32"
@@ -64,10 +66,9 @@ FILTER_GROUPS_METRIC="acc"
 FILTER_GROUPS_MAX_GEN="0"
 
 # ── 扫描变量 ─────────────────────────────────────────────────────────
-ENTROPY_COEFF_LIST=(
-    "0.001"   # baseline（当前 best）
-    # "0.005"
-    # "0.01"
+ENTROPY_GATE_TOLERANCE_LIST=(
+    "0.0"
+    "0.1"
 )
 
 GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
@@ -78,7 +79,7 @@ TOTAL=0
 SUBMITTED=0
 
 for DATASET in "${DATASETS[@]}"; do
-for ENTROPY_COEFF in "${ENTROPY_COEFF_LIST[@]}"; do
+for ENTROPY_GATE_TOLERANCE in "${ENTROPY_GATE_TOLERANCE_LIST[@]}"; do
     TOTAL=$((TOTAL + 1))
 
     DATASET_SHORT=$(echo "$DATASET" | tr '/' '-')
@@ -86,13 +87,20 @@ for ENTROPY_COEFF in "${ENTROPY_COEFF_LIST[@]}"; do
     OSS_ROOT="/data/oss_bucket_0/ad/loujieming.ljm"
     MODEL_PATH="${OSS_ROOT}/base_models/${MODEL}"
 
+    # tolerance 标签：0.0 为默认值，不加标签
+    if [ "$ENTROPY_GATE_TOLERANCE" = "0.0" ] || [ "$ENTROPY_GATE_TOLERANCE" = "0" ]; then
+        TOL_TAG=""
+    else
+        TOL_TAG="-tol${ENTROPY_GATE_TOLERANCE}"
+    fi
+
     CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
-    JOB_NAME="TASD-${DATASET_SHORT}-rt_${REWARD_TYPE}-gate_${ENTROPY_GATE}-topk${DISTILL_TOPK}-rep${REPETITION_PENALTY}-normStd-clipH${CLIP_RATIO_HIGH}-clipAdv${CLIP_ADV_VALUE}-ema${TEACHER_UPDATE_RATE}-inclSucc-gmSeq-ec${ENTROPY_COEFF}-v2-${MODEL_SHORT}-${CURRENT_TIME}"
+    JOB_NAME="TASD-${DATASET_SHORT}-rt_${REWARD_TYPE}-gate_${ENTROPY_GATE}${TOL_TAG}-topk${DISTILL_TOPK}-rep${REPETITION_PENALTY}-normStd-clipH${CLIP_RATIO_HIGH}-clipAdv${CLIP_ADV_VALUE}-ema${TEACHER_UPDATE_RATE}-inclSucc-gmSeq-ec${ENTROPY_COEFF}-v2-${MODEL_SHORT}-${CURRENT_TIME}"
 
     if [ "$DRY_RUN" = true ]; then
         echo "------------------------------------------------------------"
         echo "Job #${TOTAL}: ${JOB_NAME}"
-        echo "  ENTROPY_COEFF=${ENTROPY_COEFF}"
+        echo "  DATASET=${DATASET} ENTROPY_GATE_TOLERANCE=${ENTROPY_GATE_TOLERANCE}"
     else
         echo "提交 Job #${TOTAL}: ${JOB_NAME}"
 

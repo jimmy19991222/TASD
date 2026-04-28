@@ -65,7 +65,7 @@ ENTROPY_FLOOR_LIST=(
 # floor=0.1 时 deficit 最大约 0.1；coeff=3.0 → penalty_max ≈ 0.3，量级合理
 # 只跑 3.0，避免 1.0 太弱（penalty_max=0.1，可能仍被淹没）
 ENTROPY_PENALTY_COEFF_LIST=(
-    "1.0"
+    # "1.0"
     "3.0"
 )
 

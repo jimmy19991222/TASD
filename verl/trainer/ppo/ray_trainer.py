@@ -1893,6 +1893,7 @@ class RayPPOTrainer:
             tasd_reward_type = _tasd_cfg.get("reward_type", "teacher_prob")
             tasd_entropy_gate = _tasd_cfg.get("entropy_gate", "none")
             tasd_entropy_gate_ratio = _tasd_cfg.get("entropy_gate_ratio", 1.0)
+            tasd_entropy_gate_tolerance = _tasd_cfg.get("entropy_gate_tolerance", 0.0)
             tasd_adv_entropy_weight = _tasd_cfg.get("adv_entropy_weight", "none")
             tasd_entropy_floor = _tasd_cfg.get("entropy_floor", 0.0)
             tasd_entropy_penalty_coeff = _tasd_cfg.get("entropy_penalty_coeff", 0.0)
@@ -2137,6 +2138,7 @@ class RayPPOTrainer:
                                 reward_type=tasd_reward_type,
                                 entropy_gate=tasd_entropy_gate,
                                 entropy_gate_ratio=tasd_entropy_gate_ratio,
+                                entropy_gate_tolerance=tasd_entropy_gate_tolerance,
                                 adv_entropy_weight=tasd_adv_entropy_weight,
                                 entropy_floor=tasd_entropy_floor,
                                 entropy_penalty_coeff=tasd_entropy_penalty_coeff,
