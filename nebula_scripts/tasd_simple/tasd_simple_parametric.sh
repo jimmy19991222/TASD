@@ -43,6 +43,7 @@ GEN_BATCH_SIZE="${GEN_BATCH_SIZE:-32}"   # 不用 filter_groups 时应等于 tra
 MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-32}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
 INCLUDE_SUCCESSFUL_ROLLOUTS="${INCLUDE_SUCCESSFUL_ROLLOUTS:-True}"
+REMOVE_THINKING_FROM_DEMONSTRATION="${REMOVE_THINKING_FROM_DEMONSTRATION:-True}"
 # ── DAPO 动态采样配置 ────────────────────────────────────────────────
 FILTER_GROUPS_ENABLE="${FILTER_GROUPS_ENABLE:-false}"  # 是否启用 filter_groups
 FILTER_GROUPS_METRIC="${FILTER_GROUPS_METRIC:-acc}"    # 过滤指标：acc / seq_reward / seq_final_reward
@@ -133,6 +134,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.data_loader_seed=${SEED} \
     actor_rollout_ref.actor.self_distillation.teacher_regularization=${TEACHER_REG} \
     actor_rollout_ref.actor.self_distillation.teacher_update_rate=${TEACHER_UPDATE_RATE} \
+    actor_rollout_ref.actor.self_distillation.remove_thinking_from_demonstration=${REMOVE_THINKING_FROM_DEMONSTRATION} \
     actor_rollout_ref.actor.self_distillation.include_environment_feedback=False \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.rollout.n=${ROLLOUT_N} \

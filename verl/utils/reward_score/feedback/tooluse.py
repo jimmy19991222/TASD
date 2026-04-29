@@ -33,10 +33,46 @@ def merge_action_inputs(action_inputs_list: list[dict]) -> dict:
     return combined
 
 
+def diagnose_format_error(text: str) -> tuple[bool, str]:
+    """
+    Diagnose format errors in tooluse response.
+    
+    Returns:
+        (is_correct: bool, error_msg: str)
+        is_correct=True  -> error_msg is empty
+        is_correct=False -> error_msg describes the specific format error
+    """
+    has_action = re.search(r'Action:', text) is not None
+    has_action_input = re.search(r'Action Input:', text) is not None
+    
+    # 1. Missing fields
+    if not has_action and not has_action_input:
+        return False, "Format error: missing both 'Action:' and 'Action Input:' fields"
+    
+    if has_action and not has_action_input:
+        return False, "Format error: missing 'Action Input:' field"
+    
+    if not has_action and has_action_input:
+        return False, "Format error: missing 'Action:' field"
+    
+    # 2. Has both fields, check JSON parsing
+    json_blocks = re.findall(r'Action Input:\s*({.*?})', text, re.DOTALL)
+    if not json_blocks:
+        return False, "Format error: 'Action Input:' has no JSON content"
+    
+    for block in json_blocks:
+        try:
+            json.loads(block)
+        except json.JSONDecodeError as e:
+            return False, f"Format error: JSON parse error in Action Input ({str(e)})"
+    
+    return True, ""
+
+
 def is_correct_format(text: str) -> bool:
     """Check if the text contains the expected Action/Action Input format."""
-    pattern = re.compile(r"Action:.*?\nAction Input:.*?", re.DOTALL)
-    return pattern.search(text) is not None
+    is_correct, _ = diagnose_format_error(text)
+    return is_correct
 
 
 def compute_score(solution: str, ground_truth: str) -> dict:
@@ -90,23 +126,109 @@ def compute_score(solution: str, ground_truth: str) -> dict:
     is_correct = actions_correct and action_inputs_correct
     reward = 1.0 if is_correct else 0.0
     
-    # Check format
-    correct_format = is_correct_format(solution)
+    # Check format with detailed diagnosis
+    correct_format, format_error_msg = diagnose_format_error(solution)
     
     # Build prediction string for logging
     prediction = f"Actions: {pred_actions}, Inputs: {pred_action_inputs}"
     
-    # Build feedback
+    # Build detailed feedback
     feedback_parts = []
+    
+    # 1. Format error feedback
+    if not correct_format:
+        feedback_parts.append(format_error_msg)
+    
+    # 2. Action error feedback
     if not actions_correct:
-        feedback_parts.append(f"Actions mismatch: predicted {pred_actions}, expected {gt_actions}")
-    if not action_inputs_correct:
-        feedback_parts.append(f"Action inputs mismatch: predicted {pred_action_inputs}, expected {gt_action_inputs}")
+        if not pred_actions:
+            feedback_parts.append(f"Action error: no action detected, expected {gt_actions}")
+        else:
+            # Identify specific action mismatches
+            pred_set = set(pred_actions)
+            gt_set = set(gt_actions)
+            extra_actions = list(pred_set - gt_set)
+            missing_actions = list(gt_set - pred_set)
+            
+            if extra_actions and missing_actions:
+                feedback_parts.append(
+                    f"Action error: should call {gt_actions}, but called {pred_actions} "
+                    f"(wrong action: used {extra_actions} instead of {missing_actions})"
+                )
+            elif extra_actions:
+                feedback_parts.append(
+                    f"Action error: should call {gt_actions}, but called {pred_actions} "
+                    f"(extra action: {extra_actions})"
+                )
+            elif missing_actions:
+                feedback_parts.append(
+                    f"Action error: should call {gt_actions}, but called {pred_actions} "
+                    f"(missing action: {missing_actions})"
+                )
+            else:
+                # Same actions but different counts (multiset mismatch)
+                feedback_parts.append(
+                    f"Action error: should call {gt_actions}, but called {pred_actions} "
+                    f"(action count mismatch)"
+                )
+    
+    # 3. Action Input error feedback
+    if not action_inputs_correct and pred_actions:
+        # Only report input errors if actions are present (otherwise it's covered above)
+        if not pred_action_inputs:
+            feedback_parts.append(f"Input error: no action input detected, expected {gt_action_inputs}")
+        else:
+            # Identify specific key/value mismatches
+            pred_keys = set(pred_action_inputs.keys())
+            gt_keys = set(gt_action_inputs.keys())
+            extra_keys = list(pred_keys - gt_keys)
+            missing_keys = list(gt_keys - pred_keys)
+            wrong_values = []
+            for key in pred_keys & gt_keys:
+                if pred_action_inputs[key] != gt_action_inputs[key]:
+                    wrong_values.append(
+                        f"{key} should be {gt_action_inputs[key]}, got {pred_action_inputs[key]}"
+                    )
+            
+            parts = []
+            if missing_keys:
+                parts.append(f"missing keys: {missing_keys}")
+            if extra_keys:
+                parts.append(f"extra keys: {extra_keys}")
+            if wrong_values:
+                parts.append("; ".join(wrong_values))
+            
+            if parts:
+                feedback_parts.append(
+                    f"Input error: expected {gt_action_inputs}, but got {pred_action_inputs} "
+                    f"({'; '.join(parts)})"
+                )
+            else:
+                feedback_parts.append(
+                    f"Input error: expected {gt_action_inputs}, but got {pred_action_inputs}"
+                )
 
     if len(feedback_parts) == 0:
-        feedback = "" # no feedback means correct
+        feedback = ""  # no feedback means correct
+        format_error_type = "none"
     else:
         feedback = "; ".join(feedback_parts)
+        # Categorize format error for monitoring
+        if not correct_format:
+            if "missing both" in format_error_msg:
+                format_error_type = "missing_both"
+            elif "missing 'Action:'" in format_error_msg:
+                format_error_type = "missing_action"
+            elif "missing 'Action Input:'" in format_error_msg:
+                format_error_type = "missing_action_input"
+            elif "no JSON content" in format_error_msg:
+                format_error_type = "empty_json"
+            elif "JSON parse error" in format_error_msg:
+                format_error_type = "json_parse_error"
+            else:
+                format_error_type = "other_format"
+        else:
+            format_error_type = "none"
     
     return {
         "score": reward,
@@ -114,4 +236,5 @@ def compute_score(solution: str, ground_truth: str) -> dict:
         "pred": prediction,
         "incorrect_format": 0 if correct_format else 1,
         "feedback": feedback,
+        "format_error_type": format_error_type,
     }

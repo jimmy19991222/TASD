@@ -23,12 +23,29 @@ def compute_score(solution: str, ground_truth: str) -> dict:
     multiple_choice_answer = extract_xml_answer(solution)
 
     reward = float(multiple_choice_answer == ground_truth)
-    incorrect_format = is_correct_format(solution)
+    correct_format = is_correct_format(solution)
+
+    # Build detailed feedback
+    feedback_parts = []
+    if not correct_format:
+        feedback_parts.append(
+            "Format error: response does not contain valid `<answer>...</answer>` tags"
+        )
+    elif reward < 1.0:
+        # Format is correct but answer is wrong
+        feedback_parts.append(
+            f"Answer error: predicted {multiple_choice_answer}, expected {ground_truth}"
+        )
+
+    if len(feedback_parts) == 0:
+        feedback = ""  # correct, no feedback needed
+    else:
+        feedback = "; ".join(feedback_parts)
 
     return {
       "score": reward,
       "acc": reward,
       "pred": multiple_choice_answer,
-      "incorrect_format": 1 if incorrect_format else 0,
-      "feedback": "",
+      "incorrect_format": 1 if correct_format else 0,
+      "feedback": feedback,
     }

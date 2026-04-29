@@ -67,8 +67,9 @@ FILTER_GROUPS_MAX_GEN="0"
 
 # ── 扫描变量 ─────────────────────────────────────────────────────────
 ENTROPY_GATE_TOLERANCE_LIST=(
-    "0.0"
-    "0.1"
+    # "0.0"
+    "0.05"
+    # "0.1"
 )
 
 GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"

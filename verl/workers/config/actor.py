@@ -85,6 +85,8 @@ class SelfDistillationConfig(BaseConfig):
     )
     feedback_template: str = (
         "\n"
+        "Your previous attempt:\n\n"
+        "{failed_attempt}\n\n"
         "The following is feedback from your unsuccessful earlier attempt:\n\n"
         "{feedback_raw}\n\n"
     )

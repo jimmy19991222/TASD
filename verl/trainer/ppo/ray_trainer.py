@@ -767,6 +767,40 @@ class RayPPOTrainer:
         """Remove <think>...</think> tags and their content from text."""
         return re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
 
+    def _format_ground_truth(self, ground_truth: Optional[str], data_source: str) -> Optional[str]:
+        """
+        Format ground truth into solution text for teacher context.
+        Used as fallback when no successful rollout exists in the group.
+        """
+        if not ground_truth:
+            return None
+
+        if data_source in ["tooluse"]:
+            # Parse JSON and format as Action/Action Input text
+            try:
+                gt_list = json.loads(ground_truth)
+                if not isinstance(gt_list, list):
+                    gt_list = [gt_list]
+                parts = []
+                for item in gt_list:
+                    if isinstance(item, dict):
+                        action = item.get("Action", "")
+                        action_input = item.get("Action_Input", "")
+                        # Action_Input may be a JSON string itself, keep as-is
+                        if action:
+                            parts.append(f"Action: {action}")
+                        if action_input:
+                            parts.append(f"Action Input: {action_input}")
+                return "\n".join(parts) if parts else None
+            except (json.JSONDecodeError, TypeError):
+                return None
+
+        elif data_source in ["sciknoweval", "gpqa", "mmlu_pro", "mcq"]:
+            # MCQ format: wrap in <answer> tags
+            return f"<answer>\n{ground_truth}\n</answer>"
+
+        return None
+
     def _get_solution(
         self,
         idx: int,
@@ -782,19 +816,14 @@ class RayPPOTrainer:
         solution_idxs = success_by_uid[uid]
         is_self_success = idx in solution_idxs
 
-        # 成功 rollout 用自己的 response 作为 teacher context
-        if use_self_as_teacher_on_success and is_self_success:
+        # 成功 rollout 永远用自己的 response 作为 teacher context
+        if is_self_success:
             solution = response_texts[idx]
             if remove_thinking_from_demonstration:
                 solution = self._remove_thinking_trace(solution)
             return solution
 
-        if dont_reprompt_on_self_success:
-            solution_idxs = [j for j in solution_idxs if j != idx]
-
         if len(solution_idxs) == 0:
-            if fallback_to_self and is_self_success:
-                return response_texts[idx]
             return None
 
         solution_idx = random.choice(solution_idxs)  # randomly select from successful demonstrations
@@ -856,6 +885,20 @@ class RayPPOTrainer:
             for i in range(batch_size)
         ]
 
+        # Fallback to ground truth when no successful rollout exists
+        # This ensures teacher always sees a correct demonstration, preventing
+        # the death spiral when success rate drops to zero.
+        ground_truths = [
+            item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None)
+            for item in batch
+        ]
+        data_sources = batch.non_tensor_batch.get("data_source", ["unknown"] * batch_size)
+        for i in range(batch_size):
+            if solution_strs[i] is None and ground_truths[i] is not None:
+                gt_solution = self._format_ground_truth(ground_truths[i], data_sources[i])
+                if gt_solution is not None:
+                    solution_strs[i] = gt_solution
+
         def _build_teacher_message(i: int) -> list[dict]:
             system_messages = batch.non_tensor_batch["raw_prompt"][i][:-1]
             has_solution = solution_strs[i] is not None
@@ -876,6 +919,7 @@ class RayPPOTrainer:
             feedback_section = ""
             if use_feedback:
                 feedback_section = self_distillation_cfg.feedback_template.format(
+                    failed_attempt=response_texts[i],
                     feedback_raw=feedback_list[i]
                 )
 
@@ -936,6 +980,17 @@ class RayPPOTrainer:
         num_with_feedback_available = sum(1 for f in feedback_list if f is not None)
         num_with_feedback_used = sum(1 for f in feedback_used if f)
         num_with_solution = sum(1 for s in solution_strs if s is not None)
+
+        # Collect format error type distribution for monitoring
+        format_error_types = []
+        if reward_extra_infos_dict is not None:
+            format_error_types = reward_extra_infos_dict.get("format_error_type", [])
+        format_error_counts = {}
+        if format_error_types:
+            for fet in format_error_types:
+                if fet and fet != "none":
+                    format_error_counts[fet] = format_error_counts.get(fet, 0) + 1
+
         metrics = {
             "self_distillation/success_group_fraction": len([uid for uid in uids if len(success_by_uid[uid]) > 0]) / len(uids),
             "self_distillation/success_sample_fraction": num_with_solution / batch_size,
@@ -943,6 +998,9 @@ class RayPPOTrainer:
             "self_distillation/feedback_used_fraction": num_with_feedback_used / batch_size,
             "self_distillation/reprompt_sample_fraction": self_distillation_mask.float().mean().item(),
         }
+        # Add format error type distribution metrics
+        for error_type, count in format_error_counts.items():
+            metrics[f"self_distillation/format_error_{error_type}"] = count / batch_size
         return DataProto.from_dict(tensors={
             "teacher_input_ids": teacher_input_ids,
             "teacher_attention_mask": teacher_attention_mask,
