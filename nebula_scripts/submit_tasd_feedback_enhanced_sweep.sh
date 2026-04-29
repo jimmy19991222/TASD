@@ -27,7 +27,7 @@ OSS_BUCKET="lazada-ai-model"
 CLUSTER_FILE="nebula_scripts/cluster.json"
 SCRIPT_PATH="nebula_scripts/tasd_simple/tasd_simple_parametric.sh"
 CUSTOM_DOCKER_IMAGE="${CUSTOM_DOCKER_IMAGE:-hub.docker.alibaba-inc.com/mdl/notebook_saved:loujieming.ljm_yueqiu_sdpo_env_torch260_20260324155942}"
-PROJECT_NAME="TASD-v7"
+PROJECT_NAME="TASD-v6"
 
 # ── 数据集配置 ──────────────────────────────────────────────────────
 # 跑 tooluse + bio，验证 feedback 增强效果

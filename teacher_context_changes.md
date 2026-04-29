@@ -17,7 +17,10 @@ TASD (Teacher-Student Adaptive Distillation) 中，teacher 模型在计算 token
 | `verl/utils/reward_score/feedback/tooluse.py` | feedback 从简单 mismatch → 三级细粒度（格式/Action/Input） + 5 种格式错误分类 + 监控指标 | tooluse |
 | `verl/utils/reward_score/feedback/mcq.py` | feedback 从空字符串 → 两级细粒度（格式/答案） | sciknoweval (bio/chemistry/physics/material) |
 | `verl/workers/config/actor.py` | `feedback_template` 新增 `failed_attempt` 段落 | 所有数据集 |
-| `verl/trainer/ppo/ray_trainer.py` | 1. `_get_solution` 简化：成功 rollout 永远返回自己<br>2. Ground truth fallback：无成功 rollout 时用标准答案构造示范<br>3. 格式错误类型分布监控指标 | 所有数据集 |
+| `verl/trainer/ppo/ray_trainer.py` | 1. `_get_solution` 简化：成功 rollout 永远返回自己<br>2. Ground truth fallback：无成功 rollout 时用标准答案构造示范<br>3. 格式错误类型分布监控指标<br>4. 新增 `feedback_available_fraction` / `feedback_used_fraction` 观测指标 | 所有数据集 |
+| `verl/trainer/config/actor/actor.yaml`<br>`verl/workers/config/actor.py` | `self_distillation.include_environment_feedback`（默认 False）<br>`self_distillation.environment_feedback_only_without_solution`（yaml 默认 True） | 所有数据集 |
+| `nebula_scripts/tasd_simple/tasd_simple_parametric.sh` | 两个开关均环境变量化并通过 hydra 注入 | 所有数据集 |
+| `nebula_scripts/submit_tasd_feedback_enhanced_sweep.sh` | 固定 `INCLUDE_ENVIRONMENT_FEEDBACK=True` + `ENVIRONMENT_FEEDBACK_ONLY_WITHOUT_SOLUTION=False` | fbEnhanced sweep |
 
 ---
 
@@ -192,11 +195,67 @@ assistant: {当前模型生成的 response}
 **改进**:
 1. **Ground truth fallback**: 当 group 内无成功 rollout 时，用标准答案构造正确示范（`Action: search...`）
 2. **错误答案 + 详细反馈**: Teacher 看到"哪里错了"和"应该怎么答"
-3. **防止死亡螺旋**: 即使 success rate 归零，teacher 仍有正确答案作为参考
+3. **防止死亡螺旋**: 即使 success rate 归零，teacher 仍能通过 GT fallback 看到正确答案
 
 ---
 
-### 3.3 成功 Rollout（自参考）
+### 3.2.1 教师获取正确答案的双路径
+
+Teacher 获取正确答案有两个独立来源（代码见 `ray_trainer.py` L874-900）：
+
+1. **成功 rollout 路径**（L874-886）：`_get_solution` 从同 group 中采样成功的 response
+2. **Ground truth fallback 路径**（L888-900）：当 `solution_strs[i] is None`（group 内无成功 rollout）时，从 `reward_model.ground_truth` 构造标准答案示范
+
+因此即使 group 内所有 rollout 都失败，teacher 的正确示范来自 GT fallback（数据集标准答案）；只有当 GT fallback 也未提供时，teacher 才真正失去正确答案参考。
+
+**完整的 teacher context 组成**（`environment_feedback_only_without_solution=False`）：
+
+```
+Correct solution: {同 group 成功样本 或 GT fallback 构造的正确答案}
+
+Your previous attempt: {学生当前生成的答案}
+
+The following is feedback from your unsuccessful earlier attempt:
+{细粒度错误反馈：格式错误/Action错误/答案错误}
+```
+
+---
+
+### 3.3 Feedback 注入的两道闸门（v6 诊断新增）
+
+fbEnhanced 是否真正生效，取决于两个独立开关的组合：
+
+```python
+# verl/trainer/ppo/ray_trainer.py :: _build_teacher_message
+feedback_only_without_solution = self_distillation_cfg.get(
+    "environment_feedback_only_without_solution", False
+)
+use_feedback = has_feedback and (not feedback_only_without_solution or not has_solution)
+```
+
+| `include_environment_feedback` | `environment_feedback_only_without_solution` | GT fallback 状态 | 实际效果 |
+|---|---|---|---|
+| False | *（任意）* | *（任意）* | 完全关闭 feedback，等价于普通 TASD |
+| True | True | 开启（默认，覆盖 ~100%） | **feedback 被 solution 挡住，等价于关闭** ⚠️ |
+| True | True | 无 solution 的样本 | feedback 仅在兜底场景注入 |
+| **True** | **False** | *（任意）* | **真正的 fbEnhanced：feedback 与 solution 并存** ✅ |
+
+**关键踩坑**（v6 实验 `fbEnhanced-v2-...20260429_162342`）：
+
+- 日志显示 `feedback_available_fraction = 0.58 ~ 0.71`（MCQ feedback 链路已通）
+- 但 `feedback_used_fraction = 0.0`（最终没有一个样本用上 feedback）
+- 根因：`actor.yaml` 默认 `environment_feedback_only_without_solution: True`，叠加 GT fallback 让所有样本都有 solution → feedback 永远被挡住
+- 结果：v6 的 `teacher_message` 与 v5 完全相同（system + prompt + solution_section），**训练轨迹等价于 v5，仅 SwanLab 多出观测指标**
+- 修复：sweep 脚本固定 `ENVIRONMENT_FEEDBACK_ONLY_WITHOUT_SOLUTION="False"`，让 feedback 与 solution 并存
+
+**调试信号**：
+- `self_distillation/feedback_available_fraction`：feedback 字段非空的样本比例（上游 reward 链路健康度）
+- `self_distillation/feedback_used_fraction`：真正进入 teacher_message 的比例（最终生效率）
+- 两者差值 > 0 即意味着 feedback 被闸门挡掉，需要检查 `environment_feedback_only_without_solution`
+
+---
+
+### 3.4 成功 Rollout（自参考）
 
 #### 修改前
 
@@ -243,14 +302,24 @@ solution = response_texts[B]  # 固定看自己
 
 ## 五、实验脚本
 
-**脚本**: `nebula_scripts/submit_tasd_tooluse_feedback_enhanced_sweep.sh`
+**脚本**: `nebula_scripts/submit_tasd_feedback_enhanced_sweep.sh`（`PROJECT_NAME=TASD-v6`）
 
 **核心标签**: `-fbEnhanced`
+
+**关键环境变量**（两者必须同时设置才能真正启用）：
+```bash
+INCLUDE_ENVIRONMENT_FEEDBACK="True"                     # 闸门 1：是否在 teacher context 注入 feedback
+ENVIRONMENT_FEEDBACK_ONLY_WITHOUT_SOLUTION="False"      # 闸门 2：False = feedback 与 solution 并存
+```
 
 **可扫描超参**:
 - `REMOVE_THINKING_FROM_DEMONSTRATION`: True（默认）/ False
   - True: 正确答案示范去掉 `<think>...</think>`
   - False: 正确答案示范保留完整 thinking
+
+**Commit 参考**:
+- `a7eb014`：`include_environment_feedback` 参数化
+- `2055fc1`：`environment_feedback_only_without_solution` 参数化 + sweep 启用 feedback+solution 并存
 
 ---
 
@@ -259,9 +328,9 @@ solution = response_texts[B]  # 固定看自己
 即使做了上述增强，核心问题仍存在：
 
 1. **Teacher 无领域知识**: Teacher 只是语言模型，tooluse 上不知道"应该调用什么工具"
-2. **依赖成功 rollout**: 如果 group 内所有 rollout 都失败，teacher 仍看不到正确答案
-3. **无法完全解决死亡螺旋**: 细粒度反馈只能延缓崩溃，不能阻止 success rate 归零
+2. **依赖 GT fallback**: 当 group 内无成功 rollout 时，teacher 的正确示范完全依赖 GT fallback；如果数据集未提供 ground_truth，teacher 才真正失去正确答案参考
+3. **无法完全解决死亡螺旋**: 细粒度反馈 + GT fallback 能延缓崩溃，但不能阻止 success rate 归零（当 GT 也不存在时 teacher 才真正失去参考）
 
 **建议后续方向**:
-- 混合 reward: `reward = α * teacher_log_prob + β * success_reward`
 - 或在数据预处理阶段把标准答案注入 teacher 的 system prompt
+- 配置健康度：在启动日志中硬检查 `include_environment_feedback` 与 `environment_feedback_only_without_solution` 组合，避免再次出现 v6 这种"开关开了但被另一侧默认值静默抵消"的失效实验
