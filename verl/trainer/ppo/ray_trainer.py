@@ -364,6 +364,7 @@ def compute_advantage(
             gate_mask=gate_mask,
             teacher_entropy_norm=teacher_entropy_norm,
             student_entropy_norm=student_entropy_norm,
+            teacher_log_probs=data.batch.get("teacher_log_probs_on_response", None),
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns

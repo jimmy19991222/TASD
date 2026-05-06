@@ -54,7 +54,7 @@ CLIP_ADV_VALUE="2.0"
 REPETITION_PENALTY="1.05"
 NORM_ADV_BY_STD="true"
 ADV_STD_FLOOR="none"
-ADV_ENTROPY_WEIGHT="none"
+ADV_ENTROPY_WEIGHT="teacher_prob"
 GROUP_MEAN_MODE="seq"
 CLIP_RATIO_HIGH="0.28"
 FILTER_GROUPS_ENABLE="false"
@@ -94,7 +94,7 @@ for DATASET in "${DATASETS[@]}"; do
     MODEL_PATH="${OSS_ROOT}/base_models/${MODEL}"
 
     CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
-    JOB_NAME="TASD-${DATASET_SHORT}-outcome-gate_hard_keep_reward-topk${DISTILL_TOPK}-gmSeq-clipAdv${CLIP_ADV_VALUE}-ema${TEACHER_UPDATE_RATE}-rep${REPETITION_PENALTY}-ec${ENTROPY_COEFF}-${MODEL_SHORT}-${CURRENT_TIME}"
+    JOB_NAME="TASD-${DATASET_SHORT}-outcome-gate_hard_keep-aew_tprob-topk${DISTILL_TOPK}-gmSeq-clipAdv${CLIP_ADV_VALUE}-ema${TEACHER_UPDATE_RATE}-rep${REPETITION_PENALTY}-ec${ENTROPY_COEFF}-${MODEL_SHORT}-${CURRENT_TIME}"
 
     if [ "$DRY_RUN" = true ]; then
         echo "------------------------------------------------------------"

@@ -2504,6 +2504,7 @@ def compute_tasd_advantage(
     gate_mask: Optional[torch.Tensor] = None,  # (B, T) bool，entropy gate 后有效位置
     teacher_entropy_norm: Optional[torch.Tensor] = None,  # (B, T) teacher 归一化熵
     student_entropy_norm: Optional[torch.Tensor] = None,  # (B, T) student 归一化熵
+    teacher_log_probs: Optional[torch.Tensor] = None,  # (B, T) teacher log probs on response tokens
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -2694,11 +2695,35 @@ def compute_tasd_advantage(
         # adv_entropy_weight 只做加权，不过滤。过滤由 ENTROPY_GATE 通过
         # effective_mask 统一控制。这样避免了两处过滤的冗余和语义混乱。
         if adv_entropy_weight != "none":
-            assert teacher_entropy_norm is not None and student_entropy_norm is not None, \
-                f"adv_entropy_weight={adv_entropy_weight} requires teacher/student entropy " \
-                f"(set entropy_gate != 'none' or ensure topk is provided)"
+            if adv_entropy_weight == "teacher_prob":
+                # teacher_prob 模式：需要 teacher_log_probs
+                assert teacher_log_probs is not None, \
+                    "adv_entropy_weight=teacher_prob requires teacher_log_probs"
+            else:
+                assert teacher_entropy_norm is not None and student_entropy_norm is not None, \
+                    f"adv_entropy_weight={adv_entropy_weight} requires teacher/student entropy " \
+                    f"(set entropy_gate != 'none' or ensure topk is provided)"
             
-            if adv_entropy_weight == "teacher_conf":
+            if adv_entropy_weight == "teacher_prob":
+                # 方向感知的 teacher_prob 加权：
+                #   adv > 0（正确 response）：w = teacher_prob → 强化 teacher 认同的 token
+                #   adv < 0（错误 response）：w = 1 - teacher_prob → 惩罚 teacher 不认同的 token
+                # 语义统一：放大 teacher 认为"关键"的位置
+                t_prob = teacher_log_probs.clamp(min=-20.0).exp()  # (B, T), ∈ (0, 1]
+                
+                # 计算每个 sample 的 advantage 符号（sequence-level）
+                # 用 effective_mask 内的 advantage 均值判定方向
+                sample_adv_sum = (advantages * effective_mask).sum(dim=-1)  # (B,)
+                sample_positive = (sample_adv_sum >= 0).unsqueeze(-1).float()  # (B, 1)
+                
+                # 方向感知权重
+                entropy_w = sample_positive * t_prob + (1.0 - sample_positive) * (1.0 - t_prob)
+                
+                print(f"[TASD Debug] adv_entropy_weight=teacher_prob, "
+                      f"pos_samples={int(sample_positive.sum().item())}/{sample_positive.shape[0]}, "
+                      f"mean_teacher_prob={t_prob[effective_mask.bool()].mean().item():.4f}")
+            
+            elif adv_entropy_weight == "teacher_conf":
                 # 按 teacher 确定性加权：teacher 越确定（H_t 越低），权重越大
                 # w = 1 - H_t_norm ∈ [0, 1]
                 entropy_w = 1.0 - teacher_entropy_norm
@@ -2717,7 +2742,7 @@ def compute_tasd_advantage(
             else:
                 raise ValueError(
                     f"Unknown adv_entropy_weight: {adv_entropy_weight}. "
-                    f"Supported: none, teacher_conf, certainty_diff"
+                    f"Supported: none, teacher_prob, teacher_conf, certainty_diff"
                 )
             
             # 将 entropy_w 应用到 advantage 上

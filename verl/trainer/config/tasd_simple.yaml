@@ -82,7 +82,7 @@ algorithm:
     #   - ADV_ENTROPY_WEIGHT（advantage 阶段）：对参与训练的 token 做软加权
     # 
     # adv_entropy_weight 只做加权，不过滤。过滤由 ENTROPY_GATE 通过 effective_mask 统一控制。
-    # "none" | "teacher_conf" | "certainty_diff"
+    # "none" | "teacher_prob" | "teacher_conf" | "certainty_diff"
     adv_entropy_weight: "none"
     
     # ── 成功 rollout 配置 ─────────────────────────────────────
