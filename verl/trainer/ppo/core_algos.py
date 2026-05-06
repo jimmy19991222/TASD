@@ -1061,7 +1061,8 @@ def agg_loss(
         # Guard: when all tokens are masked (e.g. entropy gate filters everything),
         # return zero loss instead of NaN from division by zero.
         if batch_num_tokens == 0:
-            return torch.tensor(0.0, device=loss_mat.device, dtype=loss_mat.dtype)
+            # Return zero with gradient connection to avoid backward failure
+            return (loss_mat * loss_mask).sum() * 0.0
         loss = verl_F.masked_sum(loss_mat, loss_mask) / batch_num_tokens * dp_size
     elif loss_agg_mode == "seq-mean-token-sum":
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)  # token-sum
@@ -1069,7 +1070,8 @@ def agg_loss(
         if global_batch_size is None:
             global_batch_size = seq_mask.sum()
         if global_batch_size == 0:
-            return torch.tensor(0.0, device=loss_mat.device, dtype=loss_mat.dtype)
+            # Return zero with gradient connection to avoid backward failure
+            return (loss_mat * loss_mask).sum() * 0.0
         loss = verl_F.masked_sum(seq_losses, seq_mask) / global_batch_size * dp_size  # seq-mean
     elif loss_agg_mode == "seq-mean-token-mean":
         seq_mask = torch.sum(loss_mask, dim=-1)  # per-sequence token count
@@ -1078,7 +1080,8 @@ def agg_loss(
         if global_batch_size is None:
             global_batch_size = seq_mask.sum()
         if global_batch_size == 0:
-            return torch.tensor(0.0, device=loss_mat.device, dtype=loss_mat.dtype)
+            # Return zero with gradient connection to avoid backward failure
+            return (loss_mat * loss_mask).sum() * 0.0
         loss = verl_F.masked_sum(seq_losses, seq_mask) / global_batch_size * dp_size  # seq-mean
     elif loss_agg_mode == "seq-mean-token-sum-norm":
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)
