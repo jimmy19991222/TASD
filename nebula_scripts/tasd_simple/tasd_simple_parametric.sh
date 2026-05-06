@@ -180,7 +180,7 @@ python -m verl.trainer.main_ppo \
     trainer.save_freq=-1 \
     trainer.save_best_metric="val-core/sciknoweval/acc/mean@16" \
     trainer.n_gpus_per_node=4 \
-    trainer.val_before_train=False \
+    trainer.val_before_train=${VAL_BEFORE_TRAIN:-True} \
     trainer.default_local_dir="${save_path}" \
     trainer.project_name="${PROJECT_NAME:-TASD_simple}" \
     trainer.experiment_name="${JOB_NAME:-tasd_simple}" \
