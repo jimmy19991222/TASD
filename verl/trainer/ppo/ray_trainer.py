@@ -2080,7 +2080,13 @@ class RayPPOTrainer:
             tasd_micro_batch_size = self.config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu
             # entropy_gate 或 adv_entropy_weight 需要 topk 信息
             tasd_need_topk = tasd_entropy_gate != "none" or tasd_adv_entropy_weight != "none"
-            tasd_distill_topk = _tasd_cfg.get("distill_topk", 100) if tasd_need_topk else None
+            # top_k_agreement: 使用独立 K（用于 student 候选集大小），覆盖默认 distill_topk
+            tasd_top_k_agreement_k = int(_tasd_cfg.get("top_k_agreement_k", 512))
+            tasd_top_k_agreement_eps = float(_tasd_cfg.get("top_k_agreement_eps", 0.1))
+            if tasd_entropy_gate == "top_k_agreement":
+                tasd_distill_topk = tasd_top_k_agreement_k
+            else:
+                tasd_distill_topk = _tasd_cfg.get("distill_topk", 100) if tasd_need_topk else None
         # ────────────────────────────────────────────────────────
 
         # ── 训练详情 dump 配置（TASD rollout 详细日志）─────────────────
@@ -2314,6 +2320,9 @@ class RayPPOTrainer:
                             # 训练详情日志：让 teacher 额外返回自己 argmax 的 top-K（零额外 forward）
                             if _dump_detailed_enabled:
                                 teacher_fwd_batch.meta_info["return_teacher_own_topk"] = _dump_detailed_top_k
+                            # top_k_agreement gate: 让 teacher forward 计算 agreement mask
+                            if tasd_entropy_gate == "top_k_agreement":
+                                teacher_fwd_batch.meta_info["compute_top_k_agreement"] = True
 
                             with marked_timer("tasd_teacher_fwd", timing_raw, color="cyan"):
                                 teacher_result = self.actor_rollout_wg.compute_teacher_log_probs(
@@ -2336,6 +2345,8 @@ class RayPPOTrainer:
                                 entropy_gate=tasd_entropy_gate,
                                 entropy_gate_ratio=tasd_entropy_gate_ratio,
                                 adv_entropy_weight=tasd_adv_entropy_weight,
+                                teacher_agreement_mask=teacher_result.batch.get("teacher_agreement_mask"),
+                                top_k_agreement_eps=tasd_top_k_agreement_eps,
                             )
 
                             # Mask out padding positions

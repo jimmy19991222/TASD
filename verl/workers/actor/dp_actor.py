@@ -740,6 +740,8 @@ class DataParallelPPOActor(BasePPOActor):
         distill_topk     = data.meta_info.get("distill_topk", None)
         # 用于训练日志 dump：teacher 在自己 argmax 位置的 top-k（独立于 student topk）
         return_own_topk  = data.meta_info.get("return_teacher_own_topk", None)
+        # top_k_agreement gate：在 student top-K 候选集中取 teacher argmax，与 student 采样 token 比较
+        compute_top_k_agreement = bool(data.meta_info.get("compute_top_k_agreement", False))
 
         teacher_model = self.teacher_module or self.actor_module
         micro_batches = data.split(micro_batch_size)
@@ -748,6 +750,7 @@ class DataParallelPPOActor(BasePPOActor):
         student_topk_lst = []
         teacher_own_topk_logps_lst = []
         teacher_own_topk_indices_lst = []
+        teacher_agreement_mask_lst = []
 
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
@@ -794,6 +797,20 @@ class DataParallelPPOActor(BasePPOActor):
                     teacher_own_topk_logps_lst.append(teacher_outputs["own_topk_logps"])
                     teacher_own_topk_indices_lst.append(teacher_outputs["own_topk_indices"])
 
+                # ── top_k_agreement: 在 student top-K 候选集中找 teacher argmax ──
+                #  - teacher_topk_logps: (b, T, K) - teacher 在 student topk 位置的 log_prob
+                #  - student_topk_indices: (b, T, K) - student 的 top-K 候选 token id
+                #  - 取 teacher 在这 K 个候选中最偏爱的 token，与 student 实际采样 token 比较
+                #  - agreement=True 表示 "student 采到了 teacher 在其候选集里的 argmax" → 不需训练
+                if compute_top_k_agreement:
+                    teacher_best_idx = teacher_outputs["topk_logps"].argmax(dim=-1)  # (b, T)
+                    teacher_best_token = student_topk_indices.gather(
+                        -1, teacher_best_idx.unsqueeze(-1)
+                    ).squeeze(-1)  # (b, T)
+                    responses_mb = micro_batch.batch["responses"]  # (b, T)
+                    agreement_mask = (teacher_best_token == responses_mb)  # (b, T) bool
+                    teacher_agreement_mask_lst.append(agreement_mask)
+
             else:
                 # ── 不需要 topk：只需 teacher token log-prob ─────────────
                 teacher_inputs = {
@@ -824,6 +841,8 @@ class DataParallelPPOActor(BasePPOActor):
         if teacher_own_topk_logps_lst:
             result["teacher_own_topk_log_probs"] = torch.cat(teacher_own_topk_logps_lst, dim=0)
             result["teacher_own_topk_indices"] = torch.cat(teacher_own_topk_indices_lst, dim=0)
+        if teacher_agreement_mask_lst:
+            result["teacher_agreement_mask"] = torch.cat(teacher_agreement_mask_lst, dim=0)
 
         return result
 

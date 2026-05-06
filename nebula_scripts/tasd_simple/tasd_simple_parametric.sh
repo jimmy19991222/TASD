@@ -14,7 +14,7 @@ OSS_ROOT="/data/oss_bucket_0/ad/loujieming.ljm"
 # ── 必需参数 ─────────────────────────────────────────────────────────────
 : "${DATASET:?DATASET is not set}"
 : "${REWARD_TYPE:?REWARD_TYPE is not set}"      # teacher_prob | teacher_log_prob
-: "${ENTROPY_GATE:?ENTROPY_GATE is not set}"     # none | hard | hard_keep_reward | soft
+: "${ENTROPY_GATE:?ENTROPY_GATE is not set}"     # none | hard | hard_keep_reward | soft | top_k_agreement
 : "${ENTROPY_GATE_RATIO:?ENTROPY_GATE_RATIO is not set}"  # hard gate 保留比例：1.0=原始 | 0.8=top80% | 0.5=top50%
 : "${CLIP_ADV_VALUE:?CLIP_ADV_VALUE is not set}"
 : "${MODEL_PATH:?MODEL_PATH is not set}"
@@ -33,6 +33,11 @@ GROUP_MEAN_MODE="${GROUP_MEAN_MODE:-token}"  # group mean/std 统计粒度：tok
 CLIP_RATIO_HIGH="${CLIP_RATIO_HIGH:-10000}"  # DAPO 风格：不 clip 上界；用 0.2 可退回标准 PPO
 DISTILL_TOPK="${DISTILL_TOPK:-100}"
 DISTILL_TEMPERATURE="${DISTILL_TEMPERATURE:-1.0}"
+# ── top_k_agreement gate 参数（ENTROPY_GATE=top_k_agreement 时生效）──────
+# TOP_K_AGREEMENT_K: student 候选集大小（在该集合内取 teacher argmax 与 student 采样对比）
+# TOP_K_AGREEMENT_EPS: 一条 response 全部 token 一致（全被过滤）时整条赋值的 gate 权重兜底
+TOP_K_AGREEMENT_K="${TOP_K_AGREEMENT_K:-512}"
+TOP_K_AGREEMENT_EPS="${TOP_K_AGREEMENT_EPS:-0.1}"
 ROLLOUT_TEMPERATURE="${ROLLOUT_TEMPERATURE:-1.0}"   # vLLM rollout 采样温度
 REPETITION_PENALTY="${REPETITION_PENALTY:-1.0}"   # 1.0=不启用重复惩罚（等效禁用），与tasd_v2保持一致
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"
@@ -121,6 +126,7 @@ echo "  ROLLOUT_TEMPERATURE: ${ROLLOUT_TEMPERATURE}, DISTILL_TEMPERATURE: ${DIST
 echo "  ADV_ENTROPY_WEIGHT: ${ADV_ENTROPY_WEIGHT}"
 echo "  FILTER_GROUPS: enable=${FILTER_GROUPS_ENABLE}, metric=${FILTER_GROUPS_METRIC}, max_gen=${FILTER_GROUPS_MAX_GEN}"
 echo "  DISTILL_TOPK: ${DISTILL_TOPK}"
+echo "  TOP_K_AGREEMENT_K: ${TOP_K_AGREEMENT_K}, TOP_K_AGREEMENT_EPS: ${TOP_K_AGREEMENT_EPS}"
 echo "  SEED: ${SEED}"
 echo "============================================"
 
@@ -155,6 +161,8 @@ python -m verl.trainer.main_ppo \
     algorithm.tasd.entropy_gate_ratio=${ENTROPY_GATE_RATIO} \
     algorithm.tasd.distill_topk=${DISTILL_TOPK} \
     algorithm.tasd.distill_temperature=${DISTILL_TEMPERATURE} \
+    algorithm.tasd.top_k_agreement_k=${TOP_K_AGREEMENT_K} \
+    algorithm.tasd.top_k_agreement_eps=${TOP_K_AGREEMENT_EPS} \
     algorithm.tasd.norm_adv_by_std=${NORM_ADV_BY_STD} \
     algorithm.tasd.adv_std_floor=${ADV_STD_FLOOR} \
     algorithm.tasd.clip_adv=${CLIP_ADV} \

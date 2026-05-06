@@ -2330,6 +2330,8 @@ def compute_tasd_token_rewards(
     entropy_gate: str = "none",
     entropy_gate_ratio: float = 1.0,
     adv_entropy_weight: str = "none",
+    teacher_agreement_mask: Optional[torch.Tensor] = None,
+    top_k_agreement_eps: float = 0.1,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
     TASD token-level reward 计算（清爽版）.
@@ -2340,11 +2342,13 @@ def compute_tasd_token_rewards(
         student_topk_log_probs: (B, T, K) - student topk log_probs（熵门控需要）
         teacher_topk_log_probs: (B, T, K) - teacher topk log_probs（熵门控需要）
         reward_type: "teacher_prob" | "teacher_log_prob"
-        entropy_gate: "none" | "hard" | "soft" | "soft_v2" - 熵门控模式
+        entropy_gate: "none" | "hard" | "hard_keep_reward" | "soft" | "soft_v2" | "top_k_agreement"
             - none: 无门控
             - hard: 二值 mask，teacher 显著更确定时保留（受 entropy_gate_ratio 控制）
             - soft: 连续权重，基于熵差
             - soft_v2: 两阶段策略，mask + teacher 确定性权重
+            - top_k_agreement: teacher 在 student top-K 候选中的 argmax 若等于 student 采样
+                token 则视为"共识"，该位置不训练；否则训练（hard_keep_reward 语义）
         entropy_gate_ratio: float - hard gate 保留比例（默认 1.0）
             - 1.0: 保留所有 teacher 更确定的 token（原始 hard gate）
             - 0.8: 保留熵差 top 80%（过滤"勉强更确定"的 token）
@@ -2353,6 +2357,10 @@ def compute_tasd_token_rewards(
         adv_entropy_weight: "none" | "teacher_conf" | "certainty_diff"
             纯加权，不过滤。通过归一化 entropy_w 乘到 advantage 上实现加权，w 归一化到均值=1 保证量级不变
             过滤职责由 ENTROPY_GATE 通过 effective_mask 承担
+        teacher_agreement_mask: (B, T) bool - top_k_agreement 模式下 teacher 在 student top-K
+            候选中的 argmax 是否等于 student 采样 token（True=共识）。仅 entropy_gate="top_k_agreement" 时使用。
+        top_k_agreement_eps: float - 样本级兜底权重，若某条 response 所有 token 均通过
+            agreement 检查（gate_mask 全 0），则对该样本整条赋 ε 权重，避免完全无梯度。
     
     Returns:
         reward: (B, T) - token-level reward
@@ -2382,7 +2390,32 @@ def compute_tasd_token_rewards(
     gate_mask = None  # 默认 None，表示没有熵门控
     teacher_entropy_norm = None  # teacher 归一化熵（adv_entropy_weight 需要）
     student_entropy_norm = None  # student 归一化熵（adv_entropy_weight 需要）
-    
+
+    # ── top_k_agreement: 独立分支（不需要熵计算）────────────────────────
+    # 语义：teacher 在 student top-K 候选中的 argmax 若等于 student 采样 token → 不训练
+    # 作用层 = hard_keep_reward（只过滤 advantage，不乘 reward）
+    if entropy_gate == "top_k_agreement":
+        assert teacher_agreement_mask is not None, (
+            "entropy_gate=top_k_agreement requires teacher_agreement_mask "
+            "(set compute_top_k_agreement=True in teacher forward meta_info)"
+        )
+        # agreement=True → gate=0（不训练），agreement=False → gate=1（训练）
+        gate_mask = (~teacher_agreement_mask).float()
+        # 样本级 ε 兜底：若某条 response 所有 token 均通过 agreement（gate_mask 全 0），
+        # 对该样本整条赋 ε 权重，避免完全无梯度
+        sample_all_zero = (gate_mask.sum(dim=-1) == 0)  # (B,)
+        n_eps_samples = int(sample_all_zero.sum().item()) if sample_all_zero.any() else 0
+        if n_eps_samples > 0 and top_k_agreement_eps > 0:
+            gate_mask[sample_all_zero] = top_k_agreement_eps
+        # Debug 统计
+        total_tokens = gate_mask.numel()
+        kept_tokens = (gate_mask > 0).sum().item()
+        print(f"[TASD Debug] entropy_gate=top_k_agreement, "
+              f"kept_tokens={kept_tokens}/{total_tokens}, "
+              f"keep_rate={kept_tokens / max(total_tokens, 1):.3f}, "
+              f"eps_samples={n_eps_samples}")
+        return reward, gate_mask, teacher_entropy_norm, student_entropy_norm
+
     # 当有 entropy_gate 或 adv_entropy_weight 时，都需要计算熵
     need_entropy = entropy_gate != "none" or adv_entropy_weight != "none"
     

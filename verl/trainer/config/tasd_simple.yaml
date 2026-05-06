@@ -45,7 +45,9 @@ algorithm:
     # hard: 硬过滤，被过滤的 token reward=0 且不产生梯度（影响 mean/std）
     # hard_keep_reward: 硬过滤但保留 reward，只在 advantage 阶段过滤（不影响 mean/std）
     # soft: 软门控，按熵差加权 reward
-    entropy_gate: "none"            # "none" | "hard" | "hard_keep_reward" | "soft"
+    # top_k_agreement: teacher-student 共识门控——在 student top-K 候选集中取 teacher argmax，
+    #                  若 student 采样 token == teacher argmax 则过滤（两者一致 = 无修改意愿）
+    entropy_gate: "none"            # "none" | "hard" | "hard_keep_reward" | "soft" | "top_k_agreement"
     entropy_gate_ratio: 1.0         # hard gate 保留比例（默认 1.0 = 原始 hard gate）
                                     # 0.8 = 保留熵差 top 80%，0.5 = 保留 top 50%
                                     # 仅在 entropy_gate="hard" 时生效
@@ -53,6 +55,13 @@ algorithm:
     # ── distill topk（熵门控需要）─────────────────────────────
     distill_topk: 100
     distill_temperature: 1.0
+
+    # ── top_k_agreement 专属参数 ─────────────────────────────
+    # top_k_agreement_k: student 候选集大小（优先生效，覆盖 distill_topk）
+    # top_k_agreement_eps: 当一条 response 全部 token 都一致（全被过滤）时，
+    #                     整条 response 的 gate_mask 赋值为 eps，避免无梯度
+    top_k_agreement_k: 512
+    top_k_agreement_eps: 0.1
     
     # ── advantage clipping ────────────────────────────────────
     norm_adv_by_std: false          # 是否除以 group std（std 基于 effective token 统计，排除熵门控过滤的位置）
