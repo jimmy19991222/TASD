@@ -38,7 +38,7 @@ algorithm:
   norm_adv_by_std_in_grpo: False
   tasd:
     # ── 核心参数（清爽版）────────────────────────────────────
-    reward_type: "teacher_prob"     # "teacher_prob" | "teacher_log_prob"
+    reward_type: "teacher_prob"     # "teacher_prob" | "teacher_log_prob" | "outcome"
     
     # ── entropy gate: 熵门控，筛选有效训练信号 ──────────────────
     # none: 无门控

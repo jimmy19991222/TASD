@@ -2353,8 +2353,9 @@ class RayPPOTrainer:
                             response_mask_float = batch.batch["response_mask"].float()
                             token_rewards = token_rewards * response_mask_float
 
-                            # 覆盖 token_level_rewards
-                            batch.batch["token_level_rewards"] = token_rewards
+                            # 覆盖 token_level_rewards（outcome 模式下保留原始 env reward）
+                            if tasd_reward_type != "outcome":
+                                batch.batch["token_level_rewards"] = token_rewards
 
                             # 保存 gate_mask，供 compute_tasd_advantage 排除 gate 掉的 token
                             # gate_mask=None 表示无熵门控（noGate），gate_mask!=None 表示 hard/soft 门控

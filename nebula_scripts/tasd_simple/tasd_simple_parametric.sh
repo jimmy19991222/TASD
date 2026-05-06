@@ -13,7 +13,7 @@ OSS_ROOT="/data/oss_bucket_0/ad/loujieming.ljm"
 
 # ── 必需参数 ─────────────────────────────────────────────────────────────
 : "${DATASET:?DATASET is not set}"
-: "${REWARD_TYPE:?REWARD_TYPE is not set}"      # teacher_prob | teacher_log_prob
+: "${REWARD_TYPE:?REWARD_TYPE is not set}"      # teacher_prob | teacher_log_prob | outcome
 : "${ENTROPY_GATE:?ENTROPY_GATE is not set}"     # none | hard | hard_keep_reward | soft | top_k_agreement
 : "${ENTROPY_GATE_RATIO:?ENTROPY_GATE_RATIO is not set}"  # hard gate 保留比例：1.0=原始 | 0.8=top80% | 0.5=top50%
 : "${CLIP_ADV_VALUE:?CLIP_ADV_VALUE is not set}"
