@@ -2706,18 +2706,14 @@ def compute_tasd_advantage(
             advantages = advantages * entropy_w_normalized
         
         # filtered_response_mask 决定 loss 聚合的分母范围
-        # Per-sample 处理：某些 sample 的 effective_mask 全零（self_distillation_mask=0），
-        # 但整个 batch 的 effective_mask 非全零。当 ppo_micro_batch_size_per_gpu=1 时，
-        # 这些 sample 会单独成为 micro-batch，导致 agg_loss 中 0/0=NaN。
-        # 修复：per-sample 判断，全零的 sample 保留原始 response_mask。
-        # 原理：advantages 已为 0 → PPO loss=ratio*0=0，保留 mask 只为 metrics 和 entropy 正常
+        # all-zero effective_mask 的 sample 直接放弃（不训练），advantages 置 0
+        filtered_response_mask = effective_mask.clone()
         sample_has_effective = effective_mask.sum(dim=-1, keepdim=True) > 0  # (B, 1)
-        filtered_response_mask = torch.where(
-            sample_has_effective, effective_mask, response_mask.float()
-        )
         n_empty = (~sample_has_effective.squeeze(-1)).sum().item()
         if n_empty > 0:
-            print(f"[TASD Warning] {n_empty} samples have all-zero effective_mask, preserving original response_mask")
+            # 将 all-zero sample 的 advantage 置 0，确保不贡献梯度
+            advantages = advantages * sample_has_effective.float()
+            print(f"[TASD Info] {n_empty} samples have all-zero effective_mask, dropped from training")
         
         # ── Advantage clipping（在 adv_entropy_weight 之后）──────────────────
         # 必须在加权之后再 clip：归一化 entropy_w 均值=1，但局部 w 可能 > 1
