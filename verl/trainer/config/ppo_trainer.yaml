@@ -153,6 +153,18 @@ trainer:
   # Directory for logging validation data; no dump if null
   validation_data_dir: null
 
+  # ── TASD 训练详情 dump（teacher top-k / student-teacher disagreement）──
+  # 开关：为 true 时在 TASD 训练中每 step 导出样本级日志
+  rollout_dump_detailed: false
+  # teacher 返回的 top-K 粒度（影响 dp_actor 内部 topk 计算）
+  rollout_dump_top_k: 5
+  # 每 step 采样的样本条数（固定 seed = global_steps，便于对齐）
+  rollout_dump_sample_size: 4
+  # 是否额外输出全 batch 中 student token != teacher argmax 的 disagreement JSONL
+  rollout_dump_disagreement: true
+  # Dump 目录（建议指向 OSS 挂载路径，如 /data/oss_bucket_0/.../rollout_details/<job>）
+  rollout_dump_oss_path: null
+
   # Number of nodes used in the training
   nnodes: 1
 

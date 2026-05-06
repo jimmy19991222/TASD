@@ -637,6 +637,188 @@ class RayPPOTrainer:
                 dump_path=rollout_data_dir,
             )
 
+    def _dump_training_details(
+        self,
+        batch: DataProto,
+        dump_dir: str,
+        sample_size: int = 4,
+        top_k: int = 5,
+    ):
+        """TASD 训练详情 dump：每 step 采样 sample_size 条，写完整 token 级数据到 JSONL。
+
+        输出字段（每行一个样本）：
+          step, sample_idx, uid, score, ground_truth,
+          student_context, teacher_context, response, response_length,
+          tokens: [{pos, token_id, token_str,
+                    student_logprob, teacher_logprob,
+                    teacher_top{K}_tokens, teacher_top{K}_logprobs,
+                    teacher_argmax_token_str, agree}, ...]
+        依赖 batch 字段：responses, prompts, input_ids, teacher_input_ids,
+                        old_log_probs, teacher_log_probs_on_response,
+                        teacher_own_topk_log_probs, teacher_own_topk_indices,
+                        response_mask, token_level_scores。
+        """
+        required = {
+            "teacher_own_topk_log_probs", "teacher_own_topk_indices",
+            "teacher_log_probs_on_response", "old_log_probs",
+        }
+        missing = required - set(batch.batch.keys())
+        if missing:
+            print(f"[dump_training_details] skip: missing {missing}")
+            return
+
+        os.makedirs(dump_dir, exist_ok=True)
+        filename = os.path.join(dump_dir, f"step_{self.global_steps}.jsonl")
+
+        B = batch.batch["responses"].shape[0]
+        # 固定 seed，便于对齐同一 step 的样本
+        rng = np.random.RandomState(self.global_steps)
+        n = min(sample_size, B)
+        idxs = rng.choice(B, size=n, replace=False).tolist()
+
+        responses       = batch.batch["responses"].cpu()
+        response_mask   = batch.batch["response_mask"].cpu()
+        old_lp          = batch.batch["old_log_probs"].cpu()
+        teacher_lp      = batch.batch["teacher_log_probs_on_response"].cpu()
+        teacher_topk_lp = batch.batch["teacher_own_topk_log_probs"].cpu()
+        teacher_topk_id = batch.batch["teacher_own_topk_indices"].cpu()
+        student_ids     = batch.batch.get("input_ids", None)
+        teacher_ids     = batch.batch.get("teacher_input_ids", None)
+        prompts         = batch.batch.get("prompts", None)
+        scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist() if "token_level_scores" in batch.batch else [None] * B
+
+        lines = []
+        for local_i, i in enumerate(idxs):
+            resp_ids = responses[i]
+            mask = response_mask[i].bool()
+            T_valid = int(mask.sum().item())
+
+            student_ctx = self.tokenizer.decode(student_ids[i], skip_special_tokens=True) if student_ids is not None else None
+            teacher_ctx = self.tokenizer.decode(teacher_ids[i], skip_special_tokens=True) if teacher_ids is not None else None
+            response_str = self.tokenizer.decode(resp_ids[:T_valid], skip_special_tokens=True)
+            prompt_str = self.tokenizer.decode(prompts[i], skip_special_tokens=True) if prompts is not None else None
+
+            gt = None
+            try:
+                item = batch[i]
+                gt = item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None)
+            except Exception:
+                gt = None
+            uid = None
+            if "uid" in batch.non_tensor_batch:
+                try:
+                    uid = str(batch.non_tensor_batch["uid"][i])
+                except Exception:
+                    uid = None
+
+            tokens_info = []
+            k = min(top_k, teacher_topk_id.shape[-1])
+            for pos in range(T_valid):
+                tok_id = int(resp_ids[pos].item())
+                top_ids = teacher_topk_id[i, pos, :k].tolist()
+                top_lps = [float(x) for x in teacher_topk_lp[i, pos, :k].tolist()]
+                argmax_tok_id = top_ids[0] if top_ids else tok_id
+                tokens_info.append({
+                    "pos": pos,
+                    "token_id": tok_id,
+                    "token_str": self.tokenizer.decode([tok_id], skip_special_tokens=False),
+                    "student_logprob": float(old_lp[i, pos].item()),
+                    "teacher_logprob": float(teacher_lp[i, pos].item()),
+                    f"teacher_top{k}_tokens": [self.tokenizer.decode([t], skip_special_tokens=False) for t in top_ids],
+                    f"teacher_top{k}_logprobs": top_lps,
+                    "teacher_argmax_token_str": self.tokenizer.decode([argmax_tok_id], skip_special_tokens=False),
+                    "agree": bool(argmax_tok_id == tok_id),
+                })
+
+            entry = {
+                "step": self.global_steps,
+                "sample_idx": int(i),
+                "uid": uid,
+                "score": scores[i] if i < len(scores) else None,
+                "ground_truth": gt,
+                "prompt": prompt_str,
+                "student_context": student_ctx,
+                "teacher_context": teacher_ctx,
+                "response": response_str,
+                "response_length": T_valid,
+                "tokens": tokens_info,
+            }
+            lines.append(json.dumps(entry, ensure_ascii=False))
+
+        with open(filename, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        print(f"[dump_training_details] wrote {len(lines)} samples -> {filename}")
+
+    def _dump_disagreement(
+        self,
+        batch: DataProto,
+        dump_dir: str,
+        top_k: int = 5,
+    ):
+        """Disagreement dump：遍历全 batch，把 student 采样 token 与 teacher argmax 不一致的位置写成 JSONL。
+
+        每行一个 disagreement token。仅保留 response_mask==1 的位置。
+        """
+        required = {
+            "teacher_own_topk_indices", "teacher_own_topk_log_probs",
+            "teacher_log_probs_on_response", "old_log_probs",
+        }
+        missing = required - set(batch.batch.keys())
+        if missing:
+            print(f"[dump_disagreement] skip: missing {missing}")
+            return
+
+        os.makedirs(dump_dir, exist_ok=True)
+        filename = os.path.join(dump_dir, f"step_{self.global_steps}_disagreement.jsonl")
+
+        responses       = batch.batch["responses"].cpu()
+        response_mask   = batch.batch["response_mask"].cpu().bool()
+        old_lp          = batch.batch["old_log_probs"].cpu()
+        teacher_lp      = batch.batch["teacher_log_probs_on_response"].cpu()
+        teacher_topk_lp = batch.batch["teacher_own_topk_log_probs"].cpu()
+        teacher_topk_id = batch.batch["teacher_own_topk_indices"].cpu()
+        scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist() if "token_level_scores" in batch.batch else None
+
+        B, T = responses.shape
+        k = min(top_k, teacher_topk_id.shape[-1])
+        argmax_ids = teacher_topk_id[..., 0]  # (B, T)
+        disagree_mask = (argmax_ids != responses) & response_mask  # (B, T)
+
+        total = int(disagree_mask.sum().item())
+        if total == 0:
+            with open(filename, "w") as f:
+                f.write("")
+            print(f"[dump_disagreement] no disagreements at step {self.global_steps}")
+            return
+
+        lines = []
+        # 取坐标，避免 python loop 全 batch
+        coords = disagree_mask.nonzero(as_tuple=False).tolist()
+        for b, t in coords:
+            tok_id = int(responses[b, t].item())
+            top_ids = teacher_topk_id[b, t, :k].tolist()
+            top_lps = [float(x) for x in teacher_topk_lp[b, t, :k].tolist()]
+            argmax_tok_id = top_ids[0]
+            entry = {
+                "step": self.global_steps,
+                "sample_idx": int(b),
+                "pos": int(t),
+                "score": scores[b] if scores is not None else None,
+                "student_token_id": tok_id,
+                "student_token_str": self.tokenizer.decode([tok_id], skip_special_tokens=False),
+                "student_logprob": float(old_lp[b, t].item()),
+                "teacher_argmax_token_id": argmax_tok_id,
+                "teacher_argmax_token_str": self.tokenizer.decode([argmax_tok_id], skip_special_tokens=False),
+                "teacher_logprob_on_student": float(teacher_lp[b, t].item()),
+                f"teacher_top{k}_tokens": [self.tokenizer.decode([t], skip_special_tokens=False) for t in top_ids],
+                f"teacher_top{k}_logprobs": top_lps,
+            }
+            lines.append(json.dumps(entry, ensure_ascii=False))
+
+        with open(filename, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        print(f"[dump_disagreement] wrote {total} disagreements -> {filename}")
+
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
 
@@ -1901,6 +2083,14 @@ class RayPPOTrainer:
             tasd_distill_topk = _tasd_cfg.get("distill_topk", 100) if tasd_need_topk else None
         # ────────────────────────────────────────────────────────
 
+        # ── 训练详情 dump 配置（TASD rollout 详细日志）─────────────────
+        _dump_detailed_enabled = bool(self.config.trainer.get("rollout_dump_detailed", False)) and is_tasd
+        _dump_detailed_top_k = int(self.config.trainer.get("rollout_dump_top_k", 5))
+        _dump_sample_size = int(self.config.trainer.get("rollout_dump_sample_size", 4))
+        _dump_disagreement_enabled = bool(self.config.trainer.get("rollout_dump_disagreement", True))
+        _dump_oss_path = self.config.trainer.get("rollout_dump_oss_path", None)
+        # ────────────────────────────────────────────────────────
+
         # ── DAPO filter_groups 流式累积状态（循环外，跨 dataloader step 持继）
         _fg_accumulated_batch = None   # 累积过滤后的 batch
         _fg_num_prompt_in_batch = 0    # 已累积的合格 prompt 数
@@ -2121,11 +2311,21 @@ class RayPPOTrainer:
                                 "pad_token_id":     self.tokenizer.pad_token_id,
                                 "distill_topk":     tasd_distill_topk,
                             }
+                            # 训练详情日志：让 teacher 额外返回自己 argmax 的 top-K（零额外 forward）
+                            if _dump_detailed_enabled:
+                                teacher_fwd_batch.meta_info["return_teacher_own_topk"] = _dump_detailed_top_k
 
                             with marked_timer("tasd_teacher_fwd", timing_raw, color="cyan"):
                                 teacher_result = self.actor_rollout_wg.compute_teacher_log_probs(
                                     teacher_fwd_batch
                                 )
+
+                            # 保存 teacher 自己 argmax 的 top-K 供后续 dump 使用
+                            if _dump_detailed_enabled and "teacher_own_topk_log_probs" in teacher_result.batch:
+                                batch.batch["teacher_own_topk_log_probs"] = teacher_result.batch["teacher_own_topk_log_probs"]
+                                batch.batch["teacher_own_topk_indices"] = teacher_result.batch["teacher_own_topk_indices"]
+                                # 顺便缓存 teacher 在 response 位置的 log_prob（用于 disagreement 判断）
+                                batch.batch["teacher_log_probs_on_response"] = teacher_result.batch["teacher_log_probs_on_response"]
 
                             token_rewards, gate_mask, teacher_entropy_norm, student_entropy_norm = core_algos.compute_tasd_token_rewards(
                                 student_log_probs=batch.batch["old_log_probs"],
@@ -2366,6 +2566,25 @@ class RayPPOTrainer:
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+
+                    # ── TASD 训练详情 dump（每 step × N 条 + 全 batch disagreement）────────
+                    if _dump_detailed_enabled and _dump_oss_path:
+                        with marked_timer("dump_training_details", timing_raw, color="green"):
+                            try:
+                                self._dump_training_details(
+                                    batch=batch,
+                                    dump_dir=_dump_oss_path,
+                                    sample_size=_dump_sample_size,
+                                    top_k=_dump_detailed_top_k,
+                                )
+                                if _dump_disagreement_enabled:
+                                    self._dump_disagreement(
+                                        batch=batch,
+                                        dump_dir=_dump_oss_path,
+                                        top_k=_dump_detailed_top_k,
+                                    )
+                            except Exception as _dump_e:
+                                print(f"[dump] failed at step {self.global_steps}: {_dump_e}")
 
                 # validate
                 if (

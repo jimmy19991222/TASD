@@ -45,6 +45,18 @@ FILTER_GROUPS_ENABLE="${FILTER_GROUPS_ENABLE:-false}"  # 是否启用 filter_gro
 FILTER_GROUPS_METRIC="${FILTER_GROUPS_METRIC:-acc}"    # 过滤指标：acc / seq_reward / seq_final_reward
 FILTER_GROUPS_MAX_GEN="${FILTER_GROUPS_MAX_GEN:-0}"    # 最大重采样次数，0=不限制
 
+# ── 训练详情 dump 开关 ───────────────────────────────────────────────
+DUMP_DETAILED="${DUMP_DETAILED:-true}"            # true=开启每 step 详细日志
+DUMP_SAMPLE_SIZE="${DUMP_SAMPLE_SIZE:-4}"          # 每 step 采样条数
+DUMP_TOP_K="${DUMP_TOP_K:-5}"                      # teacher top-K
+DUMP_DISAGREEMENT="${DUMP_DISAGREEMENT:-true}"      # 额外 disagreement-only JSONL
+DUMP_OSS_PATH="${DUMP_OSS_PATH:-${OSS_ROOT}/logs/rollout_details/${JOB_NAME:-tasd_simple}}"
+
+# ── stdout/stderr 日志镜像到 OSS ────────────────────────────────────
+STDOUT_LOG_DIR="${OSS_ROOT}/logs/stdout"
+mkdir -p "${STDOUT_LOG_DIR}" 2>/dev/null || true
+STDOUT_LOG_FILE="${STDOUT_LOG_DIR}/${JOB_NAME:-tasd_simple}_$(date +%Y%m%d_%H%M%S).log"
+
 # ── 路径 ────────────────────────────────────────────────────────────────
 train_data_path="${OSS_ROOT}/datasets/${DATASET}/train.parquet"
 val_data_path="${OSS_ROOT}/datasets/${DATASET}/test.parquet"
@@ -165,4 +177,9 @@ python -m verl.trainer.main_ppo \
     trainer.project_name="${PROJECT_NAME:-TASD_simple}" \
     trainer.experiment_name="${JOB_NAME:-tasd_simple}" \
     trainer.group_name="TASD-simple" \
-    "trainer.logger=[console,swanlab]"
+    trainer.rollout_dump_detailed=${DUMP_DETAILED} \
+    trainer.rollout_dump_sample_size=${DUMP_SAMPLE_SIZE} \
+    trainer.rollout_dump_top_k=${DUMP_TOP_K} \
+    trainer.rollout_dump_disagreement=${DUMP_DISAGREEMENT} \
+    trainer.rollout_dump_oss_path="${DUMP_OSS_PATH}" \
+    "trainer.logger=[console,swanlab]" 2>&1 | tee -a "${STDOUT_LOG_FILE}"
