@@ -1058,12 +1058,18 @@ def agg_loss(
     if loss_agg_mode == "token-mean":
         if batch_num_tokens is None:
             batch_num_tokens = loss_mask.sum()
+        # Guard: when all tokens are masked (e.g. entropy gate filters everything),
+        # return zero loss instead of NaN from division by zero.
+        if batch_num_tokens == 0:
+            return torch.tensor(0.0, device=loss_mat.device, dtype=loss_mat.dtype)
         loss = verl_F.masked_sum(loss_mat, loss_mask) / batch_num_tokens * dp_size
     elif loss_agg_mode == "seq-mean-token-sum":
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)  # token-sum
         seq_mask = (torch.sum(loss_mask, dim=-1) > 0).float()  # exclude fully masked sequences
         if global_batch_size is None:
             global_batch_size = seq_mask.sum()
+        if global_batch_size == 0:
+            return torch.tensor(0.0, device=loss_mat.device, dtype=loss_mat.dtype)
         loss = verl_F.masked_sum(seq_losses, seq_mask) / global_batch_size * dp_size  # seq-mean
     elif loss_agg_mode == "seq-mean-token-mean":
         seq_mask = torch.sum(loss_mask, dim=-1)  # per-sequence token count
@@ -1071,6 +1077,8 @@ def agg_loss(
         seq_mask = (seq_mask > 0).float()  # exclude fully masked sequences
         if global_batch_size is None:
             global_batch_size = seq_mask.sum()
+        if global_batch_size == 0:
+            return torch.tensor(0.0, device=loss_mat.device, dtype=loss_mat.dtype)
         loss = verl_F.masked_sum(seq_losses, seq_mask) / global_batch_size * dp_size  # seq-mean
     elif loss_agg_mode == "seq-mean-token-sum-norm":
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)
@@ -2505,6 +2513,7 @@ def compute_tasd_advantage(
     teacher_entropy_norm: Optional[torch.Tensor] = None,  # (B, T) teacher 归一化熵
     student_entropy_norm: Optional[torch.Tensor] = None,  # (B, T) student 归一化熵
     teacher_log_probs: Optional[torch.Tensor] = None,  # (B, T) teacher log probs on response tokens
+    global_steps: int = 0,  # 当前训练步数，用于 gate warmup
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -2548,6 +2557,8 @@ def compute_tasd_advantage(
     norm_adv_by_std = tasd_cfg.get("norm_adv_by_std", False)
     adv_entropy_weight = tasd_cfg.get("adv_entropy_weight", "none")
     reward_type = tasd_cfg.get("reward_type", "teacher_log_prob")
+    # gate_warmup_steps: warmup 期间不启用 gate（teacher ≈ student，gate 过滤率过高）
+    gate_warmup_steps = int(tasd_cfg.get("gate_warmup_steps", 0))
     # group_mean_mode: 控制 group mean/std 的统计粒度
     #   "token"：所有有效 token 打平后统计（原有方式，存在 length bias）
     #   "seq"  ：先 per-sequence 取 token 均值得到标量 reward，再在 seq 上统计
@@ -2575,8 +2586,10 @@ def compute_tasd_advantage(
         effective_mask = response_mask.float()
         if self_distillation_mask is not None:
             effective_mask = effective_mask * self_distillation_mask.unsqueeze(1).float()
-        if gate_mask is not None:
+        if gate_mask is not None and global_steps >= gate_warmup_steps:
             effective_mask = effective_mask * gate_mask.float()
+        elif gate_mask is not None and global_steps < gate_warmup_steps:
+            print(f"[TASD Debug] gate warmup: step {global_steps} < {gate_warmup_steps}, bypassing gate_mask")
         
         # Debug: effective_mask 统计
         eff_total = effective_mask.sum().item()

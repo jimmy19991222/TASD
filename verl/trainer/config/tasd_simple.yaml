@@ -51,6 +51,8 @@ algorithm:
     entropy_gate_ratio: 1.0         # hard gate 保留比例（默认 1.0 = 原始 hard gate）
                                     # 0.8 = 保留熵差 top 80%，0.5 = 保留 top 50%
                                     # 仅在 entropy_gate="hard" 时生效
+    gate_warmup_steps: 0            # warmup 期间不启用 gate（teacher ≈ student 时避免全过滤）
+                                    # 0 = 不 warmup，建议设为 LR warmup 步数（如 10）
     
     # ── distill topk（熵门控需要）─────────────────────────────
     distill_topk: 100
@@ -89,6 +91,15 @@ algorithm:
     include_successful_rollouts: true
     use_self_as_teacher_on_success: true
     success_reward_threshold: 1.0
+    
+    # ── error_pool: group-shared 错例池注入 teacher context ────
+    # teacher_context_mode: 
+    #   "per_rollout" (默认, v5): 每个 rollout 独立构建 teacher context
+    #   "group_shared": 同 uid 组内共享 error_pool + reference_answer
+    teacher_context_mode: "per_rollout"
+    max_errors_in_pool: 8               # 每 group 去重后错例上限
+    error_answer_max_chars: 1024        # 每条错例答案字符上限
+    error_pool_format_only: true        # 仅格式错例入池（避免语义泄漏）
   # ── DAPO 动态采样（Dynamic Sampling / Group Filtering）──────────────
   # 过滤全对/全错的 group，只保留有区分度的 group 参与训练
   filter_groups:

@@ -1,17 +1,20 @@
 #!/bin/bash
 # =============================================================================
-# TASD outcome reward + entropy gate 实验 v3（含 NaN 修复 + gate warmup）
+# TASD error_pool 实验（v14 sweep）
 #
-# 5 实验矩阵：
-#   1. noGate:  无 gate 对照（纯 outcome + teacher_prob 加权）
-#   2. gateWU:  gate + warmup baseline
-#   3. epFmt:   gate + warmup + error_pool(仅格式错误)
-#   4. epAll:   gate + warmup + error_pool(格式+答案错误)
-#   5. tka512:  top_k_agreement gate（K=512）重跑
+# 核心思路：
+#   - teacher_context_mode = group_shared：同 uid 组内共享 error_pool + reference_answer
+#   - error_pool_format_only = true：仅格式错例入池，避免语义泄漏
+#   - 对照组 per_rollout：等价 v5 原始行为
 #
-# 全部共享：
-#   REWARD_TYPE=outcome, gmSeq, clipAdv=2.0, ema=0.1, rep=1.05, ec=0.001
-#   GATE_WARMUP_STEPS=10（复用 LR warmup 步数）
+# 实验矩阵：
+#   1. v14-ctrl: per_rollout（对照，应复现基线）
+#   2. v14-fmt8: group_shared, format_only=true, max_errors=8（主推）
+#   3. v14-fmt4: group_shared, format_only=true, max_errors=4（消融：紧凑 pool）
+#   4. v14-all8: group_shared, format_only=false, max_errors=8（消融：不做 format gating）
+#
+# 固定其他超参为 v5 最优组合：
+#   gmSeq + clipAdv=2.0 + ema=0.1 + rep=1.05 + ec=0.001
 # =============================================================================
 
 # ── Nebula 账号配置 ──────────────────────────────────────────────────────
@@ -40,14 +43,26 @@ if [ $# -gt 0 ] && [[ "$1" == "--dry-run" ]]; then
 fi
 
 # =============================================================================
-# 共享超参（v5 最优）
+# 实验矩阵
 # =============================================================================
-REWARD_TYPE="outcome"
+# (TEACHER_CONTEXT_MODE, ERROR_POOL_FORMAT_ONLY, MAX_ERRORS_IN_POOL, TAG)
+declare -a CONFIGS=(
+    "per_rollout|True|8|ctrl"
+    "group_shared|True|8|fmt8"
+    "group_shared|True|4|fmt4"
+    "group_shared|False|8|all8"
+)
+
+# ── 固定超参（v5 最优）────────────────────────────────────────────────────
+REWARD_TYPE="teacher_log_prob"
+ENTROPY_GATE="hard_keep_reward"
+ENTROPY_GATE_RATIO="1.0"
 CLIP_ADV="true"
 CLIP_ADV_VALUE="2.0"
 REPETITION_PENALTY="1.05"
 NORM_ADV_BY_STD="true"
 ADV_STD_FLOOR="none"
+ADV_ENTROPY_WEIGHT="none"
 GROUP_MEAN_MODE="seq"
 CLIP_RATIO_HIGH="0.28"
 FILTER_GROUPS_ENABLE="false"
@@ -64,22 +79,8 @@ TRAIN_BATCH_SIZE="32"
 MINI_BATCH_SIZE="32"
 ROLLOUT_N="8"
 MODEL="Qwen3-8B"
-GATE_WARMUP_STEPS="10"
-MAX_ERRORS_IN_POOL="8"
+DISTILL_TOPK="256"
 ERROR_ANSWER_MAX_CHARS="1024"
-
-# =============================================================================
-# 实验矩阵
-# ENTROPY_GATE | ENTROPY_GATE_RATIO | ADV_ENTROPY_WEIGHT | TEACHER_CONTEXT_MODE | ERROR_POOL_FORMAT_ONLY | DISTILL_TOPK | TOP_K_AGREEMENT_K | TAG
-# =============================================================================
-declare -a EXPERIMENTS=(
-    "none|1.0|teacher_prob|per_rollout|True|256|0|noGate"
-    "hard_keep_reward|1.0|none|per_rollout|True|256|0|gateOnly"
-    "hard_keep_reward|1.0|teacher_prob|per_rollout|True|256|0|gateWU"
-    "hard_keep_reward|1.0|teacher_prob|group_shared|True|256|0|epFmt"
-    "hard_keep_reward|1.0|teacher_prob|group_shared|False|256|0|epAll"
-    "top_k_agreement|1.0|none|per_rollout|True|512|512|tka512"
-)
 
 GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
 GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
@@ -91,9 +92,9 @@ TOTAL=0
 SUBMITTED=0
 
 for DATASET in "${DATASETS[@]}"; do
-for EXP_CFG in "${EXPERIMENTS[@]}"; do
+for CONFIG in "${CONFIGS[@]}"; do
 
-    IFS='|' read -r ENTROPY_GATE ENTROPY_GATE_RATIO ADV_ENTROPY_WEIGHT TEACHER_CONTEXT_MODE ERROR_POOL_FORMAT_ONLY DISTILL_TOPK TOP_K_AGREEMENT_K TAG <<< "$EXP_CFG"
+    IFS='|' read -r TEACHER_CONTEXT_MODE ERROR_POOL_FORMAT_ONLY MAX_ERRORS_IN_POOL TAG <<< "$CONFIG"
 
     TOTAL=$((TOTAL + 1))
 
@@ -103,12 +104,15 @@ for EXP_CFG in "${EXPERIMENTS[@]}"; do
     MODEL_PATH="${OSS_ROOT}/base_models/${MODEL}"
 
     CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
-    JOB_NAME="TASD-${DATASET_SHORT}-outcome-v3-${TAG}-topk${DISTILL_TOPK}-gmSeq-clipAdv${CLIP_ADV_VALUE}-ema${TEACHER_UPDATE_RATE}-rep${REPETITION_PENALTY}-ec${ENTROPY_COEFF}-${MODEL_SHORT}-${CURRENT_TIME}"
+    JOB_NAME="TASD-${DATASET_SHORT}-v14-${TAG}-gmSeq-clipAdv${CLIP_ADV_VALUE}-ema${TEACHER_UPDATE_RATE}-rep${REPETITION_PENALTY}-ec${ENTROPY_COEFF}-clipH${CLIP_RATIO_HIGH}-${MODEL_SHORT}-${CURRENT_TIME}"
 
     if [ "$DRY_RUN" = true ]; then
         echo "------------------------------------------------------------"
         echo "Job #${TOTAL}: ${JOB_NAME}"
-        echo "  ENTROPY_GATE=${ENTROPY_GATE} ADV_ENTROPY_WEIGHT=${ADV_ENTROPY_WEIGHT} TEACHER_CONTEXT_MODE=${TEACHER_CONTEXT_MODE} ERROR_POOL_FORMAT_ONLY=${ERROR_POOL_FORMAT_ONLY} TOP_K_AGREEMENT_K=${TOP_K_AGREEMENT_K}"
+        echo "  TEACHER_CONTEXT_MODE=${TEACHER_CONTEXT_MODE}"
+        echo "  ERROR_POOL_FORMAT_ONLY=${ERROR_POOL_FORMAT_ONLY}"
+        echo "  MAX_ERRORS_IN_POOL=${MAX_ERRORS_IN_POOL}"
+        echo "  TAG=${TAG}"
     else
         echo "提交 Job #${TOTAL}: ${JOB_NAME}"
 
@@ -117,7 +121,7 @@ for EXP_CFG in "${EXPERIMENTS[@]}"; do
             --engine=xdl \
             --queue=${QUEUE} \
             --entry=nebula_scripts/entry.py \
-            --user_params="--script_path=${SCRIPT_PATH} --world_size=${WORLD_SIZE} --job_name=${JOB_NAME} --env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=DATASET=${DATASET} --env=MODEL=${MODEL} --env=MODEL_PATH=${MODEL_PATH} --env=REWARD_TYPE=${REWARD_TYPE} --env=ENTROPY_GATE=${ENTROPY_GATE} --env=ENTROPY_GATE_RATIO=${ENTROPY_GATE_RATIO} --env=CLIP_ADV=${CLIP_ADV} --env=CLIP_ADV_VALUE=${CLIP_ADV_VALUE} --env=DISTILL_TOPK=${DISTILL_TOPK} --env=REPETITION_PENALTY=${REPETITION_PENALTY} --env=LR=${LR} --env=SEED=${SEED} --env=ENTROPY_COEFF=${ENTROPY_COEFF} --env=ROLLOUT_TEMPERATURE=${TEMPERATURE} --env=TEACHER_REG=${TEACHER_REG} --env=TEACHER_UPDATE_RATE=${TEACHER_UPDATE_RATE} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=MINI_BATCH_SIZE=${MINI_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=INCLUDE_SUCCESSFUL_ROLLOUTS=${INCLUDE_SUCCESSFUL_ROLLOUTS} --env=NORM_ADV_BY_STD=${NORM_ADV_BY_STD} --env=ADV_STD_FLOOR=${ADV_STD_FLOOR} --env=ADV_ENTROPY_WEIGHT=${ADV_ENTROPY_WEIGHT} --env=GROUP_MEAN_MODE=${GROUP_MEAN_MODE} --env=CLIP_RATIO_HIGH=${CLIP_RATIO_HIGH} --env=FILTER_GROUPS_ENABLE=${FILTER_GROUPS_ENABLE} --env=FILTER_GROUPS_METRIC=${FILTER_GROUPS_METRIC} --env=FILTER_GROUPS_MAX_GEN=${FILTER_GROUPS_MAX_GEN} --env=TEACHER_CONTEXT_MODE=${TEACHER_CONTEXT_MODE} --env=GATE_WARMUP_STEPS=${GATE_WARMUP_STEPS} --env=MAX_ERRORS_IN_POOL=${MAX_ERRORS_IN_POOL} --env=ERROR_ANSWER_MAX_CHARS=${ERROR_ANSWER_MAX_CHARS} --env=ERROR_POOL_FORMAT_ONLY=${ERROR_POOL_FORMAT_ONLY} --env=TOP_K_AGREEMENT_K=${TOP_K_AGREEMENT_K} --env=GIT_BRANCH=${GIT_BRANCH} --env=GIT_COMMIT=${GIT_COMMIT} --env=DINGTALK_WEBHOOK=https://oapi.dingtalk.com/robot/send?access_token=f598ad33b071751bf79d2484d8e1acefe8df9d879e129cae40340a158854f9cb --env=DINGTALK_SECRET=SECc5b9e4f61f56b32b46abf1ecedc11bdcba10dc35fbba8fa0ff62c084a1cc6ad3" \
+            --user_params="--script_path=${SCRIPT_PATH} --world_size=${WORLD_SIZE} --job_name=${JOB_NAME} --env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=DATASET=${DATASET} --env=MODEL=${MODEL} --env=MODEL_PATH=${MODEL_PATH} --env=REWARD_TYPE=${REWARD_TYPE} --env=ENTROPY_GATE=${ENTROPY_GATE} --env=ENTROPY_GATE_RATIO=${ENTROPY_GATE_RATIO} --env=CLIP_ADV=${CLIP_ADV} --env=CLIP_ADV_VALUE=${CLIP_ADV_VALUE} --env=DISTILL_TOPK=${DISTILL_TOPK} --env=REPETITION_PENALTY=${REPETITION_PENALTY} --env=LR=${LR} --env=SEED=${SEED} --env=ENTROPY_COEFF=${ENTROPY_COEFF} --env=ROLLOUT_TEMPERATURE=${TEMPERATURE} --env=TEACHER_REG=${TEACHER_REG} --env=TEACHER_UPDATE_RATE=${TEACHER_UPDATE_RATE} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=MINI_BATCH_SIZE=${MINI_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=INCLUDE_SUCCESSFUL_ROLLOUTS=${INCLUDE_SUCCESSFUL_ROLLOUTS} --env=NORM_ADV_BY_STD=${NORM_ADV_BY_STD} --env=ADV_STD_FLOOR=${ADV_STD_FLOOR} --env=ADV_ENTROPY_WEIGHT=${ADV_ENTROPY_WEIGHT} --env=GROUP_MEAN_MODE=${GROUP_MEAN_MODE} --env=CLIP_RATIO_HIGH=${CLIP_RATIO_HIGH} --env=FILTER_GROUPS_ENABLE=${FILTER_GROUPS_ENABLE} --env=FILTER_GROUPS_METRIC=${FILTER_GROUPS_METRIC} --env=FILTER_GROUPS_MAX_GEN=${FILTER_GROUPS_MAX_GEN} --env=TEACHER_CONTEXT_MODE=${TEACHER_CONTEXT_MODE} --env=MAX_ERRORS_IN_POOL=${MAX_ERRORS_IN_POOL} --env=ERROR_ANSWER_MAX_CHARS=${ERROR_ANSWER_MAX_CHARS} --env=ERROR_POOL_FORMAT_ONLY=${ERROR_POOL_FORMAT_ONLY} --env=GIT_BRANCH=${GIT_BRANCH} --env=GIT_COMMIT=${GIT_COMMIT} --env=DINGTALK_WEBHOOK=https://oapi.dingtalk.com/robot/send?access_token=f598ad33b071751bf79d2484d8e1acefe8df9d879e129cae40340a158854f9cb --env=DINGTALK_SECRET=SECc5b9e4f61f56b32b46abf1ecedc11bdcba10dc35fbba8fa0ff62c084a1cc6ad3" \
             --worker_count=${WORLD_SIZE} \
             --file.cluster_file=${CLUSTER_FILE} \
             --job_name=${JOB_NAME} \

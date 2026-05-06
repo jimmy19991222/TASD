@@ -45,6 +45,14 @@ GEN_BATCH_SIZE="${GEN_BATCH_SIZE:-32}"   # 不用 filter_groups 时应等于 tra
 MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-32}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
 INCLUDE_SUCCESSFUL_ROLLOUTS="${INCLUDE_SUCCESSFUL_ROLLOUTS:-True}"
+# ── gate warmup 配置 ──────────────────────────────────────────────────
+GATE_WARMUP_STEPS="${GATE_WARMUP_STEPS:-10}"  # warmup 期间不启用 entropy gate
+
+# ── error_pool teacher context 配置 ───────────────────────────────────
+TEACHER_CONTEXT_MODE="${TEACHER_CONTEXT_MODE:-per_rollout}"  # per_rollout | group_shared
+MAX_ERRORS_IN_POOL="${MAX_ERRORS_IN_POOL:-8}"
+ERROR_ANSWER_MAX_CHARS="${ERROR_ANSWER_MAX_CHARS:-1024}"
+ERROR_POOL_FORMAT_ONLY="${ERROR_POOL_FORMAT_ONLY:-True}"
 # ── DAPO 动态采样配置 ────────────────────────────────────────────────
 FILTER_GROUPS_ENABLE="${FILTER_GROUPS_ENABLE:-false}"  # 是否启用 filter_groups
 FILTER_GROUPS_METRIC="${FILTER_GROUPS_METRIC:-acc}"    # 过滤指标：acc / seq_reward / seq_final_reward
@@ -127,6 +135,8 @@ echo "  ADV_ENTROPY_WEIGHT: ${ADV_ENTROPY_WEIGHT}"
 echo "  FILTER_GROUPS: enable=${FILTER_GROUPS_ENABLE}, metric=${FILTER_GROUPS_METRIC}, max_gen=${FILTER_GROUPS_MAX_GEN}"
 echo "  DISTILL_TOPK: ${DISTILL_TOPK}"
 echo "  TOP_K_AGREEMENT_K: ${TOP_K_AGREEMENT_K}, TOP_K_AGREEMENT_EPS: ${TOP_K_AGREEMENT_EPS}"
+echo "  GATE_WARMUP_STEPS: ${GATE_WARMUP_STEPS}"
+echo "  TEACHER_CONTEXT_MODE: ${TEACHER_CONTEXT_MODE}, MAX_ERRORS: ${MAX_ERRORS_IN_POOL}, FORMAT_ONLY: ${ERROR_POOL_FORMAT_ONLY}"
 echo "  SEED: ${SEED}"
 echo "============================================"
 
@@ -172,6 +182,11 @@ python -m verl.trainer.main_ppo \
     algorithm.tasd.use_self_as_teacher_on_success=${INCLUDE_SUCCESSFUL_ROLLOUTS} \
     algorithm.tasd.include_successful_rollouts=${INCLUDE_SUCCESSFUL_ROLLOUTS} \
     algorithm.tasd.success_reward_threshold=1.0 \
+    algorithm.tasd.teacher_context_mode=${TEACHER_CONTEXT_MODE} \
+    algorithm.tasd.gate_warmup_steps=${GATE_WARMUP_STEPS} \
+    algorithm.tasd.max_errors_in_pool=${MAX_ERRORS_IN_POOL} \
+    algorithm.tasd.error_answer_max_chars=${ERROR_ANSWER_MAX_CHARS} \
+    algorithm.tasd.error_pool_format_only=${ERROR_POOL_FORMAT_ONLY} \
     algorithm.filter_groups.enable=${FILTER_GROUPS_ENABLE} \
     algorithm.filter_groups.metric=${FILTER_GROUPS_METRIC} \
     algorithm.filter_groups.max_num_gen_batches=${FILTER_GROUPS_MAX_GEN} \

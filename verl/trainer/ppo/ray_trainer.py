@@ -365,6 +365,7 @@ def compute_advantage(
             teacher_entropy_norm=teacher_entropy_norm,
             student_entropy_norm=student_entropy_norm,
             teacher_log_probs=data.batch.get("teacher_log_probs_on_response", None),
+            global_steps=data.non_tensor_batch.get("global_steps", [0])[0] if "global_steps" in data.non_tensor_batch else 0,
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
@@ -950,6 +951,146 @@ class RayPPOTrainer:
         """Remove <think>...</think> tags and their content from text."""
         return re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
 
+    # ── error_pool 辅助方法 ─────────────────────────────────────────────
+
+    @staticmethod
+    def _tail_truncate(text: str, max_chars: int) -> str:
+        """取文本末尾 max_chars 字符，保留最后的答案部分。"""
+        if not text:
+            return ""
+        return text if len(text) <= max_chars else "..." + text[-max_chars:]
+
+    @staticmethod
+    def _extract_format_tag(reward_info: dict) -> str:
+        """从 reward_extra_info 中提取 format_error_type tag。"""
+        return reward_info.get("format_error_type") or "none"
+
+    @classmethod
+    def _build_error_display(cls, response: str, reward_info: dict, tail_max_chars: int) -> dict:
+        """单条失败 rollout → 错例显示项。"""
+        tag = cls._extract_format_tag(reward_info)
+        # 先去掉 thinking trace，只保留最终输出
+        answer = cls._remove_thinking_trace(response)
+        answer = cls._tail_truncate(answer, tail_max_chars)
+        # dedup_key: 归一化后的答案内容 + tag
+        normalized = answer.lower().strip()
+        normalized = re.sub(r'\s+', ' ', normalized)
+        dedup_key = (tag, normalized[-200:])
+        return {"answer": answer, "tag": tag, "dedup_key": dedup_key}
+
+    @staticmethod
+    def _dedup_and_aggregate_errors(displays: list, max_unique: int) -> list:
+        """去重、按出现次数降序、取 top-K。"""
+        grouped = {}
+        order = []
+        for d in displays:
+            k = d["dedup_key"]
+            if k not in grouped:
+                grouped[k] = {"answer": d["answer"], "tag": d["tag"], "count": 0}
+                order.append(k)
+            grouped[k]["count"] += 1
+        items = [grouped[k] for k in order]
+        items.sort(key=lambda x: -x["count"])
+        return items[:max_unique]
+
+    @staticmethod
+    def _render_error_pool_text(aggregated: list, n_total: int) -> str:
+        """拼接错例池为 teacher-readable 文本。"""
+        if not aggregated:
+            return ""
+        header = f"{n_total} previous attempt(s) failed, showing {len(aggregated)} unique error pattern(s):"
+        blocks = []
+        for i, item in enumerate(aggregated, start=1):
+            blocks.append(
+                f"[Error pattern {i}, observed in {item['count']} attempt(s), tag={item['tag']}]:\n{item['answer']}"
+            )
+        return header + "\n\n" + "\n\n".join(blocks)
+
+    def _build_group_assets(
+        self,
+        batch: "DataProto",
+        reward_tensor: torch.Tensor,
+        reward_extra_infos_dict: Optional[dict],
+        success_by_uid: dict,
+        response_texts: list,
+        success_threshold: float,
+        max_errors_in_pool: int,
+        error_answer_max_chars: int,
+        error_pool_format_only: bool,
+    ) -> dict:
+        """
+        per-uid 聚合资源：reference_answer + error_pool_text。
+        返回 {uid: {"reference_answer": str|None, "error_pool_text": str, "n_errors": int, "n_unique": int}}
+        """
+        uids = batch.non_tensor_batch["uid"]
+        batch_size = batch.batch["responses"].shape[0]
+        seq_scores = reward_tensor.sum(dim=-1).detach().cpu().numpy()
+
+        uid_to_indices: dict[Any, list[int]] = defaultdict(list)
+        for i in range(batch_size):
+            uid_to_indices[uids[i]].append(i)
+
+        # format_error_type 列表（如有）
+        fmt_types_all = (reward_extra_infos_dict.get("format_error_type", None)
+                         if reward_extra_infos_dict else None)
+
+        def _has_fmt_error(idx):
+            if fmt_types_all is None or idx >= len(fmt_types_all):
+                return False
+            return fmt_types_all[idx] not in (None, "none", "")
+
+        assets = {}
+        for uid, indices in uid_to_indices.items():
+            if not indices:
+                continue
+            # 1. reference_answer: 首个 success rollout（去 thinking）；无则用 GT
+            reference_answer = None
+            success_idxs = success_by_uid.get(uid, [])
+            if success_idxs:
+                ref_text = response_texts[success_idxs[0]]
+                ref_text = self._remove_thinking_trace(ref_text)
+                reference_answer = self._tail_truncate(ref_text, error_answer_max_chars)
+            else:
+                # fallback to ground_truth
+                try:
+                    gt = batch.non_tensor_batch.get("reward_model", [{}] * batch_size)
+                    if isinstance(gt, list) and indices[0] < len(gt):
+                        gt_val = gt[indices[0]].get("ground_truth", None) if isinstance(gt[indices[0]], dict) else None
+                    else:
+                        gt_val = None
+                    if gt_val:
+                        reference_answer = str(gt_val)[:error_answer_max_chars]
+                except Exception:
+                    reference_answer = None
+
+            # 2. 收集失败样本（format-only gating）
+            if error_pool_format_only:
+                failed_indices = [i for i in indices
+                                  if seq_scores[i] < success_threshold and _has_fmt_error(i)]
+            else:
+                failed_indices = [i for i in indices if seq_scores[i] < success_threshold]
+
+            # 3. 构建 error displays
+            displays = []
+            for i in failed_indices:
+                info = {}
+                if fmt_types_all is not None and i < len(fmt_types_all):
+                    info["format_error_type"] = fmt_types_all[i]
+                displays.append(self._build_error_display(
+                    response_texts[i], info, error_answer_max_chars
+                ))
+
+            aggregated = self._dedup_and_aggregate_errors(displays, max_errors_in_pool)
+            error_pool_text = self._render_error_pool_text(aggregated, len(failed_indices))
+
+            assets[uid] = {
+                "reference_answer": reference_answer,
+                "error_pool_text": error_pool_text,
+                "n_errors": len(failed_indices),
+                "n_unique": len(aggregated),
+            }
+        return assets
+
     def _get_solution(
         self,
         idx: int,
@@ -1025,6 +1166,24 @@ class RayPPOTrainer:
         )
 
         success_by_uid = self._collect_solutions_by_uid(batch, reward_tensor, success_reward_threshold=self_distillation_cfg.success_reward_threshold)
+        
+        # ── error_pool: group_shared 模式 ──────────────────────────────────
+        teacher_context_mode = tasd_cfg.get("teacher_context_mode", "per_rollout")
+        is_group_shared = (teacher_context_mode == "group_shared")
+        group_assets = None
+        if is_group_shared:
+            group_assets = self._build_group_assets(
+                batch=batch,
+                reward_tensor=reward_tensor,
+                reward_extra_infos_dict=reward_extra_infos_dict,
+                success_by_uid=success_by_uid,
+                response_texts=response_texts,
+                success_threshold=self_distillation_cfg.success_reward_threshold,
+                max_errors_in_pool=tasd_cfg.get("max_errors_in_pool", 8),
+                error_answer_max_chars=tasd_cfg.get("error_answer_max_chars", 1024),
+                error_pool_format_only=tasd_cfg.get("error_pool_format_only", True),
+            )
+
         solution_strs = [
             self._get_solution(
                 i,
@@ -1041,6 +1200,23 @@ class RayPPOTrainer:
 
         def _build_teacher_message(i: int) -> list[dict]:
             system_messages = batch.non_tensor_batch["raw_prompt"][i][:-1]
+            uid = batch.non_tensor_batch["uid"][i]
+
+            # ── group_shared 模式：用 group_assets 构建 teacher prompt ──
+            if is_group_shared and group_assets and uid in group_assets:
+                a = group_assets[uid]
+                err_block = ""
+                if a["error_pool_text"]:
+                    err_block = f"\n\nBelow are error patterns other students made for this problem; avoid them:\n{a['error_pool_text']}"
+                ref_block = ""
+                if a["reference_answer"]:
+                    ref_block = f"\n\nHere is a correct reference answer:\n{a['reference_answer']}"
+                reprompt_text = prompt_texts[i] + err_block + ref_block
+                return system_messages + [
+                    {"role": "user", "content": reprompt_text},
+                ]
+
+            # ── per_rollout 模式（v5 原始逻辑）──
             has_solution = solution_strs[i] is not None
             has_feedback = feedback_list[i] is not None
             feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
@@ -1102,12 +1278,25 @@ class RayPPOTrainer:
             for i in range(batch_size)
         ]
 
-        # self_distillation_mask is True if sample has a solution OR feedback is used (i.e., will get a reprompted message)
-        self_distillation_mask = torch.tensor(
-            [solution_strs[i] is not None or feedback_used[i] for i in range(batch_size)],
-            dtype=torch.float32,
-            device=device
-        )
+        # self_distillation_mask: True if sample has enriched teacher context
+        if is_group_shared and group_assets:
+            # group_shared 模式：有 reference_answer 或 error_pool_text 即有 teacher context
+            uids_list = batch.non_tensor_batch["uid"]
+            self_distillation_mask = torch.tensor(
+                [
+                    bool(group_assets.get(uids_list[i], {}).get("reference_answer") or
+                         group_assets.get(uids_list[i], {}).get("error_pool_text"))
+                    for i in range(batch_size)
+                ],
+                dtype=torch.float32,
+                device=device
+            )
+        else:
+            self_distillation_mask = torch.tensor(
+                [solution_strs[i] is not None or feedback_used[i] for i in range(batch_size)],
+                dtype=torch.float32,
+                device=device
+            )
         
         # Debug: self_distillation_mask 统计
         num_with_solution = sum(1 for s in solution_strs if s is not None)
@@ -1126,6 +1315,18 @@ class RayPPOTrainer:
             "self_distillation/feedback_used_fraction": num_with_feedback_used / batch_size,
             "self_distillation/reprompt_sample_fraction": self_distillation_mask.float().mean().item(),
         }
+        # error_pool metrics
+        if is_group_shared and group_assets:
+            import numpy as np
+            metrics["tasd/group_n_errors_mean"] = float(np.mean([a["n_errors"] for a in group_assets.values()]))
+            metrics["tasd/group_n_unique_mean"] = float(np.mean([a["n_unique"] for a in group_assets.values()]))
+            metrics["tasd/group_with_ref_frac"] = float(np.mean([a["reference_answer"] is not None for a in group_assets.values()]))
+            metrics["tasd/group_with_pool_frac"] = float(np.mean([bool(a["error_pool_text"]) for a in group_assets.values()]))
+            print(f"[TASD error_pool] groups={len(group_assets)}, "
+                  f"n_errors_mean={metrics['tasd/group_n_errors_mean']:.1f}, "
+                  f"n_unique_mean={metrics['tasd/group_n_unique_mean']:.1f}, "
+                  f"with_ref={metrics['tasd/group_with_ref_frac']:.2f}, "
+                  f"with_pool={metrics['tasd/group_with_pool_frac']:.2f}")
         return DataProto.from_dict(tensors={
             "teacher_input_ids": teacher_input_ids,
             "teacher_attention_mask": teacher_attention_mask,
@@ -2542,6 +2743,9 @@ class RayPPOTrainer:
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor
+
+                        # Inject global_steps for gate warmup
+                        batch.non_tensor_batch["global_steps"] = [self.global_steps] * len(batch.non_tensor_batch["uid"])
 
                         batch = compute_advantage(
                             batch,
