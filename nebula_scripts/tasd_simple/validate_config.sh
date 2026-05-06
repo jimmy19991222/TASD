@@ -24,7 +24,7 @@ if [ "$ENTROPY_GATE" = "none" ] && [ "$ADV_ENTROPY_WEIGHT" = "none" ]; then
 fi
 
 # 3. 检查 adv_entropy_weight 值是否有效
-VALID_AEW="none teacher_conf certainty_diff"
+VALID_AEW="none teacher_prob teacher_conf certainty_diff"
 if ! echo "$VALID_AEW" | grep -qw "$ADV_ENTROPY_WEIGHT"; then
     echo "❌ 错误: adv_entropy_weight='$ADV_ENTROPY_WEIGHT' 无效"
     echo "   有效值: $VALID_AEW"
