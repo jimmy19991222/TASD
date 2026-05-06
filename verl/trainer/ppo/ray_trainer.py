@@ -2745,7 +2745,7 @@ class RayPPOTrainer:
                         )  # GRPO adv normalization factor
 
                         # Inject global_steps for gate warmup
-                        batch.non_tensor_batch["global_steps"] = [self.global_steps] * len(batch.non_tensor_batch["uid"])
+                        batch.non_tensor_batch["global_steps"] = np.array([self.global_steps] * len(batch.non_tensor_batch["uid"]))
 
                         batch = compute_advantage(
                             batch,
