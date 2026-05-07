@@ -47,13 +47,13 @@ fi
 
 declare -a EXPERIMENTS=(
     # 算法 | 特殊参数 | 实验标签
-    "grpo||grpo_baseline"
-    "sdpo|alpha=1.0,dont_reprompt=True|sdpo_alpha1.0"
-    "fipo||fipo_baseline"
-    "self_teacher|beta=1.0,ema_alpha=0.9,clip_value=5.0|self_teacher_beta1.0_Vce_only"
-    "self_teacher|beta=0.7,ema_alpha=0.9,clip_value=5.0|self_teacher_beta0.7_recommended"
-    "self_teacher|beta=0.5,ema_alpha=0.9,clip_value=5.0|self_teacher_beta0.5_equal"
-    "self_teacher|beta=0.0,ema_alpha=0.9,clip_value=5.0|self_teacher_beta0.0_Vema_only"
+    "grpo|mini_batch_size=8|grpo_offpolicy_mbs8"
+    "sdpo|alpha=0.5,dont_reprompt=True,mini_batch_size=32|sdpo_js_alpha0.5"
+    "fipo|mini_batch_size=8|fipo_offpolicy_mbs8"
+    "self_teacher|beta=1.0,ema_alpha=0.9,clip_value=5.0,mini_batch_size=32|self_teacher_beta1.0_Vce_only"
+    "self_teacher|beta=0.7,ema_alpha=0.9,clip_value=5.0,mini_batch_size=32|self_teacher_beta0.7_recommended"
+    "self_teacher|beta=0.5,ema_alpha=0.9,clip_value=5.0,mini_batch_size=32|self_teacher_beta0.5_equal"
+    "self_teacher|beta=0.0,ema_alpha=0.9,clip_value=5.0,mini_batch_size=32|self_teacher_beta0.0_Vema_only"
 )
 
 # ── 共享超参 ─────────────────────────────────────────────────────────
@@ -62,7 +62,7 @@ ENTROPY_COEFF="0.001"
 SEED="42"
 TRAIN_BATCH_SIZE="32"
 GEN_BATCH_SIZE="32"
-MINI_BATCH_SIZE="32"
+# MINI_BATCH_SIZE 由各实验单独指定（GRPO/FIPO=8, SDPO/Self-Teacher=32）
 ROLLOUT_N="8"
 ROLLOUT_TEMPERATURE="1.0"
 REPETITION_PENALTY="1.05"
@@ -77,8 +77,10 @@ echo "============================================"
 echo "算法对比实验提交"
 echo "============================================"
 echo "实验数量: ${#EXPERIMENTS[@]}"
-echo "  - Baseline: GRPO, SDPO, FIPO (3个)"
-echo "  - Self-Teacher beta 消融: 1.0/0.7/0.5/0.0 (4个)"
+echo "  - GRPO: off-policy, mini_batch=8 (论文参数)"
+echo "  - SDPO: on-policy, alpha=0.5 (JS divergence, 论文 Table 3)"
+echo "  - FIPO: off-policy, mini_batch=8 (与 GRPO 共享参数)"
+echo "  - Self-Teacher: on-policy, beta 消融 (1.0/0.7/0.5/0.0)"
 echo "数据集: ${DATASET}"
 echo "模型: Qwen3-8B"
 echo "SwanLab组: Algorithm-Comparison-v1"
@@ -101,13 +103,17 @@ for EXP in "${EXPERIMENTS[@]}"; do
     fi
     
     # 解析特殊参数
-    SDPO_ALPHA="1.0"
+    MINI_BATCH_SIZE="32"  # 默认值（会被算法逻辑覆盖）
+    SDPO_ALPHA="0.5"  # 默认 Jensen-Shannon
     SDPO_DONT_REPROMPT="True"
     ADV_MODE="self_teacher"
     BETA="0.7"
     EMA_ALPHA="0.9"
     CLIP_VALUE="5.0"
     
+    if [[ "$SPECIAL_PARAMS" == *"mini_batch_size="* ]]; then
+        MINI_BATCH_SIZE=$(echo "$SPECIAL_PARAMS" | sed -n 's/.*mini_batch_size=\([0-9]*\).*/\1/p')
+    fi
     if [[ "$SPECIAL_PARAMS" == *"alpha="* ]]; then
         SDPO_ALPHA=$(echo "$SPECIAL_PARAMS" | sed -n 's/.*alpha=\([0-9.]*\).*/\1/p')
     fi

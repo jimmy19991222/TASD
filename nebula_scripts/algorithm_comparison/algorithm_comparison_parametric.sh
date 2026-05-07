@@ -25,9 +25,10 @@ REPETITION_PENALTY="${REPETITION_PENALTY:-1.05}"
 CLIP_RATIO_HIGH="${CLIP_RATIO_HIGH:-0.28}"
 
 # ── 算法特定参数 ─────────────────────────────────────────────────────
-# SDPO 参数
-SDPO_ALPHA="${SDPO_ALPHA:-1.0}"
+# SDPO 参数（论文 Table 3）
+SDPO_ALPHA="${SDPO_ALPHA:-0.5}"  # Jensen-Shannon divergence
 SDPO_DONT_REPROMPT="${SDPO_DONT_REPROMPT:-True}"
+SDPO_DISTILLATION_TOPK="${SDPO_DISTILLATION_TOPK:-100}"
 
 # Self-Teacher Advantage 参数
 ADV_MODE="${ADV_MODE:-grpo}"  # grpo | self_teacher
@@ -39,6 +40,15 @@ ENTROPY_GATE="${ENTROPY_GATE:-none}"
 ENTROPY_GATE_RATIO="${ENTROPY_GATE_RATIO:-1.0}"
 DISTILL_TOPK="${DISTILL_TOPK:-256}"
 DISTILL_TEMPERATURE="${DISTILL_TEMPERATURE:-1.0}"
+
+# ── Mini-batch size（根据算法自动设置）────────────────────────────
+# GRPO/FIPO: off-policy，小 mini-batch 多步更新
+# SDPO/Self-Teacher: on-policy，单步更新（mini_batch = train_batch）
+if [[ "$ALGORITHM" == "grpo" || "$ALGORITHM" == "fipo" ]]; then
+    MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-8}"
+else
+    MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-32}"
+fi
 
 # ── 路径 ────────────────────────────────────────────────────────────────
 train_data_path="${OSS_ROOT}/datasets/${DATASET}/train.parquet"
@@ -109,30 +119,33 @@ echo "============================================"
 # ── 根据算法选择配置文件和参数 ──────────────────────────────────────────
 case "$ALGORITHM" in
     grpo)
+        # GRPO: off-policy, multi-step updates（论文参数）
         CONFIG_NAME="baseline_grpo"
         EXTRA_ARGS=""
-        echo "  → GRPO Baseline"
+        echo "  → GRPO Baseline (off-policy, mini_batch=${MINI_BATCH_SIZE})"
         ;;
     
     sdpo)
+        # SDPO: on-policy, single-step updates（论文 Table 3）
         CONFIG_NAME="sdpo"
         EXTRA_ARGS="
     actor_rollout_ref.actor.self_distillation.alpha=${SDPO_ALPHA} \
     actor_rollout_ref.actor.self_distillation.dont_reprompt_on_self_success=${SDPO_DONT_REPROMPT} \
-    actor_rollout_ref.actor.self_distillation.include_environment_feedback=False"
-        echo "  → SDPO (alpha=${SDPO_ALPHA})"
+    actor_rollout_ref.actor.self_distillation.include_environment_feedback=False \
+    actor_rollout_ref.actor.self_distillation.distillation_topk=${SDPO_DISTILLATION_TOPK}"
+        echo "  → SDPO (on-policy, alpha=${SDPO_ALPHA}, JS divergence)"
         ;;
     
     fipo)
-        # FIPO 使用 GRPO 配置 + fipo advantage estimator
+        # FIPO: 使用 verified reward，与 GRPO 共享超参数（off-policy）
         CONFIG_NAME="baseline_grpo"
         EXTRA_ARGS="
     algorithm.adv_estimator=fipo"
-        echo "  → FIPO"
+        echo "  → FIPO (off-policy, mini_batch=${MINI_BATCH_SIZE})"
         ;;
     
     self_teacher)
-        # Self-Teacher Advantage 使用 tasd_simple 配置
+        # Self-Teacher: on-policy，继承 SDPO 参数风格
         CONFIG_NAME="tasd_simple"
         EXTRA_ARGS="
     algorithm.tasd.adv_mode=${ADV_MODE} \
@@ -149,8 +162,7 @@ case "$ALGORITHM" in
     algorithm.tasd.group_mean_mode=seq \
     actor_rollout_ref.actor.self_distillation.teacher_regularization=ema \
     actor_rollout_ref.actor.self_distillation.teacher_update_rate=0.05"
-        echo "  → Self-Teacher Advantage"
-        echo "    adv_mode=${ADV_MODE}, beta=${BETA}, ema_alpha=${EMA_ALPHA}"
+        echo "  → Self-Teacher Advantage (on-policy, beta=${BETA})"
         ;;
 esac
 
