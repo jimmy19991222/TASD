@@ -46,8 +46,6 @@ fi
 declare -a EXPERIMENTS=(
     # beta | ema_alpha | clip_value | 实验标签
     "1.0|0.9|5.0|self_teacher_beta1.0_Vce_only"
-    "0.7|0.9|5.0|self_teacher_beta0.7_recommended"
-    "0.5|0.9|5.0|self_teacher_beta0.5_equal"
     "0.0|0.9|5.0|self_teacher_beta0.0_Vema_only"
 )
 
@@ -64,13 +62,11 @@ MODEL_PATH="/data/oss_bucket_0/ad/loujieming.ljm/models/Qwen3-8B"
 # =============================================================================
 
 echo "============================================"
-echo "Self-Teacher Advantage beta 消融实验提交"
+echo "Self-Teacher Advantage Baseline 实验提交"
 echo "============================================"
 echo "实验数量: ${#EXPERIMENTS[@]}"
-echo "  - Self-Teacher: on-policy, beta 消融 (1.0/0.7/0.5/0.0)"
+echo "  - Self-Teacher: on-policy, 两个关键 baseline"
 echo "  - beta=1.0: 纯 V_CE（横向 baseline）"
-echo "  - beta=0.7: V_CE 主导（推荐配置）"
-echo "  - beta=0.5: 等权融合"
 echo "  - beta=0.0: 纯 V_EMA（纵向 baseline）"
 echo "数据集: ${DATASET}"
 echo "模型: Qwen3-8B"
