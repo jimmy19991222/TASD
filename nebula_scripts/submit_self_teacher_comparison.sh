@@ -1,21 +1,19 @@
 #!/bin/bash
 # =============================================================================
-# 算法对比实验 - Nebula 批量提交脚本
+# Self-Teacher Advantage beta 消融实验 - Nebula 批量提交脚本
 #
-# 对比算法（7 个实验）：
-#   Baseline 算法（3 个）：
-#     1. GRPO: 标准 GRPO baseline
-#     2. SDPO: Self-Distillation Policy Optimization
-#     3. FIPO: Future-KL Influenced Policy Optimization
+# 算法：Self-Teacher Advantage with Bidirectional Baselines
+# 特点：on-policy, single-step updates, beta 消融（V_CE vs V_EMA）
+# 参考：Self_Teacher_Advantage_Method.md
 #
-#   Self-Teacher Advantage beta 消融（4 个）：
-#     4. beta=1.0: 纯 V_CE（横向 baseline，variance reduction 最优）
-#     5. beta=0.7: V_CE 主导（推荐配置，V_EMA 辅助捕捉转折）
-#     6. beta=0.5: 等权融合（V_CE 和 V_EMA 信号最强）
-#     7. beta=0.0: 纯 V_EMA（纵向 baseline，验证 EMA 必要性）
+# 实验矩阵（4 个 beta 配置）：
+#   1. beta=1.0: 纯 V_CE（横向 baseline，variance reduction 最优）
+#   2. beta=0.7: V_CE 主导（推荐配置，V_EMA 辅助捕捉转折）
+#   3. beta=0.5: 等权融合（V_CE 和 V_EMA 信号最强）
+#   4. beta=0.0: 纯 V_EMA（纵向 baseline，验证 EMA 必要性）
 #
 # 使用方式：
-#   bash nebula_scripts/submit_algorithm_comparison.sh [--dry-run]
+#   bash nebula_scripts/submit_self_teacher_comparison.sh [--dry-run]
 # =============================================================================
 
 # ── Nebula 账号配置 ──────────────────────────────────────────────────────
@@ -42,18 +40,15 @@ if [ $# -gt 0 ] && [[ "$1" == "--dry-run" ]]; then
 fi
 
 # =============================================================================
-# 实验矩阵（4 个算法对比）
+# 实验矩阵（Self-Teacher beta 消融，on-policy 配置）
 # =============================================================================
 
 declare -a EXPERIMENTS=(
-    # 算法 | 特殊参数 | 实验标签
-    "grpo|mini_batch_size=8|grpo_offpolicy_mbs8"
-    "sdpo|alpha=0.5,dont_reprompt=True,mini_batch_size=32|sdpo_js_alpha0.5"
-    "fipo|mini_batch_size=8|fipo_offpolicy_mbs8"
-    "self_teacher|beta=1.0,ema_alpha=0.9,clip_value=5.0,mini_batch_size=32|self_teacher_beta1.0_Vce_only"
-    "self_teacher|beta=0.7,ema_alpha=0.9,clip_value=5.0,mini_batch_size=32|self_teacher_beta0.7_recommended"
-    "self_teacher|beta=0.5,ema_alpha=0.9,clip_value=5.0,mini_batch_size=32|self_teacher_beta0.5_equal"
-    "self_teacher|beta=0.0,ema_alpha=0.9,clip_value=5.0,mini_batch_size=32|self_teacher_beta0.0_Vema_only"
+    # beta | ema_alpha | clip_value | 实验标签
+    "1.0|0.9|5.0|self_teacher_beta1.0_Vce_only"
+    "0.7|0.9|5.0|self_teacher_beta0.7_recommended"
+    "0.5|0.9|5.0|self_teacher_beta0.5_equal"
+    "0.0|0.9|5.0|self_teacher_beta0.0_Vema_only"
 )
 
 # ── 共享超参（仅包含原始论文实验中明确指定的参数）────────────────────────
@@ -61,7 +56,6 @@ LR="1e-5"
 SEED="42"
 TRAIN_BATCH_SIZE="32"
 GEN_BATCH_SIZE="32"
-# MINI_BATCH_SIZE 由各实验单独指定（GRPO/FIPO=8, SDPO/Self-Teacher=32）
 ROLLOUT_N="8"
 MODEL_PATH="/data/oss_bucket_0/ad/loujieming.ljm/models/Qwen3-8B"
 
@@ -70,13 +64,14 @@ MODEL_PATH="/data/oss_bucket_0/ad/loujieming.ljm/models/Qwen3-8B"
 # =============================================================================
 
 echo "============================================"
-echo "算法对比实验提交"
+echo "Self-Teacher Advantage beta 消融实验提交"
 echo "============================================"
 echo "实验数量: ${#EXPERIMENTS[@]}"
-echo "  - GRPO: off-policy, mini_batch=8 (论文参数)"
-echo "  - SDPO: on-policy, alpha=0.5 (JS divergence, 论文 Table 3)"
-echo "  - FIPO: off-policy, mini_batch=8 (与 GRPO 共享参数)"
 echo "  - Self-Teacher: on-policy, beta 消融 (1.0/0.7/0.5/0.0)"
+echo "  - beta=1.0: 纯 V_CE（横向 baseline）"
+echo "  - beta=0.7: V_CE 主导（推荐配置）"
+echo "  - beta=0.5: 等权融合"
+echo "  - beta=0.0: 纯 V_EMA（纵向 baseline）"
 echo "数据集: ${DATASET}"
 echo "模型: Qwen3-8B"
 echo "SwanLab组: Algorithm-Comparison-v1"
@@ -86,66 +81,30 @@ TASK_IDS=()
 FAILED=0
 
 for EXP in "${EXPERIMENTS[@]}"; do
-    IFS='|' read -r ALGORITHM SPECIAL_PARAMS EXP_LABEL <<< "$EXP"
+    IFS='|' read -r BETA EMA_ALPHA CLIP_VALUE EXP_LABEL <<< "$EXP"
     
-    JOB_NAME="alg_comp_${EXP_LABEL}"
+    JOB_NAME="self_teacher_${EXP_LABEL}"
     
     echo ""
     echo "────────────────────────────────────────"
     echo "提交实验: ${JOB_NAME}"
-    echo "  ALGORITHM: ${ALGORITHM}"
-    if [ -n "$SPECIAL_PARAMS" ]; then
-        echo "  参数: ${SPECIAL_PARAMS}"
-    fi
-    
-    # 解析特殊参数
-    MINI_BATCH_SIZE="32"  # 默认值（会被算法逻辑覆盖）
-    SDPO_ALPHA="0.5"  # 默认 Jensen-Shannon
-    SDPO_DONT_REPROMPT="True"
-    ADV_MODE="self_teacher"
-    BETA="0.7"
-    EMA_ALPHA="0.9"
-    CLIP_VALUE="5.0"
-    
-    if [[ "$SPECIAL_PARAMS" == *"mini_batch_size="* ]]; then
-        MINI_BATCH_SIZE=$(echo "$SPECIAL_PARAMS" | sed -n 's/.*mini_batch_size=\([0-9]*\).*/\1/p')
-    fi
-    if [[ "$SPECIAL_PARAMS" == *"alpha="* ]]; then
-        SDPO_ALPHA=$(echo "$SPECIAL_PARAMS" | sed -n 's/.*alpha=\([0-9.]*\).*/\1/p')
-    fi
-    if [[ "$SPECIAL_PARAMS" == *"dont_reprompt="* ]]; then
-        SDPO_DONT_REPROMPT=$(echo "$SPECIAL_PARAMS" | sed -n 's/.*dont_reprompt=\([A-Za-z]*\).*/\1/p')
-    fi
-    if [[ "$SPECIAL_PARAMS" == *"beta="* ]]; then
-        BETA=$(echo "$SPECIAL_PARAMS" | sed -n 's/.*beta=\([0-9.]*\).*/\1/p')
-    fi
-    if [[ "$SPECIAL_PARAMS" == *"ema_alpha="* ]]; then
-        EMA_ALPHA=$(echo "$SPECIAL_PARAMS" | sed -n 's/.*ema_alpha=\([0-9.]*\).*/\1/p')
-    fi
-    if [[ "$SPECIAL_PARAMS" == *"clip_value="* ]]; then
-        CLIP_VALUE=$(echo "$SPECIAL_PARAMS" | sed -n 's/.*clip_value=\([0-9.]*\).*/\1/p')
-    fi
+    echo "  ALGORITHM: self_teacher"
+    echo "  BETA: ${BETA}"
+    echo "  EMA_ALPHA: ${EMA_ALPHA}"
+    echo "  CLIP_VALUE: ${CLIP_VALUE}"
     
     # 构建环境变量
     export DATASET="$DATASET"
-    export ALGORITHM="$ALGORITHM"
+    export ALGORITHM="self_teacher"
     export MODEL_PATH="$MODEL_PATH"
     export LR="$LR"
-    export ENTROPY_COEFF="$ENTROPY_COEFF"
     export SEED="$SEED"
     export TRAIN_BATCH_SIZE="$TRAIN_BATCH_SIZE"
     export GEN_BATCH_SIZE="$GEN_BATCH_SIZE"
-    export MINI_BATCH_SIZE="$MINI_BATCH_SIZE"
-    export ROLLOUT_N="$ROLLOUT_N"
-    export ROLLOUT_TEMPERATURE="$ROLLOUT_TEMPERATURE"
-    export REPETITION_PENALTY="$REPETITION_PENALTY"
-    export CLIP_RATIO_HIGH="$CLIP_RATIO_HIGH"
-    export SDPO_ALPHA="$SDPO_ALPHA"
-    export SDPO_DONT_REPROMPT="$SDPO_DONT_REPROMPT"
-    export ADV_MODE="$ADV_MODE"
     export BETA="$BETA"
     export EMA_ALPHA="$EMA_ALPHA"
     export CLIP_VALUE="$CLIP_VALUE"
+    export ROLLOUT_N="$ROLLOUT_N"
     export JOB_NAME="$JOB_NAME"
     export PROJECT_NAME="$PROJECT_NAME"
     export GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
@@ -164,21 +123,13 @@ for EXP in "${EXPERIMENTS[@]}"; do
         --env OSS_ENDPOINT=$OSS_ENDPOINT \
         --env OSS_BUCKET=$OSS_BUCKET \
         --env DATASET=$DATASET \
-        --env ALGORITHM=$ALGORITHM \
+        --env ALGORITHM=self_teacher \
         --env MODEL_PATH=$MODEL_PATH \
         --env LR=$LR \
-        --env ENTROPY_COEFF=$ENTROPY_COEFF \
         --env SEED=$SEED \
         --env TRAIN_BATCH_SIZE=$TRAIN_BATCH_SIZE \
         --env GEN_BATCH_SIZE=$GEN_BATCH_SIZE \
-        --env MINI_BATCH_SIZE=$MINI_BATCH_SIZE \
         --env ROLLOUT_N=$ROLLOUT_N \
-        --env ROLLOUT_TEMPERATURE=$ROLLOUT_TEMPERATURE \
-        --env REPETITION_PENALTY=$REPETITION_PENALTY \
-        --env CLIP_RATIO_HIGH=$CLIP_RATIO_HIGH \
-        --env SDPO_ALPHA=$SDPO_ALPHA \
-        --env SDPO_DONT_REPROMPT=$SDPO_DONT_REPROMPT \
-        --env ADV_MODE=$ADV_MODE \
         --env BETA=$BETA \
         --env EMA_ALPHA=$EMA_ALPHA \
         --env CLIP_VALUE=$CLIP_VALUE \

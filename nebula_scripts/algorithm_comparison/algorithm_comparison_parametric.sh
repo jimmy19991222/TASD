@@ -9,20 +9,17 @@ OSS_ROOT="/data/oss_bucket_0/ad/loujieming.ljm"
 
 # ── 必需参数 ─────────────────────────────────────────────────────────────
 : "${DATASET:?DATASET is not set}"
-: "${ALGORITHM:?ALGORITHM is not set}"  # grpo | sdpo | fipo | self_teacher
+: "${ALGORITHM:?ALGORITHM is not set}"  # grpo | sdpo | fipo | dapo | self_teacher
 : "${MODEL_PATH:?MODEL_PATH is not set}"
 
 # ── 可选参数（有默认值）─────────────────────────────────────────────────
+# 注意：仅设置原始论文实验中明确指定的参数，其余使用配置文件默认值
 LR="${LR:-1e-5}"
-ENTROPY_COEFF="${ENTROPY_COEFF:-0.001}"
 SEED="${SEED:-42}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"
 GEN_BATCH_SIZE="${GEN_BATCH_SIZE:-32}"
-MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-32}"
+# MINI_BATCH_SIZE 由下方算法逻辑自动设置
 ROLLOUT_N="${ROLLOUT_N:-8}"
-ROLLOUT_TEMPERATURE="${ROLLOUT_TEMPERATURE:-1.0}"
-REPETITION_PENALTY="${REPETITION_PENALTY:-1.05}"
-CLIP_RATIO_HIGH="${CLIP_RATIO_HIGH:-0.28}"
 
 # ── 算法特定参数 ─────────────────────────────────────────────────────
 # SDPO 参数（论文 Table 3）
@@ -42,9 +39,9 @@ DISTILL_TOPK="${DISTILL_TOPK:-256}"
 DISTILL_TEMPERATURE="${DISTILL_TEMPERATURE:-1.0}"
 
 # ── Mini-batch size（根据算法自动设置）────────────────────────────
-# GRPO/FIPO: off-policy，小 mini-batch 多步更新
+# GRPO/FIPO/DAPO: off-policy，小 mini-batch 多步更新
 # SDPO/Self-Teacher: on-policy，单步更新（mini_batch = train_batch）
-if [[ "$ALGORITHM" == "grpo" || "$ALGORITHM" == "fipo" ]]; then
+if [[ "$ALGORITHM" == "grpo" || "$ALGORITHM" == "fipo" || "$ALGORITHM" == "dapo" ]]; then
     MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-8}"
 else
     MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-32}"
@@ -99,7 +96,7 @@ rm -rf ~/.ray 2>/dev/null || true
 sleep 3
 
 # ── 配置预检 ────────────────────────────────────────────────────────────
-VALID_ALG="grpo sdpo fipo self_teacher"
+VALID_ALG="grpo sdpo fipo dapo self_teacher"
 if ! echo "$VALID_ALG" | grep -qw "$ALGORITHM"; then
     echo "❌ 错误: ALGORITHM='$ALGORITHM' 无效"
     echo "   有效值: $VALID_ALG"
@@ -111,9 +108,9 @@ echo "算法对比实验配置："
 echo "  ALGORITHM: ${ALGORITHM}"
 echo "  DATASET: ${DATASET}"
 echo "  MODEL: ${model_path}"
-echo "  LR: ${LR}, ENTROPY_COEFF: ${ENTROPY_COEFF}"
-echo "  ROLLOUT_N: ${ROLLOUT_N}, TEMPERATURE: ${ROLLOUT_TEMPERATURE}"
-echo "  CLIP_RATIO_HIGH: ${CLIP_RATIO_HIGH}"
+echo "  LR: ${LR}"
+echo "  ROLLOUT_N: ${ROLLOUT_N}"
+echo "  MINI_BATCH_SIZE: ${MINI_BATCH_SIZE}"
 echo "============================================"
 
 # ── 根据算法选择配置文件和参数 ──────────────────────────────────────────
@@ -142,6 +139,15 @@ case "$ALGORITHM" in
         EXTRA_ARGS="
     algorithm.adv_estimator=fipo"
         echo "  → FIPO (off-policy, mini_batch=${MINI_BATCH_SIZE})"
+        ;;
+    
+    dapo)
+        # DAPO: clip-higher + entropy coefficient（off-policy）
+        CONFIG_NAME="dapo"
+        EXTRA_ARGS="
+    actor_rollout_ref.actor.entropy_coeff=0.001 \
+    actor_rollout_ref.actor.clip_ratio_high=10000"
+        echo "  → DAPO (off-policy, mini_batch=${MINI_BATCH_SIZE}, clip-higher)"
         ;;
     
     self_teacher)
@@ -179,16 +185,12 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.lr=${LR} \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     actor_rollout_ref.actor.ppo_mini_batch_size=${MINI_BATCH_SIZE} \
-    actor_rollout_ref.actor.entropy_coeff=${ENTROPY_COEFF} \
-    actor_rollout_ref.actor.clip_ratio_high=${CLIP_RATIO_HIGH} \
     actor_rollout_ref.actor.data_loader_seed=${SEED} \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.rollout.n=${ROLLOUT_N} \
     actor_rollout_ref.rollout.val_kwargs.n=16 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
-    actor_rollout_ref.rollout.repetition_penalty=${REPETITION_PENALTY} \
-    actor_rollout_ref.rollout.temperature=${ROLLOUT_TEMPERATURE} \
     actor_rollout_ref.rollout.seed=${SEED} \
     algorithm.rollout_correction.rollout_is=token \
     algorithm.rollout_correction.rollout_is_threshold=2.0 \
