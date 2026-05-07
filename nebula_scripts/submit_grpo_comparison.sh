@@ -34,12 +34,13 @@ if [ $# -gt 0 ] && [[ "$1" == "--dry-run" ]]; then
 fi
 
 # =============================================================================
-# 实验矩阵（GRPO off-policy 配置）
+# 实验矩阵（GRPO off-policy 和 on-policy 配置）
 # =============================================================================
 
 declare -a EXPERIMENTS=(
-    # mini_batch_size | 实验标签
-    "8|grpo_offpolicy_mbs8"
+    # mini_batch_size | 更新步数 | 实验标签
+    "8|4|grpo_offpolicy_mbs8"
+    "32|1|grpo_onpolicy_mbs32"
 )
 
 # ── 共享超参（仅包含原始论文实验中明确指定的参数）────────────────────────
@@ -58,7 +59,8 @@ echo "============================================"
 echo "GRPO Baseline 实验提交"
 echo "============================================"
 echo "实验数量: ${#EXPERIMENTS[@]}"
-echo "  - GRPO: off-policy, mini_batch=8 (论文参数)"
+echo "  - GRPO (off-policy): mini_batch=8, 4步更新 (32/8)"
+echo "  - GRPO (on-policy): mini_batch=32, 1步更新 (32/32)"
 echo "数据集: ${DATASET}"
 echo "模型: Qwen3-8B"
 echo "SwanLab组: Algorithm-Comparison-v1"
@@ -68,7 +70,7 @@ TASK_IDS=()
 FAILED=0
 
 for EXP in "${EXPERIMENTS[@]}"; do
-    IFS='|' read -r MINI_BATCH_SIZE EXP_LABEL <<< "$EXP"
+    IFS='|' read -r MINI_BATCH_SIZE NUM_UPDATES EXP_LABEL <<< "$EXP"
     
     JOB_NAME="grpo_${EXP_LABEL}"
     
@@ -77,6 +79,7 @@ for EXP in "${EXPERIMENTS[@]}"; do
     echo "提交实验: ${JOB_NAME}"
     echo "  ALGORITHM: grpo"
     echo "  MINI_BATCH_SIZE: ${MINI_BATCH_SIZE}"
+    echo "  更新步数: ${NUM_UPDATES} (train_batch=32 / mini_batch=${MINI_BATCH_SIZE})"
     
     # 构建环境变量
     export DATASET="$DATASET"
