@@ -37,7 +37,23 @@ algorithm:
   adv_estimator: tasd
   norm_adv_by_std_in_grpo: False
   tasd:
-    # ── 核心参数（清爽版）────────────────────────────────────
+    # ── Advantage 模式选择 ─────────────────────────────
+    # "grpo" (默认): 使用 GRPO seq-level advantage + 归一化
+    # "self_teacher": 使用纯 teacher advantage (Q_t - V_t)，无需归一化
+    adv_mode: "grpo"
+    
+    # ── Self-Teacher Advantage 配置 ────────────────────
+    # 仅 adv_mode="self_teacher" 时生效
+    beta: 0.7                     # V_CE vs V_EMA 融合系数
+                                  # 1.0 = 纯 V_CE（最安全，variance reduction 最优）
+                                  # 0.7 = 推荐默认值（V_CE 主导，V_EMA 辅助）
+                                  # 0.5 = 等权融合（信号最强）
+                                  # 0.0 = 纯 V_EMA（不稳定，不推荐单独使用）
+    ema_alpha: 0.9                # V_EMA 衰减系数（half-life ≈ 6.6 tokens）
+    clip_value: 5.0               # advantage clipping 阈值（数值保护）
+    
+    # ── 核心参数（GRPO 模式）────────────────────────────
+    # adv_mode="grpo" 时使用
     reward_type: "teacher_prob"     # "teacher_prob" | "teacher_log_prob"
     
     # ── entropy gate: 熵门控，筛选有效训练信号 ──────────────────

@@ -2457,6 +2457,80 @@ def compute_tasd_token_rewards(
 
 
 @register_adv_est(AdvantageEstimator.TASD)
+def compute_self_teacher_advantage(
+    teacher_log_probs: torch.Tensor,          # (B, T) teacher 对 generated token 的 log prob
+    student_topk_log_probs: torch.Tensor,     # (B, T, K) student 的 top-K log probs
+    student_topk_indices: torch.Tensor,       # (B, T, K) student 的 top-K token ids
+    teacher_at_student_topk: torch.Tensor,    # (B, T, K) teacher 在 student top-K 位置的 log probs
+    response_mask: torch.Tensor,              # (B, T) valid token mask
+    beta: float = 0.7,                        # V_CE vs V_EMA 融合系数
+    ema_alpha: float = 0.9,                   # EMA 衰减系数
+    clip_value: float = 5.0,                  # advantage 上下界
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Self-Teacher Advantage with Bidirectional Baselines
+    
+    核心公式：
+        Q_t = log π_teacher(y_t | x, f, y_{<t})  # teacher 对实际 token 的评分
+        V_CE_t = Σ π_student(a_k) · log π_teacher(a_k)  # 横向 baseline
+        V_EMA_t = α·V_EMA_{t-1} + (1-α)·Q_{t-1}  # 纵向 baseline
+        V_t = β·V_CE + (1-β)·V_EMA
+        A_t = Q_t - V_t
+    
+    特点：
+        - 无需 z-score 归一化，teacher≈student 时 A_t≈0 自然安全退化
+        - 无需 entropy gate，无需 token filter
+        - V_CE 保证 variance reduction 理论最优
+        - V_EMA 捕捉 response 内质量转折和 context pollution
+    
+    Args:
+        teacher_log_probs: (B, T) teacher 对实际生成 token 的 log prob
+        student_topk_log_probs: (B, T, K) student 的 top-K log probs
+        student_topk_indices: (B, T, K) student 的 top-K token ids
+        teacher_at_student_topk: (B, T, K) teacher 在 student top-K 位置的 log probs
+        response_mask: (B, T) valid token mask
+        beta: V_CE vs V_EMA 融合系数 [0, 1]
+        ema_alpha: EMA 衰减系数
+        clip_value: advantage clipping 阈值
+    
+    Returns:
+        advantages: (B, T) token-level advantage
+        filtered_response_mask: (B, T) 与 response_mask 相同（self_teacher 模式不过滤 token）
+    """
+    B, T, K = student_topk_log_probs.shape
+    
+    # ===== Q_t: teacher 对实际选择的评分 =====
+    Q = teacher_log_probs  # (B, T)
+    
+    # ===== V_CE: 横向 baseline（cross-entropy） =====
+    # V_CE_t = E_student[teacher(·)] = Σ π_student(a_k) · log π_teacher(a_k)
+    student_probs = student_topk_log_probs.exp()  # (B, T, K)
+    student_probs_norm = student_probs / student_probs.sum(-1, keepdim=True).clamp(min=1e-8)
+    V_CE = (student_probs_norm * teacher_at_student_topk).sum(-1)  # (B, T)
+    
+    # ===== V_EMA: 纵向 baseline（causal EMA） =====
+    V_EMA = torch.zeros_like(Q)  # (B, T)
+    V_EMA[:, 0] = Q[:, 0]
+    for t in range(1, T):
+        V_EMA[:, t] = ema_alpha * V_EMA[:, t-1] + (1 - ema_alpha) * Q[:, t-1]
+    
+    # ===== 融合 baseline =====
+    V = beta * V_CE + (1 - beta) * V_EMA  # (B, T)
+    
+    # ===== Raw advantage =====
+    A = Q - V  # (B, T)
+    
+    # ===== Per-response mean-centering（消除 prompt 难度差异，不除 std） =====
+    A_masked = A * response_mask
+    seq_means = A_masked.sum(-1, keepdim=True) / response_mask.sum(-1, keepdim=True).clamp(min=1)
+    A = (A - seq_means) * response_mask
+    
+    # ===== Clipping（数值保护） =====
+    A = torch.clamp(A, -clip_value, clip_value)
+    
+    return A, response_mask  # advantages, filtered_response_mask
+
+
 def compute_tasd_advantage(
     token_level_rewards: torch.Tensor,
     response_mask: torch.Tensor,
@@ -2466,12 +2540,20 @@ def compute_tasd_advantage(
     gate_mask: Optional[torch.Tensor] = None,  # (B, T) bool，entropy gate 后有效位置
     teacher_entropy_norm: Optional[torch.Tensor] = None,  # (B, T) teacher 归一化熵
     student_entropy_norm: Optional[torch.Tensor] = None,  # (B, T) student 归一化熵
+    teacher_log_probs: Optional[torch.Tensor] = None,  # (B, T) teacher log probs on response tokens
+    student_topk_log_probs: Optional[torch.Tensor] = None,  # (B, T, K) student top-K log probs
+    student_topk_indices: Optional[torch.Tensor] = None,  # (B, T, K) student top-K token ids
+    teacher_at_student_topk: Optional[torch.Tensor] = None,  # (B, T, K) teacher at student top-K
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     TASD advantage 计算（清爽版）。
     
-    特点：
+    支持两种模式：
+    - adv_mode="grpo" (默认): GRPO seq-level advantage + 归一化
+    - adv_mode="self_teacher": 纯 teacher advantage (Q_t - V_t)，无需归一化
+    
+    GRPO 模式特点：
     - group_mean 归一化，可选 group_std 归一化（norm_adv_by_std）
     - adv_std_floor：std 下界，防止 group_std 过小导致 adv 爆炸
         - float: 直接使用该值作为 floor
@@ -2495,6 +2577,10 @@ def compute_tasd_advantage(
         gate_mask: (B, T) bool，entropy gate 后保留的 token（hard/soft 模式）
         teacher_entropy_norm: (B, T) teacher 归一化熵（adv_entropy_weight 需要）
         student_entropy_norm: (B, T) student 归一化熵（adv_entropy_weight 需要）
+        teacher_log_probs: (B, T) teacher log probs on response tokens (self_teacher 模式需要)
+        student_topk_log_probs: (B, T, K) student top-K log probs (self_teacher 模式需要)
+        student_topk_indices: (B, T, K) student top-K token ids (self_teacher 模式需要)
+        teacher_at_student_topk: (B, T, K) teacher at student top-K (self_teacher 模式需要)
     
     Returns:
         advantages: (B, T)
@@ -2504,6 +2590,28 @@ def compute_tasd_advantage(
     """
     # 读取配置
     tasd_cfg = config.get("tasd", {}) if config else {}
+    adv_mode = tasd_cfg.get("adv_mode", "grpo")  # "grpo" | "self_teacher"
+    
+    # ── Self-Teacher Advantage 模式 ─────────────────────────────
+    if adv_mode == "self_teacher":
+        beta = tasd_cfg.get("beta", 0.7)
+        ema_alpha = tasd_cfg.get("ema_alpha", 0.9)
+        clip_value = tasd_cfg.get("clip_value", 5.0)
+        
+        print(f"[Self-Teacher Adv] mode=self_teacher, beta={beta}, ema_alpha={ema_alpha}, clip={clip_value}")
+        
+        return compute_self_teacher_advantage(
+            teacher_log_probs=teacher_log_probs,
+            student_topk_log_probs=student_topk_log_probs,
+            student_topk_indices=student_topk_indices,
+            teacher_at_student_topk=teacher_at_student_topk,
+            response_mask=response_mask,
+            beta=beta,
+            ema_alpha=ema_alpha,
+            clip_value=clip_value,
+        )
+    
+    # ── GRPO Advantage 模式（原有逻辑） ─────────────────────────
     clip_adv = tasd_cfg.get("clip_adv", True)
     clip_adv_value = tasd_cfg.get("clip_adv_value", 2.0)
     norm_adv_by_std = tasd_cfg.get("norm_adv_by_std", False)

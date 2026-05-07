@@ -355,6 +355,11 @@ def compute_advantage(
         teacher_entropy_norm = data.batch.get("tasd_teacher_entropy_norm", None)
         student_entropy_norm = data.batch.get("tasd_student_entropy_norm", None)
 
+        # self-teacher advantage 需要的参数
+        teacher_log_probs = data.batch.get("tasd_teacher_log_probs", None)
+        student_topk_log_probs = data.batch.get("tasd_student_topk_log_probs", None)
+        teacher_at_student_topk = data.batch.get("tasd_teacher_at_student_topk", None)
+
         advantages, returns, filtered_response_mask = core_algos.compute_tasd_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
             response_mask=data.batch["response_mask"],
@@ -364,6 +369,10 @@ def compute_advantage(
             gate_mask=gate_mask,
             teacher_entropy_norm=teacher_entropy_norm,
             student_entropy_norm=student_entropy_norm,
+            teacher_log_probs=teacher_log_probs,
+            student_topk_log_probs=student_topk_log_probs,
+            student_topk_indices=None,  # 不需要（已有 teacher_at_student_topk）
+            teacher_at_student_topk=teacher_at_student_topk,
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
@@ -2155,6 +2164,19 @@ class RayPPOTrainer:
                                 batch.batch["tasd_teacher_entropy_norm"] = teacher_entropy_norm
                             if student_entropy_norm is not None:
                                 batch.batch["tasd_student_entropy_norm"] = student_entropy_norm
+
+                            # ── 保存 self-teacher advantage 需要的参数 ────────────────────
+                            # teacher_log_probs_on_response: (B, T) teacher 对实际 token 的评分
+                            batch.batch["tasd_teacher_log_probs"] = teacher_result.batch["teacher_log_probs_on_response"]
+                            # student_topk_log_probs: (B, T, K) student 的 top-K log probs
+                            if "student_topk_log_probs" in teacher_result.batch:
+                                batch.batch["tasd_student_topk_log_probs"] = teacher_result.batch["student_topk_log_probs"]
+                            # teacher_topk_log_probs: (B, T, K) teacher 在 student top-K 位置的 log probs
+                            if "teacher_topk_log_probs" in teacher_result.batch:
+                                batch.batch["tasd_teacher_at_student_topk"] = teacher_result.batch["teacher_topk_log_probs"]
+                            # student_topk_indices: 需要从 student forward 获取
+                            # 注意：当前 teacher forward 没有返回 student_topk_indices
+                            # 但 compute_self_teacher_advantage 不需要它（已经有 teacher_at_student_topk）
 
                             # ── 记录 TASD token reward 指标 ─────────────────────────────
                             response_mask_bool = batch.batch["response_mask"].bool()

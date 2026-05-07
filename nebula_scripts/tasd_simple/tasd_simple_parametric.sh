@@ -44,6 +44,11 @@ INCLUDE_SUCCESSFUL_ROLLOUTS="${INCLUDE_SUCCESSFUL_ROLLOUTS:-True}"
 FILTER_GROUPS_ENABLE="${FILTER_GROUPS_ENABLE:-false}"  # 是否启用 filter_groups
 FILTER_GROUPS_METRIC="${FILTER_GROUPS_METRIC:-acc}"    # 过滤指标：acc / seq_reward / seq_final_reward
 FILTER_GROUPS_MAX_GEN="${FILTER_GROUPS_MAX_GEN:-0}"    # 最大重采样次数，0=不限制
+# ── Self-Teacher Advantage 配置 ─────────────────────────────────────
+ADV_MODE="${ADV_MODE:-grpo}"           # grpo | self_teacher
+BETA="${BETA:-0.7}"                    # V_CE vs V_EMA 融合系数
+EMA_ALPHA="${EMA_ALPHA:-0.9}"          # V_EMA 衰减系数
+CLIP_VALUE="${CLIP_VALUE:-5.0}"        # self_teacher advantage clipping 阈值
 
 # ── 路径 ────────────────────────────────────────────────────────────────
 train_data_path="${OSS_ROOT}/datasets/${DATASET}/train.parquet"
@@ -109,6 +114,10 @@ echo "  ROLLOUT_TEMPERATURE: ${ROLLOUT_TEMPERATURE}, DISTILL_TEMPERATURE: ${DIST
 echo "  ADV_ENTROPY_WEIGHT: ${ADV_ENTROPY_WEIGHT}"
 echo "  FILTER_GROUPS: enable=${FILTER_GROUPS_ENABLE}, metric=${FILTER_GROUPS_METRIC}, max_gen=${FILTER_GROUPS_MAX_GEN}"
 echo "  DISTILL_TOPK: ${DISTILL_TOPK}"
+echo "  ADV_MODE: ${ADV_MODE}"
+if [ "$ADV_MODE" = "self_teacher" ]; then
+    echo "  BETA: ${BETA}, EMA_ALPHA: ${EMA_ALPHA}, CLIP_VALUE: ${CLIP_VALUE}"
+fi
 echo "  SEED: ${SEED}"
 echo "============================================"
 
@@ -138,6 +147,10 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.repetition_penalty=${REPETITION_PENALTY} \
     actor_rollout_ref.rollout.temperature=${ROLLOUT_TEMPERATURE} \
     actor_rollout_ref.rollout.seed=${SEED} \
+    algorithm.tasd.adv_mode=${ADV_MODE} \
+    algorithm.tasd.beta=${BETA} \
+    algorithm.tasd.ema_alpha=${EMA_ALPHA} \
+    algorithm.tasd.clip_value=${CLIP_VALUE} \
     algorithm.tasd.reward_type=${REWARD_TYPE} \
     algorithm.tasd.entropy_gate=${ENTROPY_GATE} \
     algorithm.tasd.entropy_gate_ratio=${ENTROPY_GATE_RATIO} \
