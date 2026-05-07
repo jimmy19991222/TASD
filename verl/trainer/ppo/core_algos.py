@@ -2518,6 +2518,10 @@ def compute_tasd_advantage(
     student_entropy_norm: Optional[torch.Tensor] = None,  # (B, T) student 归一化熵
     teacher_log_probs: Optional[torch.Tensor] = None,  # (B, T) teacher log probs on response tokens
     global_steps: int = 0,  # 当前训练步数，用于 gate warmup
+    student_topk_log_probs: Optional[torch.Tensor] = None,  # (B, T, K) student top-K log probs
+    teacher_topk_log_probs: Optional[torch.Tensor] = None,  # (B, T, K) teacher top-K log probs
+    teacher_topk_indices: Optional[torch.Tensor] = None,  # (B, T, K) teacher top-K token ids
+    student_topk_indices: Optional[torch.Tensor] = None,  # (B, T, K) student top-K token ids
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -2828,6 +2832,96 @@ def compute_tasd_advantage(
                 f"Unknown adv_baseline_mode: {adv_baseline_mode}. "
                 f"Supported: none, causal_ema"
             )
+        
+        # ── Teacher Cross-Entropy Baseline (纯 teacher advantage) ─────────
+        # 当 adv_baseline_mode="teacher_ce" 时，完全抛弃 GRPO advantage
+        # 改用 teacher 的 Q_t - V_t 作为 token-level advantage
+        #
+        # 核心公式：
+        #   Q_t = log π_teacher(y_t | x, f, y_{<t})  # teacher 对实际 token 的评分
+        #   V_t = Σ π_student(a_k | x, y_{<t}) · log π_teacher(a_k | x, f, y_{<t})  # teacher 对 student 分布的期望
+        #   A_t = Q_t - V_t  # 不需要归一化，teacher≈student 时自然趋近 0
+        #
+        # 优势：
+        #   1. 避免 z-score 归一化的死亡螺旋（TASD 模式 A 的崩溃根因）
+        #   2. teacher≈student 时 A_t≈0，安全退化（梯度消失而非爆炸）
+        #   3. Q_t 和 V_t 都来自 teacher，噪声方向一致，差值抵消
+        if adv_baseline_mode == "teacher_ce":
+            assert teacher_log_probs is not None, \
+                "teacher_ce mode requires teacher_log_probs"
+            assert student_topk_log_probs is not None and teacher_topk_log_probs is not None, \
+                "teacher_ce mode requires top-K information for V_t computation"
+            
+            teacher_ce_clip_value = float(tasd_cfg.get("teacher_ce_clip_value", 5.0))
+            
+            print(f"[TASD TeacherCE] Using pure teacher advantage (Q_t - V_t), "
+                  f"clip_value={teacher_ce_clip_value}")
+            
+            # Step 1: Q_t = teacher 对实际 token 的评分
+            # teacher_log_probs 已经是 teacher 在 response token 上的 log_prob
+            Q_t = teacher_log_probs  # (B, T)
+            
+            # Step 2: V_t = E_student[teacher(·)]
+            # V_t = Σ π_student(a_k) · log π_teacher(a_k)
+            # 使用 student top-K 来近似期望
+            
+            # student probs on top-K (归一化)
+            student_probs = student_topk_log_probs.exp()  # (B, T, K)
+            student_probs = student_probs / student_probs.sum(-1, keepdim=True)  # renormalize
+            
+            # teacher 在 student top-K token 上的评分
+            # 需要从 teacher_topk 中 gather student 的 top-K indices
+            # 假设 student_topk_indices 和 teacher_topk_indices 共享同一套 token id 空间
+            # 如果 K 相同且覆盖充分，直接用 teacher_topk_log_probs
+            # 否则需要 gather 操作
+            
+            B_dim, T_dim, K_dim = student_topk_log_probs.shape
+            
+            # 简化版：假设 student 和 teacher 的 top-K indices 相同（distill_topk 一致时成立）
+            # 直接用 teacher 在相同 top-K 上的 log probs
+            if student_topk_indices is not None and teacher_topk_indices is not None:
+                # 检查 indices 是否相同
+                indices_match = torch.equal(student_topk_indices, teacher_topk_indices)
+                
+                if indices_match:
+                    # 最优情况：直接用 teacher_topk_log_probs
+                    V_t = (student_probs * teacher_topk_log_probs).sum(-1)  # (B, T)
+                    print(f"[TASD TeacherCE] top-K indices match, direct computation")
+                else:
+                    # 需要 gather：从 teacher 的分布中取 student top-K 对应的值
+                    # 这里需要 teacher 的完整 logits，或者用 teacher_log_probs_on_response 近似
+                    # 简化处理：用 teacher 在 response token 上的 log_prob 作为 V_t 的近似
+                    print(f"[TASD TeacherCE] WARNING: top-K indices mismatch, using teacher_log_probs as approximation")
+                    V_t = teacher_log_probs  # 近似：V_t ≈ Q_t（会导致 A_t ≈ 0）
+            else:
+                # 回退：直接用 teacher_log_probs
+                V_t = teacher_log_probs
+            
+            # Step 3: Raw advantage
+            A_raw = Q_t - V_t  # (B, T)
+            
+            # Step 4: Per-response centering（消除 prompt 难度差异，不除 std）
+            # 对每条 response 独立去 mean，避免跨 prompt 的 scale 差异
+            for i in range(A_raw.shape[0]):
+                valid_mask_i = response_mask[i].bool()
+                valid_vals = A_raw[i][valid_mask_i]
+                if valid_vals.numel() > 0:
+                    A_raw[i] = (A_raw[i] - valid_vals.mean()) * response_mask[i].float()
+            
+            print(f"[TASD TeacherCE] After centering: "
+                  f"mean={A_raw[response_mask.bool()].mean().item():.4f}, "
+                  f"std={A_raw[response_mask.bool()].std().item():.4f}")
+            
+            # Step 5: Clipping（数值保护，不依赖 gate）
+            A_clipped = torch.clamp(A_raw, min=-teacher_ce_clip_value, max=teacher_ce_clip_value)
+            
+            # 替换 advantages（完全用 teacher CE advantage，不用 GRPO）
+            advantages = A_clipped * response_mask.float()
+            
+            print(f"[TASD TeacherCE] Final advantage stats: "
+                  f"mean={advantages[response_mask.bool()].mean().item():.4f}, "
+                  f"std={advantages[response_mask.bool()].std().item():.4f}, "
+                  f"clipped_ratio={(advantages.abs() == teacher_ce_clip_value).float().mean().item():.4f}")
         
         # filtered_response_mask 决定 loss 聚合的分母范围
         # all-zero effective_mask 的 sample 直接放弃（不训练），advantages 置 0

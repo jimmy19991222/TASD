@@ -113,6 +113,14 @@ algorithm:
     causal_ema_alpha: 0.021             # EMA 衰减系数（仅 causal_ema 模式生效）
                                         # α=0.021 ≈ τ=32 (FIPO 默认)
                                         # α=0.09  ≈ τ=7  (快速衰减)
+    
+    # ── teacher cross-entropy baseline ─────────────────────
+    # 纯 teacher advantage，不需要 seq-level GRPO advantage
+    # A_t = Q_t - V_t
+    # Q_t = teacher_log_probs_on_response  # teacher 对实际 token 的评分
+    # V_t = E_student[teacher(·)] = Σ π_student(a_k) · log π_teacher(a_k)
+    # 优势：无需归一化，teacher≈student 时 A_t≈0 自然安全退化
+    teacher_ce_clip_value: 5.0            # advantage clipping 阈值
   # ── DAPO 动态采样（Dynamic Sampling / Group Filtering）──────────────
   # 过滤全对/全错的 group，只保留有区分度的 group 参与训练
   filter_groups:

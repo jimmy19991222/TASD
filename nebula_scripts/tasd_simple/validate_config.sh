@@ -32,7 +32,7 @@ if ! echo "$VALID_AEW" | grep -qw "$ADV_ENTROPY_WEIGHT"; then
 fi
 
 # 3b. 检查 adv_baseline_mode 值是否有效
-VALID_ABM="none causal_ema"
+VALID_ABM="none causal_ema teacher_ce"
 if ! echo "$VALID_ABM" | grep -qw "$ADV_BASELINE_MODE"; then
     echo "❌ 错误: adv_baseline_mode='$ADV_BASELINE_MODE' 无效"
     echo "   有效值: $VALID_ABM"

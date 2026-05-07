@@ -1,21 +1,25 @@
 #!/bin/bash
 # =============================================================================
-# TASD Bidirectional Credit 实验
+# TASD Teacher Cross-Entropy Baseline 实验
 #
 # 核心思路：
-#   用 Causal EMA baseline 解决 context pollution 问题
-#   A_bidir_t = Q_t - V_t
-#   Q_t = teacher_log_prob (已有)
-#   V_t = causal_ema(Q_{<t})  # 用过去的位置平滑估计 baseline
+#   纯 teacher advantage，完全抛弃 GRPO seq-level advantage
+#   A_t = Q_t - V_t
+#   Q_t = teacher_log_probs_on_response
+#   V_t = E_student[teacher(·)] = Σ π_student(a_k) · log π_teacher(a_k)
 #
-# 实验矩阵（3 个）：
-#   1. noGate:  无 gate 对照（纯 outcome + teacher_prob 加权）
-#   2. gateWU:  gate + warmup baseline
-#   3. bidir:   gate + warmup + causal_ema baseline (τ=32)
+# 优势：
+#   1. 避免 z-score 归一化的死亡螺旋
+#   2. teacher≈student 时 A_t≈0，安全退化
+#   3. 无需 entropy gate，极简方案
+#
+# 实验矩阵（2 个）：
+#   1. teacherCE: 纯 teacher CE advantage（无 gate，无 GRPO）
+#   2. teacherCE_gate: teacher CE + entropy gate warmup（对照）
 #
 # 全部共享：
-#   REWARD_TYPE=outcome, gmSeq, clipAdv=2.0, ema=0.1, rep=1.05, ec=0.001
-#   GATE_WARMUP_STEPS=10
+#   REWARD_TYPE=outcome（仅用于构建 teacher context，不参与 advantage 计算）
+#   gmSeq, clipAdv=2.0, ema=0.1, rep=1.05, ec=0.001
 # =============================================================================
 
 # ── Nebula 账号配置 ──────────────────────────────────────────────────────
@@ -29,7 +33,7 @@ OSS_BUCKET="lazada-ai-model"
 CLUSTER_FILE="nebula_scripts/cluster.json"
 SCRIPT_PATH="nebula_scripts/tasd_simple/tasd_simple_parametric.sh"
 CUSTOM_DOCKER_IMAGE="${CUSTOM_DOCKER_IMAGE:-hub.docker.alibaba-inc.com/mdl/notebook_saved:loujieming.ljm_yueqiu_sdpo_env_torch260_20260324155942}"
-PROJECT_NAME="TASD-v5-bidir"
+PROJECT_NAME="TASD-v5-teacherCE"
 
 # ── 数据集 ───────────────────────────────────────────────────────────────
 DATASETS=(
@@ -74,12 +78,11 @@ ERROR_ANSWER_MAX_CHARS="1024"
 
 # =============================================================================
 # 实验矩阵
-# ADV_BASELINE_MODE | CAUSAL_EMA_ALPHA | ENTROPY_GATE | ADV_ENTROPY_WEIGHT | TAG
+# ADV_BASELINE_MODE | ENTROPY_GATE | ADV_ENTROPY_WEIGHT | TAG
 # =============================================================================
 declare -a EXPERIMENTS=(
-    "none|0.0|none|teacher_prob|noGate"
-    "none|0.0|hard_keep_reward|none|gateWU"
-    "causal_ema|0.021|hard_keep_reward|none|bidir_tau32"
+    "teacher_ce|none|none|teacherCE"
+    "teacher_ce|hard_keep_reward|none|teacherCE_gate"
 )
 
 GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
@@ -94,7 +97,7 @@ SUBMITTED=0
 for DATASET in "${DATASETS[@]}"; do
 for EXP_CFG in "${EXPERIMENTS[@]}"; do
 
-    IFS='|' read -r ADV_BASELINE_MODE CAUSAL_EMA_ALPHA ENTROPY_GATE ADV_ENTROPY_WEIGHT TAG <<< "$EXP_CFG"
+    IFS='|' read -r ADV_BASELINE_MODE ENTROPY_GATE ADV_ENTROPY_WEIGHT TAG <<< "$EXP_CFG"
 
     TOTAL=$((TOTAL + 1))
 
@@ -104,12 +107,12 @@ for EXP_CFG in "${EXPERIMENTS[@]}"; do
     MODEL_PATH="${OSS_ROOT}/base_models/${MODEL}"
 
     CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
-    JOB_NAME="TASD-${DATASET_SHORT}-bidir-${TAG}-topk256-gmSeq-clipAdv${CLIP_ADV_VALUE}-ema${TEACHER_UPDATE_RATE}-rep${REPETITION_PENALTY}-ec${ENTROPY_COEFF}-${MODEL_SHORT}-${CURRENT_TIME}"
+    JOB_NAME="TASD-${DATASET_SHORT}-${TAG}-topk256-gmSeq-clipAdv${CLIP_ADV_VALUE}-ema${TEACHER_UPDATE_RATE}-rep${REPETITION_PENALTY}-ec${ENTROPY_COEFF}-${MODEL_SHORT}-${CURRENT_TIME}"
 
     if [ "$DRY_RUN" = true ]; then
         echo "------------------------------------------------------------"
         echo "Job #${TOTAL}: ${JOB_NAME}"
-        echo "  ADV_BASELINE_MODE=${ADV_BASELINE_MODE} CAUSAL_EMA_ALPHA=${CAUSAL_EMA_ALPHA} ENTROPY_GATE=${ENTROPY_GATE} ADV_ENTROPY_WEIGHT=${ADV_ENTROPY_WEIGHT}"
+        echo "  ADV_BASELINE_MODE=${ADV_BASELINE_MODE} ENTROPY_GATE=${ENTROPY_GATE} ADV_ENTROPY_WEIGHT=${ADV_ENTROPY_WEIGHT}"
     else
         echo "提交 Job #${TOTAL}: ${JOB_NAME}"
 
@@ -118,7 +121,7 @@ for EXP_CFG in "${EXPERIMENTS[@]}"; do
             --engine=xdl \
             --queue=${QUEUE} \
             --entry=nebula_scripts/entry.py \
-            --user_params="--script_path=${SCRIPT_PATH} --world_size=${WORLD_SIZE} --job_name=${JOB_NAME} --env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=DATASET=${DATASET} --env=MODEL=${MODEL} --env=MODEL_PATH=${MODEL_PATH} --env=REWARD_TYPE=${REWARD_TYPE} --env=ENTROPY_GATE=${ENTROPY_GATE} --env=ENTROPY_GATE_RATIO=1.0 --env=CLIP_ADV=${CLIP_ADV} --env=CLIP_ADV_VALUE=${CLIP_ADV_VALUE} --env=DISTILL_TOPK=256 --env=REPETITION_PENALTY=${REPETITION_PENALTY} --env=LR=${LR} --env=SEED=${SEED} --env=ENTROPY_COEFF=${ENTROPY_COEFF} --env=ROLLOUT_TEMPERATURE=${TEMPERATURE} --env=TEACHER_REG=${TEACHER_REG} --env=TEACHER_UPDATE_RATE=${TEACHER_UPDATE_RATE} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=MINI_BATCH_SIZE=${MINI_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=INCLUDE_SUCCESSFUL_ROLLOUTS=${INCLUDE_SUCCESSFUL_ROLLOUTS} --env=NORM_ADV_BY_STD=${NORM_ADV_BY_STD} --env=ADV_STD_FLOOR=${ADV_STD_FLOOR} --env=ADV_ENTROPY_WEIGHT=${ADV_ENTROPY_WEIGHT} --env=GROUP_MEAN_MODE=${GROUP_MEAN_MODE} --env=CLIP_RATIO_HIGH=${CLIP_RATIO_HIGH} --env=FILTER_GROUPS_ENABLE=${FILTER_GROUPS_ENABLE} --env=FILTER_GROUPS_METRIC=${FILTER_GROUPS_METRIC} --env=FILTER_GROUPS_MAX_GEN=${FILTER_GROUPS_MAX_GEN} --env=TEACHER_CONTEXT_MODE=per_rollout --env=GATE_WARMUP_STEPS=${GATE_WARMUP_STEPS} --env=MAX_ERRORS_IN_POOL=${MAX_ERRORS_IN_POOL} --env=ERROR_ANSWER_MAX_CHARS=${ERROR_ANSWER_MAX_CHARS} --env=ERROR_POOL_FORMAT_ONLY=True --env=TOP_K_AGREEMENT_K=0 --env=ADV_BASELINE_MODE=${ADV_BASELINE_MODE} --env=CAUSAL_EMA_ALPHA=${CAUSAL_EMA_ALPHA} --env=GIT_BRANCH=${GIT_BRANCH} --env=GIT_COMMIT=${GIT_COMMIT} --env=DINGTALK_WEBHOOK=https://oapi.dingtalk.com/robot/send?access_token=f598ad33b071751bf79d2484d8e1acefe8df9d879e129cae40340a158854f9cb --env=DINGTALK_SECRET=SECc5b9e4f61f56b32b46abf1ecedc11bdcba10dc35fbba8fa0ff62c084a1cc6ad3" \
+            --user_params="--script_path=${SCRIPT_PATH} --world_size=${WORLD_SIZE} --job_name=${JOB_NAME} --env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=DATASET=${DATASET} --env=MODEL=${MODEL} --env=MODEL_PATH=${MODEL_PATH} --env=REWARD_TYPE=${REWARD_TYPE} --env=ENTROPY_GATE=${ENTROPY_GATE} --env=ENTROPY_GATE_RATIO=1.0 --env=CLIP_ADV=${CLIP_ADV} --env=CLIP_ADV_VALUE=${CLIP_ADV_VALUE} --env=DISTILL_TOPK=256 --env=REPETITION_PENALTY=${REPETITION_PENALTY} --env=LR=${LR} --env=SEED=${SEED} --env=ENTROPY_COEFF=${ENTROPY_COEFF} --env=ROLLOUT_TEMPERATURE=${TEMPERATURE} --env=TEACHER_REG=${TEACHER_REG} --env=TEACHER_UPDATE_RATE=${TEACHER_UPDATE_RATE} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=MINI_BATCH_SIZE=${MINI_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=INCLUDE_SUCCESSFUL_ROLLOUTS=${INCLUDE_SUCCESSFUL_ROLLOUTS} --env=NORM_ADV_BY_STD=${NORM_ADV_BY_STD} --env=ADV_STD_FLOOR=${ADV_STD_FLOOR} --env=ADV_ENTROPY_WEIGHT=${ADV_ENTROPY_WEIGHT} --env=GROUP_MEAN_MODE=${GROUP_MEAN_MODE} --env=CLIP_RATIO_HIGH=${CLIP_RATIO_HIGH} --env=FILTER_GROUPS_ENABLE=${FILTER_GROUPS_ENABLE} --env=FILTER_GROUPS_METRIC=${FILTER_GROUPS_METRIC} --env=FILTER_GROUPS_MAX_GEN=${FILTER_GROUPS_MAX_GEN} --env=TEACHER_CONTEXT_MODE=per_rollout --env=GATE_WARMUP_STEPS=${GATE_WARMUP_STEPS} --env=MAX_ERRORS_IN_POOL=${MAX_ERRORS_IN_POOL} --env=ERROR_ANSWER_MAX_CHARS=${ERROR_ANSWER_MAX_CHARS} --env=ERROR_POOL_FORMAT_ONLY=True --env=TOP_K_AGREEMENT_K=0 --env=ADV_BASELINE_MODE=${ADV_BASELINE_MODE} --env=CAUSAL_EMA_ALPHA=0.021 --env=GIT_BRANCH=${GIT_BRANCH} --env=GIT_COMMIT=${GIT_COMMIT} --env=DINGTALK_WEBHOOK=https://oapi.dingtalk.com/robot/send?access_token=f598ad33b071751bf79d2484d8e1acefe8df9d879e129cae40340a158854f9cb --env=DINGTALK_SECRET=SECc5b9e4f61f56b32b46abf1ecedc11bdcba10dc35fbba8fa0ff62c084a1cc6ad3" \
             --worker_count=${WORLD_SIZE} \
             --file.cluster_file=${CLUSTER_FILE} \
             --job_name=${JOB_NAME} \
