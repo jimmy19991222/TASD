@@ -23,6 +23,7 @@ __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, Optional
+import math
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -2783,6 +2784,50 @@ def compute_tasd_advantage(
             
             # 乘到 advantage 上（量级不变）
             advantages = advantages * entropy_w_normalized
+        
+        # ── Bidirectional Credit: Causal EMA Baseline ──────────────────────
+        # 用因果 EMA baseline 解决 context pollution 问题
+        # A_bidir_t = A_t - V_t
+        # V_t = α·V_{t-1} + (1-α)·A_{t-1}  （因果：只看过去的位置）
+        #
+        # 动机：
+        #   传统 outcome reward 会把整条 response 的 advantage 均匀分配给所有 token
+        #   但如果前面错了导致后面也错，后面 token 的 advantage 也会被错误地惩罚
+        #   Causal EMA 用"过去位置的平均表现"作为 baseline，隔离出 token 的真实贡献
+        #
+        # 参考 FIPO: τ=32 (half-life=32 tokens) → α = 1 - 2^{-1/32} ≈ 0.021
+        adv_baseline_mode = tasd_cfg.get("adv_baseline_mode", "none")
+        
+        if adv_baseline_mode == "causal_ema":
+            causal_ema_alpha = float(tasd_cfg.get("causal_ema_alpha", 0.021))
+            
+            print(f"[TASD Bidir] Applying causal EMA baseline: α={causal_ema_alpha:.4f} "
+                  f"(half-life ≈ {math.log(0.5)/math.log(causal_ema_alpha):.1f} tokens)")
+            
+            # 对每条 sample 独立计算 causal EMA baseline
+            B, T = advantages.shape
+            baseline = torch.zeros_like(advantages)  # (B, T)
+            
+            # V_0 = 0（第一个 token 没有历史）
+            # V_t = α·V_{t-1} + (1-α)·A_{t-1}  for t >= 1
+            for t in range(1, T):
+                baseline[:, t] = causal_ema_alpha * baseline[:, t-1] + (1.0 - causal_ema_alpha) * advantages[:, t-1]
+            
+            # A_bidir = A - V
+            advantages = advantages - baseline
+            
+            # Debug: 打印 baseline 统计
+            valid_adv = advantages[filtered_response_mask.bool()]
+            valid_base = baseline[filtered_response_mask.bool()]
+            print(f"[TASD Bidir] advantage stats after baseline subtraction: "
+                  f"mean={valid_adv.mean().item():.4f}, std={valid_adv.std().item():.4f}, "
+                  f"baseline_mean={valid_base.mean().item():.4f}")
+        
+        elif adv_baseline_mode != "none":
+            raise ValueError(
+                f"Unknown adv_baseline_mode: {adv_baseline_mode}. "
+                f"Supported: none, causal_ema"
+            )
         
         # filtered_response_mask 决定 loss 聚合的分母范围
         # all-zero effective_mask 的 sample 直接放弃（不训练），advantages 置 0

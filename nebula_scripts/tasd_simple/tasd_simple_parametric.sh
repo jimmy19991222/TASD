@@ -48,6 +48,10 @@ INCLUDE_SUCCESSFUL_ROLLOUTS="${INCLUDE_SUCCESSFUL_ROLLOUTS:-True}"
 # ── gate warmup 配置 ──────────────────────────────────────────────────
 GATE_WARMUP_STEPS="${GATE_WARMUP_STEPS:-10}"  # warmup 期间不启用 entropy gate
 
+# ── bidirectional credit 配置 ──────────────────────────────────────
+ADV_BASELINE_MODE="${ADV_BASELINE_MODE:-none}"  # none | causal_ema
+CAUSAL_EMA_ALPHA="${CAUSAL_EMA_ALPHA:-0.021}"   # EMA 衰减系数（τ=32 对应 α≈0.021）
+
 # ── error_pool teacher context 配置 ───────────────────────────────────
 TEACHER_CONTEXT_MODE="${TEACHER_CONTEXT_MODE:-per_rollout}"  # per_rollout | group_shared
 MAX_ERRORS_IN_POOL="${MAX_ERRORS_IN_POOL:-8}"
@@ -136,6 +140,7 @@ echo "  FILTER_GROUPS: enable=${FILTER_GROUPS_ENABLE}, metric=${FILTER_GROUPS_ME
 echo "  DISTILL_TOPK: ${DISTILL_TOPK}"
 echo "  TOP_K_AGREEMENT_K: ${TOP_K_AGREEMENT_K}, TOP_K_AGREEMENT_EPS: ${TOP_K_AGREEMENT_EPS}"
 echo "  GATE_WARMUP_STEPS: ${GATE_WARMUP_STEPS}"
+echo "  ADV_BASELINE_MODE: ${ADV_BASELINE_MODE}, CAUSAL_EMA_ALPHA: ${CAUSAL_EMA_ALPHA}"
 echo "  TEACHER_CONTEXT_MODE: ${TEACHER_CONTEXT_MODE}, MAX_ERRORS: ${MAX_ERRORS_IN_POOL}, FORMAT_ONLY: ${ERROR_POOL_FORMAT_ONLY}"
 echo "  SEED: ${SEED}"
 echo "============================================"
@@ -187,6 +192,8 @@ python -m verl.trainer.main_ppo \
     algorithm.tasd.max_errors_in_pool=${MAX_ERRORS_IN_POOL} \
     algorithm.tasd.error_answer_max_chars=${ERROR_ANSWER_MAX_CHARS} \
     algorithm.tasd.error_pool_format_only=${ERROR_POOL_FORMAT_ONLY} \
+    algorithm.tasd.adv_baseline_mode=${ADV_BASELINE_MODE} \
+    algorithm.tasd.causal_ema_alpha=${CAUSAL_EMA_ALPHA} \
     algorithm.filter_groups.enable=${FILTER_GROUPS_ENABLE} \
     algorithm.filter_groups.metric=${FILTER_GROUPS_METRIC} \
     algorithm.filter_groups.max_num_gen_batches=${FILTER_GROUPS_MAX_GEN} \

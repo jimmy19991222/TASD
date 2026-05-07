@@ -100,6 +100,19 @@ algorithm:
     max_errors_in_pool: 8               # 每 group 去重后错例上限
     error_answer_max_chars: 1024        # 每条错例答案字符上限
     error_pool_format_only: true        # 仅格式错例入池（避免语义泄漏）
+    
+    # ── bidirectional credit assignment ──────────────────────
+    # 用 baseline 隔离 token-level signal，解决 context pollution
+    # adv_baseline_mode:
+    #   "none" (默认): 不做 baseline 修正，直接用原始 advantage
+    #   "causal_ema": 用因果 EMA 估计 baseline V_t = α·V_{t-1} + (1-α)·A_{t-1}
+    #                 A_bidir_t = A_t - V_t，其中 α = 1 - 2^{-1/τ}
+    #                 τ=32 → α≈0.021 (half-life=32 tokens, 参考 FIPO)
+    #                 τ=7  → α≈0.09  (half-life=7 tokens, 快速衰减)
+    adv_baseline_mode: "none"
+    causal_ema_alpha: 0.021             # EMA 衰减系数（仅 causal_ema 模式生效）
+                                        # α=0.021 ≈ τ=32 (FIPO 默认)
+                                        # α=0.09  ≈ τ=7  (快速衰减)
   # ── DAPO 动态采样（Dynamic Sampling / Group Filtering）──────────────
   # 过滤全对/全错的 group，只保留有区分度的 group 参与训练
   filter_groups:

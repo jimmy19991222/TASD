@@ -31,6 +31,26 @@ if ! echo "$VALID_AEW" | grep -qw "$ADV_ENTROPY_WEIGHT"; then
     exit 1
 fi
 
+# 3b. 检查 adv_baseline_mode 值是否有效
+VALID_ABM="none causal_ema"
+if ! echo "$VALID_ABM" | grep -qw "$ADV_BASELINE_MODE"; then
+    echo "❌ 错误: adv_baseline_mode='$ADV_BASELINE_MODE' 无效"
+    echo "   有效值: $VALID_ABM"
+    exit 1
+fi
+
+# 3c. 检查 causal_ema_alpha 范围（仅 causal_ema 模式）
+if [ "$ADV_BASELINE_MODE" = "causal_ema" ]; then
+    ALPHA="${CAUSAL_EMA_ALPHA:-0.021}"
+    # 简单检查：必须在 (0, 1) 范围内
+    if python3 -c "import sys; sys.exit(0 if 0 < float('$ALPHA') < 1 else 1)" 2>/dev/null; then
+        echo "ℹ️  causal_ema_alpha=$ALPHA (half-life ≈ $(python3 -c "import math; print(f'{math.log(0.5)/math.log(float(\"$ALPHA\")):.1f}') tokens")")"
+    else
+        echo "❌ 错误: causal_ema_alpha=$ALPHA 必须在 (0, 1) 范围内"
+        exit 1
+    fi
+fi
+
 # 4. 检查 clip_adv_value
 if [ "${CLIP_ADV:-true}" = "true" ] && [ "${CLIP_ADV_VALUE:-2.0}" = "0" ]; then
     echo "⚠️ 警告: clip_adv=true 但 clip_adv_value=0，等效于不 clip"
