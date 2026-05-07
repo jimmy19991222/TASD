@@ -95,32 +95,24 @@ for EXP in "${EXPERIMENTS[@]}"; do
     export GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
     export GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
     
-    # 构建 nebula 命令
-    CMD="nebula submit \
-        --queue $QUEUE \
-        --world_size $WORLD_SIZE \
-        --cluster_file $CLUSTER_FILE \
-        --script_path $SCRIPT_PATH \
-        --docker_image $CUSTOM_DOCKER_IMAGE \
-        --env OPENLM_TOKEN=$OPENLM_TOKEN \
-        --env OSS_ACCESS_ID=$OSS_ACCESS_ID \
-        --env OSS_ACCESS_KEY=$OSS_ACCESS_KEY \
-        --env OSS_ENDPOINT=$OSS_ENDPOINT \
-        --env OSS_BUCKET=$OSS_BUCKET \
-        --env DATASET=$DATASET \
-        --env ALGORITHM=sdpo \
-        --env MODEL_PATH=$MODEL_PATH \
-        --env LR=$LR \
-        --env SEED=$SEED \
-        --env TRAIN_BATCH_SIZE=$TRAIN_BATCH_SIZE \
-        --env GEN_BATCH_SIZE=$GEN_BATCH_SIZE \
-        --env ROLLOUT_N=$ROLLOUT_N \
-        --env SDPO_ALPHA=$ALPHA \
-        --env SDPO_DONT_REPROMPT=$DONT_REPROMPT \
-        --env JOB_NAME=$JOB_NAME \
-        --env PROJECT_NAME=$PROJECT_NAME \
-        --env GIT_BRANCH=$GIT_BRANCH \
-        --env GIT_COMMIT=$GIT_COMMIT"
+    # 构建 nebulactl 命令
+    CMD="nebulactl run mdl \
+        --force \
+        --engine=xdl \
+        --queue=$QUEUE \
+        --entry=nebula_scripts/entry.py \
+        --worker_count=$WORLD_SIZE \
+        --file.cluster_file=$CLUSTER_FILE \
+        --job_name=$JOB_NAME \
+        --env=OPENLM_TOKEN=$OPENLM_TOKEN \
+        --env=SWANLAB_API_KEY=\${SWANLAB_API_KEY:-M5oC00EEt8G1wC0XaHkal} \
+        --custom_docker_image=$CUSTOM_DOCKER_IMAGE \
+        --requirements_file_name=requirements_nebula.txt \
+        --oss_access_id=$OSS_ACCESS_ID \
+        --oss_access_key=$OSS_ACCESS_KEY \
+        --oss_bucket=$OSS_BUCKET \
+        --oss_endpoint=$OSS_ENDPOINT \
+        --user_params=\"DATASET=$DATASET ALGORITHM=sdpo MODEL_PATH=$MODEL_PATH LR=$LR SEED=$SEED TRAIN_BATCH_SIZE=$TRAIN_BATCH_SIZE GEN_BATCH_SIZE=$GEN_BATCH_SIZE ROLLOUT_N=$ROLLOUT_N SDPO_ALPHA=$ALPHA SDPO_DONT_REPROMPT=$DONT_REPROMPT JOB_NAME=$JOB_NAME PROJECT_NAME=$PROJECT_NAME GIT_BRANCH=$GIT_BRANCH GIT_COMMIT=$GIT_COMMIT\""
     
     if [ "$DRY_RUN" = true ]; then
         echo "[DRY-RUN] 命令:"
