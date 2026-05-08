@@ -50,7 +50,8 @@ SEED="42"
 TRAIN_BATCH_SIZE="32"
 GEN_BATCH_SIZE="32"
 ROLLOUT_N="8"
-MODEL_PATH="/data/oss_bucket_0/ad/loujieming.ljm/models/Qwen3-8B"
+MODEL="Qwen3-8B"
+MODEL_PATH="/data/oss_bucket_0/ad/loujieming.ljm/base_models/${MODEL}"
 
 # =============================================================================
 # 提交实验
