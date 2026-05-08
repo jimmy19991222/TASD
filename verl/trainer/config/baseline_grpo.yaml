@@ -8,6 +8,9 @@ defaults:
 # MAX_MODEL_LEN=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
 max_model_len: 10240
 
+# ── 随机种子（可复现性）─────────────────────────────────────────────────
+seed: 42
+
 actor_rollout_ref:
   actor:
     ppo_mini_batch_size: 8

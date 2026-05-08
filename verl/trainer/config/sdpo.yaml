@@ -10,6 +10,9 @@ defaults:
 # MAX_MODEL_LEN=$((TEMPLATE_LENGTH + MAX_PROMPT_LENGTH + MAX_FEEDBACK_LENGTH + MAX_RESPONSE_LENGTH))
 max_model_len: 18944
 
+# ── 随机种子（可复现性）─────────────────────────────────────────────────
+seed: 42
+
 actor_rollout_ref:
   actor:
     ppo_mini_batch_size: 32 # TODO: make slightly off-policy in the future; use same as baseline; perhaps make 1 again for fastest convergence

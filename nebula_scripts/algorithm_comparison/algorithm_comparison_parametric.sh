@@ -175,7 +175,7 @@ esac
 # ── 启动训练 ────────────────────────────────────────────────────────────
 python -m verl.trainer.main_ppo \
     --config-name ${CONFIG_NAME} \
-    +seed=${SEED} \
+    seed=${SEED} \
     data.train_batch_size=${TRAIN_BATCH_SIZE} \
     data.gen_batch_size=${GEN_BATCH_SIZE} \
     data.train_files="${train_data_path}" \
@@ -185,13 +185,13 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.lr=${LR} \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     actor_rollout_ref.actor.ppo_mini_batch_size=${MINI_BATCH_SIZE} \
-    +actor_rollout_ref.actor.data_loader_seed=${SEED} \
+    actor_rollout_ref.actor.data_loader_seed=${SEED} \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.rollout.n=${ROLLOUT_N} \
     actor_rollout_ref.rollout.val_kwargs.n=16 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
-    +actor_rollout_ref.rollout.seed=${SEED} \
+    actor_rollout_ref.rollout.seed=${SEED} \
     algorithm.rollout_correction.rollout_is=token \
     algorithm.rollout_correction.rollout_is_threshold=2.0 \
     ${EXTRA_ARGS} \
