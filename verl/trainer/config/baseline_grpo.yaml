@@ -27,3 +27,4 @@ algorithm:
 
 data:
   train_batch_size: 32
+  gen_batch_size: ${data.train_batch_size}
