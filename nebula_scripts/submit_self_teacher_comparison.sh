@@ -1,16 +1,9 @@
 #!/bin/bash
 # =============================================================================
-# Self-Teacher Advantage beta 消融实验 - Nebula 批量提交脚本
+# Self-Teacher Advantage Baseline 实验 - Nebula 批量提交脚本
 #
 # 算法：Self-Teacher Advantage with Bidirectional Baselines
-# 特点：on-policy, single-step updates, beta 消融（V_CE vs V_EMA）
-# 参考：Self_Teacher_Advantage_Method.md
-#
-# 实验矩阵（4 个 beta 配置）：
-#   1. beta=1.0: 纯 V_CE（横向 baseline，variance reduction 最优）
-#   2. beta=0.7: V_CE 主导（推荐配置，V_EMA 辅助捕捉转折）
-#   3. beta=0.5: 等权融合（V_CE 和 V_EMA 信号最强）
-#   4. beta=0.0: 纯 V_EMA（纵向 baseline，验证 EMA 必要性）
+# 特点：on-policy, beta 消融实验（V_CE vs V_EMA）
 #
 # 使用方式：
 #   bash nebula_scripts/submit_self_teacher_comparison.sh [--dry-run]
@@ -46,6 +39,8 @@ fi
 declare -a EXPERIMENTS=(
     # beta | ema_alpha | clip_value | 实验标签
     "1.0|0.9|5.0|self_teacher_beta1.0_Vce_only"
+    "0.7|0.9|5.0|self_teacher_beta0.7_recommended"
+    "0.5|0.9|5.0|self_teacher_beta0.5_equal"
     "0.0|0.9|5.0|self_teacher_beta0.0_Vema_only"
 )
 
@@ -65,8 +60,10 @@ echo "============================================"
 echo "Self-Teacher Advantage Baseline 实验提交"
 echo "============================================"
 echo "实验数量: ${#EXPERIMENTS[@]}"
-echo "  - Self-Teacher: on-policy, 两个关键 baseline"
+echo "  - Self-Teacher: on-policy, beta 消融 (1.0/0.7/0.5/0.0)"
 echo "  - beta=1.0: 纯 V_CE（横向 baseline）"
+echo "  - beta=0.7: V_CE 主导（推荐配置）"
+echo "  - beta=0.5: 等权融合"
 echo "  - beta=0.0: 纯 V_EMA（纵向 baseline）"
 echo "数据集: ${DATASET}"
 echo "模型: Qwen3-8B"
@@ -79,7 +76,7 @@ FAILED=0
 for EXP in "${EXPERIMENTS[@]}"; do
     IFS='|' read -r BETA EMA_ALPHA CLIP_VALUE EXP_LABEL <<< "$EXP"
     
-    JOB_NAME="self_teacher_${EXP_LABEL}"
+    JOB_NAME="${EXP_LABEL}"
     
     echo ""
     echo "────────────────────────────────────────"
@@ -89,68 +86,53 @@ for EXP in "${EXPERIMENTS[@]}"; do
     echo "  EMA_ALPHA: ${EMA_ALPHA}"
     echo "  CLIP_VALUE: ${CLIP_VALUE}"
     
-    # 构建环境变量
-    export DATASET="$DATASET"
-    export ALGORITHM="self_teacher"
-    export MODEL_PATH="$MODEL_PATH"
-    export LR="$LR"
-    export SEED="$SEED"
-    export TRAIN_BATCH_SIZE="$TRAIN_BATCH_SIZE"
-    export GEN_BATCH_SIZE="$GEN_BATCH_SIZE"
-    export BETA="$BETA"
-    export EMA_ALPHA="$EMA_ALPHA"
-    export CLIP_VALUE="$CLIP_VALUE"
-    export ROLLOUT_N="$ROLLOUT_N"
-    export JOB_NAME="$JOB_NAME"
-    export PROJECT_NAME="$PROJECT_NAME"
-    export GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
-    export GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
+    # Git 信息
+    GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
+    GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
     
-    # 构建 nebulactl 命令
-    CMD="nebulactl run mdl \
-        --force \
-        --engine=xdl \
-        --queue=\$QUEUE \
-        --entry=nebula_scripts/entry.py \
-        --user_params=\"--script_path=\${SCRIPT_PATH} --world_size=\${WORLD_SIZE} --job_name=\${JOB_NAME} --env=PROJECT_NAME=\${PROJECT_NAME} --env=JOB_NAME=\${JOB_NAME} --env=DATASET=\${DATASET} --env=ALGORITHM=self_teacher --env=MODEL_PATH=\${MODEL_PATH} --env=LR=\${LR} --env=SEED=\${SEED} --env=TRAIN_BATCH_SIZE=\${TRAIN_BATCH_SIZE} --env=GEN_BATCH_SIZE=\${GEN_BATCH_SIZE} --env=ROLLOUT_N=\${ROLLOUT_N} --env=BETA=\${BETA} --env=EMA_ALPHA=\${EMA_ALPHA} --env=CLIP_VALUE=\${CLIP_VALUE} --env=GIT_BRANCH=\${GIT_BRANCH} --env=GIT_COMMIT=\${GIT_COMMIT} --env=DINGTALK_WEBHOOK=https://oapi.dingtalk.com/robot/send?access_token=f598ad33b071751bf79d2484d8e1acefe8df9d879e129cae40340a158854f9cb --env=DINGTALK_SECRET=SECc5b9e4f61f56b32b46abf1ecedc11bdcba10dc35fbba8fa0ff62c084a1cc6ad3\" \
-        --worker_count=\$WORLD_SIZE \
-        --file.cluster_file=\$CLUSTER_FILE \
-        --job_name=\$JOB_NAME \
-        --env=OPENLM_TOKEN=\$OPENLM_TOKEN \
-        --env=SWANLAB_API_KEY=\${SWANLAB_API_KEY:-M5oC00EEt8G1wC0XaHkal} \
-        --custom_docker_image=\$CUSTOM_DOCKER_IMAGE \
-        --requirements_file_name=requirements_nebula.txt \
-        --oss_access_id=\$OSS_ACCESS_ID \
-        --oss_access_key=\$OSS_ACCESS_KEY \
-        --oss_bucket=\$OSS_BUCKET \
-        --oss_endpoint=\$OSS_ENDPOINT"
-    
+    # ── 提交 ────────────────────────────────────────────────────────
     if [ "$DRY_RUN" = true ]; then
-        echo "[DRY-RUN] 命令:"
-        echo "$CMD" | tr ' ' '\n' | grep "^--env" | sed 's/^--env /  /'
+        echo "[DRY-RUN] 准备提交"
+        echo "  JOB_NAME: ${JOB_NAME}"
+        echo "  BETA: ${BETA}"
     else
         echo "提交中..."
-        OUTPUT=$(eval "$CMD" 2>&1)
-        EXIT_CODE=$?
         
-        if [ $EXIT_CODE -eq 0 ]; then
+        SUBMIT_OUTPUT=$(nebulactl run mdl \
+            --force \
+            --engine=xdl \
+            --queue=${QUEUE} \
+            --entry=nebula_scripts/entry.py \
+            --user_params="--script_path=${SCRIPT_PATH} --world_size=${WORLD_SIZE} --job_name=${JOB_NAME} --env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=DATASET=${DATASET} --env=ALGORITHM=self_teacher --env=MODEL_PATH=${MODEL_PATH} --env=LR=${LR} --env=SEED=${SEED} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=GEN_BATCH_SIZE=${GEN_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=BETA=${BETA} --env=EMA_ALPHA=${EMA_ALPHA} --env=CLIP_VALUE=${CLIP_VALUE} --env=GIT_BRANCH=${GIT_BRANCH} --env=GIT_COMMIT=${GIT_COMMIT} --env=DINGTALK_WEBHOOK=https://oapi.dingtalk.com/robot/send?access_token=f598ad33b071751bf79d2484d8e1acefe8df9d879e129cae40340a158854f9cb --env=DINGTALK_SECRET=SECc5b9e4f61f56b32b46abf1ecedc11bdcba10dc35fbba8fa0ff62c084a1cc6ad3" \
+            --worker_count=${WORLD_SIZE} \
+            --file.cluster_file=${CLUSTER_FILE} \
+            --job_name=${JOB_NAME} \
+            --env=OPENLM_TOKEN=${OPENLM_TOKEN} \
+            --env=SWANLAB_API_KEY=${SWANLAB_API_KEY:-M5oC00EEt8G1wC0XaHkal} \
+            --custom_docker_image=${CUSTOM_DOCKER_IMAGE} \
+            --requirements_file_name=requirements_nebula.txt \
+            --oss_access_id=${OSS_ACCESS_ID} \
+            --oss_access_key=${OSS_ACCESS_KEY} \
+            --oss_bucket=${OSS_BUCKET} \
+            --oss_endpoint=${OSS_ENDPOINT} \
+            2>&1)
+        SUBMIT_EXIT=$?
+        echo "$SUBMIT_OUTPUT"
+        if [ $SUBMIT_EXIT -ne 0 ]; then
+            echo "❌ 提交失败 (exit code: $SUBMIT_EXIT)"
+            FAILED=$((FAILED + 1))
+        else
             # 提取 task_id
-            TASK_ID=$(echo "$OUTPUT" | grep -oP 'task_id["\s:]+\K[a-f0-9]+' | head -1)
+            TASK_ID=$(echo "$SUBMIT_OUTPUT" | grep -oP 'task_id["\s:]+\K[a-f0-9]+' | head -1)
             if [ -n "$TASK_ID" ]; then
                 echo "✅ 提交成功: task_id=$TASK_ID"
                 TASK_IDS+=("$TASK_ID")
             else
                 echo "✅ 提交成功（未提取到 task_id）"
-                echo "输出: $OUTPUT"
             fi
-        else
-            echo "❌ 提交失败 (exit code: $EXIT_CODE)"
-            echo "输出: $OUTPUT"
-            FAILED=$((FAILED + 1))
         fi
+        sleep 2
     fi
-    
-    sleep 2
 done
 
 # =============================================================================
@@ -161,26 +143,17 @@ echo ""
 echo "============================================"
 echo "提交完成"
 echo "============================================"
-echo "成功: $((${#EXPERIMENTS[@]} - FAILED))"
-echo "失败: $FAILED"
-echo ""
-
-if [ ${#TASK_IDS[@]} -gt 0 ]; then
-    echo "Task IDs:"
-    for TID in "${TASK_IDS[@]}"; do
-        echo "  - $TID"
-    done
+if [ "$DRY_RUN" = true ]; then
+    echo "Dry-run 模式：共 ${#EXPERIMENTS[@]} 个实验"
+else
+    echo "成功: $((${#EXPERIMENTS[@]} - FAILED))"
+    echo "失败: ${FAILED}"
     echo ""
-    echo "监控命令:"
-    echo "  nebula logs <task_id>"
-    echo "  nebula status <task_id>"
-    echo ""
-    echo "SwanLab 查看:"
-    echo "  https://swanlab.cn/@oh-my-team/Algorithm-Comparison-v1"
+    if [ ${#TASK_IDS[@]} -gt 0 ]; then
+        echo "Task IDs:"
+        for tid in "${TASK_IDS[@]}"; do
+            echo "  - $tid"
+        done
+    fi
 fi
-
 echo "============================================"
-
-if [ $FAILED -gt 0 ]; then
-    exit 1
-fi

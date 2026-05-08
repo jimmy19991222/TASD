@@ -3,7 +3,7 @@
 # SDPO Baseline 实验 - Nebula 批量提交脚本
 #
 # 算法：SDPO（Self-Distillation Policy Optimization）
-# 特点：on-policy, single-step updates, alpha=0.5 (Jensen-Shannon)
+# 特点：on-policy, single-step update, Jensen-Shannon divergence
 # 参考：SDPO 论文 Table 3 + run_sdpo_all.sh
 #
 # 使用方式：
@@ -70,7 +70,7 @@ FAILED=0
 for EXP in "${EXPERIMENTS[@]}"; do
     IFS='|' read -r ALPHA DONT_REPROMPT EXP_LABEL <<< "$EXP"
     
-    JOB_NAME="sdpo_${EXP_LABEL}"
+    JOB_NAME="${EXP_LABEL}"
     
     echo ""
     echo "────────────────────────────────────────"
@@ -79,67 +79,53 @@ for EXP in "${EXPERIMENTS[@]}"; do
     echo "  ALPHA: ${ALPHA} (Jensen-Shannon)"
     echo "  DONT_REPROMPT: ${DONT_REPROMPT}"
     
-    # 构建环境变量
-    export DATASET="$DATASET"
-    export ALGORITHM="sdpo"
-    export MODEL_PATH="$MODEL_PATH"
-    export LR="$LR"
-    export SEED="$SEED"
-    export TRAIN_BATCH_SIZE="$TRAIN_BATCH_SIZE"
-    export GEN_BATCH_SIZE="$GEN_BATCH_SIZE"
-    export ROLLOUT_N="$ROLLOUT_N"
-    export SDPO_ALPHA="$ALPHA"
-    export SDPO_DONT_REPROMPT="$DONT_REPROMPT"
-    export JOB_NAME="$JOB_NAME"
-    export PROJECT_NAME="$PROJECT_NAME"
-    export GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
-    export GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
+    # Git 信息
+    GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
+    GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
     
-    # 构建 nebulactl 命令
-    CMD="nebulactl run mdl \
-        --force \
-        --engine=xdl \
-        --queue=\$QUEUE \
-        --entry=nebula_scripts/entry.py \
-        --user_params=\"--script_path=\${SCRIPT_PATH} --world_size=\${WORLD_SIZE} --job_name=\${JOB_NAME} --env=PROJECT_NAME=\${PROJECT_NAME} --env=JOB_NAME=\${JOB_NAME} --env=DATASET=\${DATASET} --env=ALGORITHM=sdpo --env=MODEL_PATH=\${MODEL_PATH} --env=LR=\${LR} --env=SEED=\${SEED} --env=TRAIN_BATCH_SIZE=\${TRAIN_BATCH_SIZE} --env=GEN_BATCH_SIZE=\${GEN_BATCH_SIZE} --env=ROLLOUT_N=\${ROLLOUT_N} --env=SDPO_ALPHA=\${ALPHA} --env=SDPO_DONT_REPROMPT=\${DONT_REPROMPT} --env=GIT_BRANCH=\${GIT_BRANCH} --env=GIT_COMMIT=\${GIT_COMMIT} --env=DINGTALK_WEBHOOK=https://oapi.dingtalk.com/robot/send?access_token=f598ad33b071751bf79d2484d8e1acefe8df9d879e129cae40340a158854f9cb --env=DINGTALK_SECRET=SECc5b9e4f61f56b32b46abf1ecedc11bdcba10dc35fbba8fa0ff62c084a1cc6ad3\" \
-        --worker_count=\$WORLD_SIZE \
-        --file.cluster_file=\$CLUSTER_FILE \
-        --job_name=\$JOB_NAME \
-        --env=OPENLM_TOKEN=\$OPENLM_TOKEN \
-        --env=SWANLAB_API_KEY=\${SWANLAB_API_KEY:-M5oC00EEt8G1wC0XaHkal} \
-        --custom_docker_image=\$CUSTOM_DOCKER_IMAGE \
-        --requirements_file_name=requirements_nebula.txt \
-        --oss_access_id=\$OSS_ACCESS_ID \
-        --oss_access_key=\$OSS_ACCESS_KEY \
-        --oss_bucket=\$OSS_BUCKET \
-        --oss_endpoint=\$OSS_ENDPOINT"
-    
+    # ── 提交 ────────────────────────────────────────────────────────
     if [ "$DRY_RUN" = true ]; then
-        echo "[DRY-RUN] 命令:"
-        echo "$CMD" | tr ' ' '\n' | grep "^--env" | sed 's/^--env /  /'
+        echo "[DRY-RUN] 准备提交"
+        echo "  JOB_NAME: ${JOB_NAME}"
+        echo "  ALPHA: ${ALPHA}"
     else
         echo "提交中..."
-        OUTPUT=$(eval "$CMD" 2>&1)
-        EXIT_CODE=$?
         
-        if [ $EXIT_CODE -eq 0 ]; then
+        SUBMIT_OUTPUT=$(nebulactl run mdl \
+            --force \
+            --engine=xdl \
+            --queue=${QUEUE} \
+            --entry=nebula_scripts/entry.py \
+            --user_params="--script_path=${SCRIPT_PATH} --world_size=${WORLD_SIZE} --job_name=${JOB_NAME} --env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=DATASET=${DATASET} --env=ALGORITHM=sdpo --env=MODEL_PATH=${MODEL_PATH} --env=LR=${LR} --env=SEED=${SEED} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=GEN_BATCH_SIZE=${GEN_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=SDPO_ALPHA=${ALPHA} --env=SDPO_DONT_REPROMPT=${DONT_REPROMPT} --env=GIT_BRANCH=${GIT_BRANCH} --env=GIT_COMMIT=${GIT_COMMIT} --env=DINGTALK_WEBHOOK=https://oapi.dingtalk.com/robot/send?access_token=f598ad33b071751bf79d2484d8e1acefe8df9d879e129cae40340a158854f9cb --env=DINGTALK_SECRET=SECc5b9e4f61f56b32b46abf1ecedc11bdcba10dc35fbba8fa0ff62c084a1cc6ad3" \
+            --worker_count=${WORLD_SIZE} \
+            --file.cluster_file=${CLUSTER_FILE} \
+            --job_name=${JOB_NAME} \
+            --env=OPENLM_TOKEN=${OPENLM_TOKEN} \
+            --env=SWANLAB_API_KEY=${SWANLAB_API_KEY:-M5oC00EEt8G1wC0XaHkal} \
+            --custom_docker_image=${CUSTOM_DOCKER_IMAGE} \
+            --requirements_file_name=requirements_nebula.txt \
+            --oss_access_id=${OSS_ACCESS_ID} \
+            --oss_access_key=${OSS_ACCESS_KEY} \
+            --oss_bucket=${OSS_BUCKET} \
+            --oss_endpoint=${OSS_ENDPOINT} \
+            2>&1)
+        SUBMIT_EXIT=$?
+        echo "$SUBMIT_OUTPUT"
+        if [ $SUBMIT_EXIT -ne 0 ]; then
+            echo "❌ 提交失败 (exit code: $SUBMIT_EXIT)"
+            FAILED=$((FAILED + 1))
+        else
             # 提取 task_id
-            TASK_ID=$(echo "$OUTPUT" | grep -oP 'task_id["\s:]+\K[a-f0-9]+' | head -1)
+            TASK_ID=$(echo "$SUBMIT_OUTPUT" | grep -oP 'task_id["\s:]+\K[a-f0-9]+' | head -1)
             if [ -n "$TASK_ID" ]; then
                 echo "✅ 提交成功: task_id=$TASK_ID"
                 TASK_IDS+=("$TASK_ID")
             else
                 echo "✅ 提交成功（未提取到 task_id）"
-                echo "输出: $OUTPUT"
             fi
-        else
-            echo "❌ 提交失败 (exit code: $EXIT_CODE)"
-            echo "输出: $OUTPUT"
-            FAILED=$((FAILED + 1))
         fi
+        sleep 2
     fi
-    
-    sleep 2
 done
 
 # =============================================================================
@@ -150,26 +136,17 @@ echo ""
 echo "============================================"
 echo "提交完成"
 echo "============================================"
-echo "成功: $((${#EXPERIMENTS[@]} - FAILED))"
-echo "失败: $FAILED"
-echo ""
-
-if [ ${#TASK_IDS[@]} -gt 0 ]; then
-    echo "Task IDs:"
-    for TID in "${TASK_IDS[@]}"; do
-        echo "  - $TID"
-    done
+if [ "$DRY_RUN" = true ]; then
+    echo "Dry-run 模式：共 ${#EXPERIMENTS[@]} 个实验"
+else
+    echo "成功: $((${#EXPERIMENTS[@]} - FAILED))"
+    echo "失败: ${FAILED}"
     echo ""
-    echo "监控命令:"
-    echo "  nebula logs <task_id>"
-    echo "  nebula status <task_id>"
-    echo ""
-    echo "SwanLab 查看:"
-    echo "  https://swanlab.cn/@oh-my-team/Algorithm-Comparison-v1"
+    if [ ${#TASK_IDS[@]} -gt 0 ]; then
+        echo "Task IDs:"
+        for tid in "${TASK_IDS[@]}"; do
+            echo "  - $tid"
+        done
+    fi
 fi
-
 echo "============================================"
-
-if [ $FAILED -gt 0 ]; then
-    exit 1
-fi
