@@ -115,8 +115,8 @@ for EXP in "${EXPERIMENTS[@]}"; do
             echo "❌ 提交失败 (exit code: $SUBMIT_EXIT)"
             FAILED=$((FAILED + 1))
         else
-            # 提取 task_id
-            TASK_ID=$(echo "$SUBMIT_OUTPUT" | grep -oP 'task_id["\s:]+\K[a-f0-9]+' | head -1)
+            # 提取 task_id（兼容 macOS grep）
+            TASK_ID=$(echo "$SUBMIT_OUTPUT" | grep -o 'task_id[": ]*[a-f0-9]\+' | grep -o '[a-f0-9]\{20,\}' | head -1)
             if [ -n "$TASK_ID" ]; then
                 echo "✅ 提交成功: task_id=$TASK_ID"
                 TASK_IDS+=("$TASK_ID")
