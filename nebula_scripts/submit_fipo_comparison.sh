@@ -97,20 +97,20 @@ for EXP in "${EXPERIMENTS[@]}"; do
     CMD="nebulactl run mdl \
         --force \
         --engine=xdl \
-        --queue=$QUEUE \
+        --queue=\$QUEUE \
         --entry=nebula_scripts/entry.py \
-        --worker_count=$WORLD_SIZE \
-        --file.cluster_file=$CLUSTER_FILE \
-        --job_name=$JOB_NAME \
-        --env=OPENLM_TOKEN=$OPENLM_TOKEN \
+        --user_params=\"--script_path=\${SCRIPT_PATH} --world_size=\${WORLD_SIZE} --job_name=\${JOB_NAME} --env=PROJECT_NAME=\${PROJECT_NAME} --env=JOB_NAME=\${JOB_NAME} --env=DATASET=\${DATASET} --env=ALGORITHM=fipo --env=MODEL_PATH=\${MODEL_PATH} --env=LR=\${LR} --env=SEED=\${SEED} --env=TRAIN_BATCH_SIZE=\${TRAIN_BATCH_SIZE} --env=GEN_BATCH_SIZE=\${GEN_BATCH_SIZE} --env=MINI_BATCH_SIZE=\${MINI_BATCH_SIZE} --env=ROLLOUT_N=\${ROLLOUT_N} --env=GIT_BRANCH=\${GIT_BRANCH} --env=GIT_COMMIT=\${GIT_COMMIT} --env=DINGTALK_WEBHOOK=https://oapi.dingtalk.com/robot/send?access_token=f598ad33b071751bf79d2484d8e1acefe8df9d879e129cae40340a158854f9cb --env=DINGTALK_SECRET=SECc5b9e4f61f56b32b46abf1ecedc11bdcba10dc35fbba8fa0ff62c084a1cc6ad3\" \
+        --worker_count=\$WORLD_SIZE \
+        --file.cluster_file=\$CLUSTER_FILE \
+        --job_name=\$JOB_NAME \
+        --env=OPENLM_TOKEN=\$OPENLM_TOKEN \
         --env=SWANLAB_API_KEY=\${SWANLAB_API_KEY:-M5oC00EEt8G1wC0XaHkal} \
-        --custom_docker_image=$CUSTOM_DOCKER_IMAGE \
+        --custom_docker_image=\$CUSTOM_DOCKER_IMAGE \
         --requirements_file_name=requirements_nebula.txt \
-        --oss_access_id=$OSS_ACCESS_ID \
-        --oss_access_key=$OSS_ACCESS_KEY \
-        --oss_bucket=$OSS_BUCKET \
-        --oss_endpoint=$OSS_ENDPOINT \
-        --user_params=\"DATASET=$DATASET ALGORITHM=fipo MODEL_PATH=$MODEL_PATH LR=$LR SEED=$SEED TRAIN_BATCH_SIZE=$TRAIN_BATCH_SIZE GEN_BATCH_SIZE=$GEN_BATCH_SIZE MINI_BATCH_SIZE=$MINI_BATCH_SIZE ROLLOUT_N=$ROLLOUT_N JOB_NAME=$JOB_NAME PROJECT_NAME=$PROJECT_NAME GIT_BRANCH=$GIT_BRANCH GIT_COMMIT=$GIT_COMMIT\""
+        --oss_access_id=\$OSS_ACCESS_ID \
+        --oss_access_key=\$OSS_ACCESS_KEY \
+        --oss_bucket=\$OSS_BUCKET \
+        --oss_endpoint=\$OSS_ENDPOINT"
     
     if [ "$DRY_RUN" = true ]; then
         echo "[DRY-RUN] 命令:"
