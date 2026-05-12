@@ -143,59 +143,67 @@ for EXP in "${EXPERIMENTS[@]}"; do
     echo "  REWARD_TYPE: ${REWARD_TYPE}"
     echo "  DISTILL_TOPK: ${DISTILL_TOPK}"
 
-    # 构建 nebula 命令
-    CMD="nebula submit \
-        --queue $QUEUE \
-        --world_size $WORLD_SIZE \
-        --cluster_file $CLUSTER_FILE \
-        --script_path $SCRIPT_PATH \
-        --docker_image $CUSTOM_DOCKER_IMAGE \
-        --env OPENLM_TOKEN=$OPENLM_TOKEN \
-        --env OSS_ACCESS_ID=$OSS_ACCESS_ID \
-        --env OSS_ACCESS_KEY=$OSS_ACCESS_KEY \
-        --env OSS_ENDPOINT=$OSS_ENDPOINT \
-        --env OSS_BUCKET=$OSS_BUCKET \
-        --env DATASET=$EXP_DATASET \
-        --env ADV_MODE=$EXP_ADV_MODE \
-        --env USE_VCE=$EXP_USE_VCE \
-        --env USE_LOG_PI_S=$EXP_USE_LOG_PI_S \
-        --env CLIP_VALUE=$EXP_CLIP_VALUE \
-        --env REWARD_TYPE=$REWARD_TYPE \
-        --env ENTROPY_GATE=$ENTROPY_GATE \
-        --env ENTROPY_GATE_RATIO=$ENTROPY_GATE_RATIO \
-        --env DISTILL_TOPK=$DISTILL_TOPK \
-        --env DISTILL_TEMPERATURE=$DISTILL_TEMPERATURE \
-        --env CLIP_ADV=$CLIP_ADV \
-        --env CLIP_ADV_VALUE=$CLIP_ADV_VALUE \
-        --env NORM_ADV_BY_STD=$NORM_ADV_BY_STD \
-        --env ADV_STD_FLOOR=$ADV_STD_FLOOR \
-        --env ADV_ENTROPY_WEIGHT=$ADV_ENTROPY_WEIGHT \
-        --env GROUP_MEAN_MODE=$GROUP_MEAN_MODE \
-        --env CLIP_RATIO_HIGH=$CLIP_RATIO_HIGH \
-        --env REPETITION_PENALTY=$REPETITION_PENALTY \
-        --env ROLLOUT_N=$ROLLOUT_N \
-        --env ROLLOUT_TEMPERATURE=$ROLLOUT_TEMPERATURE \
-        --env TRAIN_BATCH_SIZE=$TRAIN_BATCH_SIZE \
-        --env GEN_BATCH_SIZE=$GEN_BATCH_SIZE \
-        --env MINI_BATCH_SIZE=$MINI_BATCH_SIZE \
-        --env INCLUDE_SUCCESSFUL_ROLLOUTS=$INCLUDE_SUCCESSFUL_ROLLOUTS \
-        --env TEACHER_REG=$TEACHER_REG \
-        --env TEACHER_UPDATE_RATE=$TEACHER_UPDATE_RATE \
-        --env LR=$LR \
-        --env ENTROPY_COEFF=$ENTROPY_COEFF \
-        --env SEED=$SEED \
-        --env FILTER_GROUPS_ENABLE=$FILTER_GROUPS_ENABLE \
-        --env FILTER_GROUPS_METRIC=$FILTER_GROUPS_METRIC \
-        --env FILTER_GROUPS_MAX_GEN=$FILTER_GROUPS_MAX_GEN \
-        --env MODEL_PATH=$MODEL_PATH \
-        --env JOB_NAME=$JOB_NAME \
-        --env PROJECT_NAME=$PROJECT_NAME \
-        --env GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown') \
-        --env GIT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
+    # 预计算所有变量（参考 submit_self_teacher_advantage.sh 的 export 模式）
+    export DATASET="$EXP_DATASET"
+    export ADV_MODE="$EXP_ADV_MODE"
+    export USE_VCE="$EXP_USE_VCE"
+    export USE_LOG_PI_S="$EXP_USE_LOG_PI_S"
+    export CLIP_VALUE="$EXP_CLIP_VALUE"
+    export REWARD_TYPE="$REWARD_TYPE"
+    export ENTROPY_GATE="$ENTROPY_GATE"
+    export ENTROPY_GATE_RATIO="$ENTROPY_GATE_RATIO"
+    export DISTILL_TOPK="$DISTILL_TOPK"
+    export DISTILL_TEMPERATURE="$DISTILL_TEMPERATURE"
+    export CLIP_ADV="$CLIP_ADV"
+    export CLIP_ADV_VALUE="$CLIP_ADV_VALUE"
+    export NORM_ADV_BY_STD="$NORM_ADV_BY_STD"
+    export ADV_STD_FLOOR="$ADV_STD_FLOOR"
+    export ADV_ENTROPY_WEIGHT="$ADV_ENTROPY_WEIGHT"
+    export GROUP_MEAN_MODE="$GROUP_MEAN_MODE"
+    export CLIP_RATIO_HIGH="$CLIP_RATIO_HIGH"
+    export REPETITION_PENALTY="$REPETITION_PENALTY"
+    export ROLLOUT_N="$ROLLOUT_N"
+    export ROLLOUT_TEMPERATURE="$ROLLOUT_TEMPERATURE"
+    export TRAIN_BATCH_SIZE="$TRAIN_BATCH_SIZE"
+    export GEN_BATCH_SIZE="$GEN_BATCH_SIZE"
+    export MINI_BATCH_SIZE="$MINI_BATCH_SIZE"
+    export INCLUDE_SUCCESSFUL_ROLLOUTS="$INCLUDE_SUCCESSFUL_ROLLOUTS"
+    export TEACHER_REG="$TEACHER_REG"
+    export TEACHER_UPDATE_RATE="$TEACHER_UPDATE_RATE"
+    export LR="$LR"
+    export ENTROPY_COEFF="$ENTROPY_COEFF"
+    export SEED="$SEED"
+    export FILTER_GROUPS_ENABLE="$FILTER_GROUPS_ENABLE"
+    export FILTER_GROUPS_METRIC="$FILTER_GROUPS_METRIC"
+    export FILTER_GROUPS_MAX_GEN="$FILTER_GROUPS_MAX_GEN"
+    export MODEL_PATH="$MODEL_PATH"
+    export JOB_NAME="$JOB_NAME"
+    export PROJECT_NAME="$PROJECT_NAME"
+    export GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
+    export GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
+
+    # 构建 nebulactl 命令
+    CMD="nebulactl run mdl \
+        --force \
+        --engine=xdl \
+        --queue=\$QUEUE \
+        --entry=nebula_scripts/entry.py \
+        --user_params=\"--script_path=\${SCRIPT_PATH} --world_size=\${WORLD_SIZE} --job_name=\${JOB_NAME} --env=PROJECT_NAME=\${PROJECT_NAME} --env=JOB_NAME=\${JOB_NAME} --env=DATASET=\${DATASET} --env=ADV_MODE=\${ADV_MODE} --env=USE_VCE=\${USE_VCE} --env=USE_LOG_PI_S=\${USE_LOG_PI_S} --env=CLIP_VALUE=\${CLIP_VALUE} --env=REWARD_TYPE=\${REWARD_TYPE} --env=ENTROPY_GATE=\${ENTROPY_GATE} --env=ENTROPY_GATE_RATIO=\${ENTROPY_GATE_RATIO} --env=DISTILL_TOPK=\${DISTILL_TOPK} --env=DISTILL_TEMPERATURE=\${DISTILL_TEMPERATURE} --env=CLIP_ADV=\${CLIP_ADV} --env=CLIP_ADV_VALUE=\${CLIP_ADV_VALUE} --env=NORM_ADV_BY_STD=\${NORM_ADV_BY_STD} --env=ADV_STD_FLOOR=\${ADV_STD_FLOOR} --env=ADV_ENTROPY_WEIGHT=\${ADV_ENTROPY_WEIGHT} --env=GROUP_MEAN_MODE=\${GROUP_MEAN_MODE} --env=CLIP_RATIO_HIGH=\${CLIP_RATIO_HIGH} --env=REPETITION_PENALTY=\${REPETITION_PENALTY} --env=ROLLOUT_N=\${ROLLOUT_N} --env=ROLLOUT_TEMPERATURE=\${ROLLOUT_TEMPERATURE} --env=TRAIN_BATCH_SIZE=\${TRAIN_BATCH_SIZE} --env=GEN_BATCH_SIZE=\${GEN_BATCH_SIZE} --env=MINI_BATCH_SIZE=\${MINI_BATCH_SIZE} --env=INCLUDE_SUCCESSFUL_ROLLOUTS=\${INCLUDE_SUCCESSFUL_ROLLOUTS} --env=TEACHER_REG=\${TEACHER_REG} --env=TEACHER_UPDATE_RATE=\${TEACHER_UPDATE_RATE} --env=LR=\${LR} --env=ENTROPY_COEFF=\${ENTROPY_COEFF} --env=SEED=\${SEED} --env=FILTER_GROUPS_ENABLE=\${FILTER_GROUPS_ENABLE} --env=FILTER_GROUPS_METRIC=\${FILTER_GROUPS_METRIC} --env=FILTER_GROUPS_MAX_GEN=\${FILTER_GROUPS_MAX_GEN} --env=MODEL_PATH=\${MODEL_PATH} --env=GIT_BRANCH=\${GIT_BRANCH} --env=GIT_COMMIT=\${GIT_COMMIT} --env=DINGTALK_WEBHOOK=https://oapi.dingtalk.com/robot/send?access_token=f598ad33b071751bf79d2484d8e1acefe8df9d879e129cae40340a158854f9cb --env=DINGTALK_SECRET=SECc5b9e4f61f56b32b46abf1ecedc11bdcba10dc35fbba8fa0ff62c084a1cc6ad3\" \
+        --worker_count=\$WORLD_SIZE \
+        --file.cluster_file=\$CLUSTER_FILE \
+        --job_name=\$JOB_NAME \
+        --env=OPENLM_TOKEN=\$OPENLM_TOKEN \
+        --env=SWANLAB_API_KEY=\${SWANLAB_API_KEY:-M5oC00EEt8G1wC0XaHkal} \
+        --custom_docker_image=\$CUSTOM_DOCKER_IMAGE \
+        --requirements_file_name=requirements_nebula.txt \
+        --oss_access_id=\$OSS_ACCESS_ID \
+        --oss_access_key=\$OSS_ACCESS_KEY \
+        --oss_bucket=\$OSS_BUCKET \
+        --oss_endpoint=\$OSS_ENDPOINT"
 
     if [ "$DRY_RUN" = true ]; then
         echo "[DRY-RUN] 命令:"
-        echo "$CMD"
+        echo "$CMD" | tr ' ' '\n' | grep "^--env" | sed 's/^--env /  /'
     else
         echo "提交中..."
         OUTPUT=$(eval "$CMD" 2>&1)
