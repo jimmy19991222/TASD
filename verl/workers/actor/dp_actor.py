@@ -129,19 +129,100 @@ class DataParallelPPOActor(BasePPOActor):
                 f"{self.use_fused_kernels=} or {self.use_prefix_grouper=} for now."
             )
 
-    def _update_teacher(self) -> None:
+    @torch.no_grad()
+    def _compute_teacher_student_param_stats(self) -> Optional[dict]:
+        """计算 teacher 与 student 参数的 L2 距离 / 余弦相似度 / 模长，用于诊断。
+
+        返回字段：
+            l2_dist:      teacher 与 student 参数 L2 距离（滞后程度直接指标）
+            relative_l2:  L2 / ||student||（模长归一化，跨阶段可比）
+            cos_sim:      余弦相似度，=1 表示完全重叠
+            student_norm / teacher_norm: 各自模长（监控参数 blow-up）
+
+        FSDP 下每 rank 仅持有 local shard，通过 all_reduce 聚合为全局统计。
+        """
+        if self.teacher_module is None or self.teacher_module is self.actor_module:
+            return None
+
+        device = get_device_id()
+        # 4 个标量聚合器：[diff_sq, dot, student_sq, teacher_sq]
+        stats = torch.zeros(4, device=device, dtype=torch.float64)
+
+        param_count = 0
+        for t_p, s_p in zip(
+            self.teacher_module.parameters(),
+            self.actor_module.parameters(),
+        ):
+            t_data = t_p.data
+            s_data = s_p.data.to(device=t_data.device)
+            # FSDP2 DTensor → local shard；FSDP1 本来就是 local tensor
+            if isinstance(t_data, DTensor):
+                t_data = t_data.to_local()
+            if isinstance(s_data, DTensor):
+                s_data = s_data.to_local()
+            if t_data.shape != s_data.shape or t_data.numel() == 0:
+                continue
+            t_f = t_data.to(dtype=torch.float64)
+            s_f = s_data.to(dtype=torch.float64)
+            diff = t_f - s_f
+            stats[0] += diff.pow(2).sum()
+            stats[1] += (t_f * s_f).sum()
+            stats[2] += s_f.pow(2).sum()
+            stats[3] += t_f.pow(2).sum()
+            param_count += 1
+
+        if param_count == 0:
+            return None
+
+        # 跨 rank 聚合（FSDP 下不同 rank 持有不同 shard）
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
+
+        diff_sq, dot, s_sq, t_sq = [float(x) for x in stats.tolist()]
+        diff_sq = max(diff_sq, 0.0)
+        s_sq = max(s_sq, 0.0)
+        t_sq = max(t_sq, 0.0)
+        s_norm = s_sq ** 0.5
+        t_norm = t_sq ** 0.5
+        l2_dist = diff_sq ** 0.5
+        cos_sim = dot / (s_norm * t_norm) if s_norm > 0 and t_norm > 0 else 0.0
+        relative_l2 = l2_dist / s_norm if s_norm > 0 else 0.0
+
+        return {
+            "l2_dist": l2_dist,
+            "relative_l2": relative_l2,
+            "cos_sim": cos_sim,
+            "student_norm": s_norm,
+            "teacher_norm": t_norm,
+        }
+
+    def _update_teacher(self) -> dict[str, float]:
+        """EMA 更新 teacher 参数并返回 teacher/student 参数距离诊断指标。
+
+        非 sdpo/tasd 模式、或非 ema regularization 模式下返回空 dict。
+        指标用于验证 teacher_module bug 修复：
+            - 修复前（teacher_module fallback 到 actor_module）：L2_dist 应 ≡ 0
+            - 修复后（独立 EMA 副本）：L2_dist > 0 且随训练缓慢追赶
+        """
+        teacher_metrics: dict[str, float] = {}
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-        if not self_distillation_cfg or loss_mode != "sdpo":
-            return
+        # TASD/Self-Teacher 与 SDPO 共用 EMA teacher 机制：两者 teacher 架构一致，
+        # 仅 loss 路径不同（TASD 走 vanilla PPO，SDPO 走 KL 蒸馏）。
+        if not self_distillation_cfg or loss_mode not in ("sdpo", "tasd"):
+            return teacher_metrics
         teacher_regularization = getattr(self_distillation_cfg, "teacher_regularization", "ema")
         if teacher_regularization != "ema":
-            return
+            return teacher_metrics
         update_rate = getattr(self_distillation_cfg, "teacher_update_rate", 0.0)
         if update_rate == 0.0:
-            return
+            return teacher_metrics
         if self.teacher_module is None or self.teacher_module is self.actor_module:
             raise ValueError("EMA teacher requires a separate teacher_module in the actor worker.")
+
+        # ─── 诊断：EMA 更新前的 teacher vs student 参数统计 ───
+        pre_stats = self._compute_teacher_student_param_stats()
+
         with torch.no_grad():
             for teacher_param, student_param in zip(
                 self.teacher_module.parameters(),
@@ -149,6 +230,23 @@ class DataParallelPPOActor(BasePPOActor):
             ):
                 student_data = student_param.data.to(device=teacher_param.device)
                 teacher_param.data.mul_(1.0 - update_rate).add_(student_data, alpha=update_rate)
+
+        # ─── 诊断：EMA 更新后的 L2（用于观察 EMA 追赶速率）───
+        post_stats = self._compute_teacher_student_param_stats()
+
+        if pre_stats is not None:
+            teacher_metrics["actor/teacher_student_param_l2_dist"] = pre_stats["l2_dist"]
+            teacher_metrics["actor/teacher_student_param_relative_l2"] = pre_stats["relative_l2"]
+            teacher_metrics["actor/teacher_student_param_cos_sim"] = pre_stats["cos_sim"]
+            teacher_metrics["actor/teacher_param_l2_norm"] = pre_stats["teacher_norm"]
+            teacher_metrics["actor/student_param_l2_norm"] = pre_stats["student_norm"]
+        if pre_stats is not None and post_stats is not None:
+            # Delta<0 表示 EMA 后 teacher 离 student 更近（正常行为）
+            teacher_metrics["actor/teacher_student_param_l2_delta_per_step"] = (
+                post_stats["l2_dist"] - pre_stats["l2_dist"]
+            )
+        teacher_metrics["actor/teacher_update_rate_effective"] = float(update_rate)
+        return teacher_metrics
 
     @staticmethod
     def _has_non_empty_multi_modal_inputs(multi_modal_inputs) -> bool:
@@ -1004,5 +1102,7 @@ class DataParallelPPOActor(BasePPOActor):
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
         if did_update:
-            self._update_teacher()
+            teacher_metrics = self._update_teacher()
+            if teacher_metrics:
+                append_to_dict(metrics, teacher_metrics)
         return metrics
