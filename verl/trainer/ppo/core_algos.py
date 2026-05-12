@@ -2458,77 +2458,118 @@ def compute_tasd_token_rewards(
 
 @register_adv_est(AdvantageEstimator.TASD)
 def compute_self_teacher_advantage(
-    teacher_log_probs: torch.Tensor,          # (B, T) teacher 对 generated token 的 log prob
-    student_topk_log_probs: torch.Tensor,     # (B, T, K) student 的 top-K log probs
-    student_topk_indices: torch.Tensor,       # (B, T, K) student 的 top-K token ids
-    teacher_at_student_topk: torch.Tensor,    # (B, T, K) teacher 在 student top-K 位置的 log probs
-    response_mask: torch.Tensor,              # (B, T) valid token mask
-    beta: float = 0.7,                        # V_CE vs V_EMA 融合系数
-    ema_alpha: float = 0.9,                   # EMA 衰减系数
-    clip_value: float = 5.0,                  # advantage 上下界
+    teacher_log_probs: torch.Tensor,                          # (B, T)
+    response_mask: torch.Tensor,                              # (B, T)
+    index,                                                    # uid for group normalization
+    use_vce: bool = True,                                     # True: A_raw=Q-V_CE, False: A_raw=Q only
+    use_log_pi_s: bool = False,                               # True: A_raw=Q-log_pi_s (SDPO-style，隐式熵保护)
+    student_topk_log_probs: Optional[torch.Tensor] = None,   # (B, T, K) 仅 use_vce=True 时需要
+    teacher_at_student_topk: Optional[torch.Tensor] = None,  # (B, T, K) 仅 use_vce=True 时需要
+    student_log_probs: Optional[torch.Tensor] = None,        # (B, T) 仅 use_log_pi_s=True 时需要
+    norm_adv_by_std: bool = True,                             # 是否除以 group std
+    adv_std_floor: float = 0.0,                               # std 下界
+    clip_value: float = 3.0,                                  # 归一化后的 clip 阈值（≈±3σ）
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Self-Teacher Advantage with Bidirectional Baselines
-    
+    Self-Teacher Advantage with V_CE baseline + group-level normalization (seq mode).
+
     核心公式：
-        Q_t = log π_teacher(y_t | x, f, y_{<t})  # teacher 对实际 token 的评分
-        V_CE_t = Σ π_student(a_k) · log π_teacher(a_k)  # 横向 baseline
-        V_EMA_t = α·V_EMA_{t-1} + (1-α)·Q_{t-1}  # 纵向 baseline
-        V_t = β·V_CE + (1-β)·V_EMA
-        A_t = Q_t - V_t
-    
-    特点：
-        - 无需 z-score 归一化，teacher≈student 时 A_t≈0 自然安全退化
-        - 无需 entropy gate，无需 token filter
-        - V_CE 保证 variance reduction 理论最优
-        - V_EMA 捕捉 response 内质量转折和 context pollution
-    
+        Q[i,t]    = log π_teacher(y_t)                               # teacher 对采样 token 的评分
+        V_CE[i,t] = Σ_k π_student(k) · log π_teacher(k)            # token-level 期望 baseline
+        A_raw[i,t] = Q[i,t] - V_CE[i,t]  (use_vce=True)
+                   = Q[i,t]               (use_vce=False，等价于 GRPO+teacher_log_prob)
+
+    Group normalization（seq 模式，消除 length bias）：
+        seq_a_i   = mean(A_raw[i,t] for t in response_i)  # seq-level 标量
+        group_mean = mean(seq_a_i for i in group)
+        group_std  = std(seq_a_i  for i in group)
+        adv[i,t]  = (A_raw[i,t] - group_mean) / group_std  # 仍是 token-level
+
+    Clip 在归一化之后：adv = clamp(adv, -clip_value, clip_value)
+
+    设计说明：
+        - V_EMA 已去除：实验证明 beta=0.5/0.7/1.0 熵崩溃速度完全一致，V_EMA 无效
+        - per-response centering 已替换为 group-level normalization（消除系统性正偏置）
+        - use_vce=False 可消融验证 V_CE 的 variance reduction 价值
+
     Args:
         teacher_log_probs: (B, T) teacher 对实际生成 token 的 log prob
-        student_topk_log_probs: (B, T, K) student 的 top-K log probs
-        student_topk_indices: (B, T, K) student 的 top-K token ids
-        teacher_at_student_topk: (B, T, K) teacher 在 student top-K 位置的 log probs
         response_mask: (B, T) valid token mask
-        beta: V_CE vs V_EMA 融合系数 [0, 1]
-        ema_alpha: EMA 衰减系数
-        clip_value: advantage clipping 阈值
-    
+        index: uid list，用于分组归一化（同一 prompt 的多条 rollout 为一组）
+        use_vce: 是否使用 V_CE 作为 token-level baseline
+        student_topk_log_probs: (B, T, K) student top-K log probs（use_vce=True 时需要）
+        teacher_at_student_topk: (B, T, K) teacher 在 student top-K 位置的 log probs（use_vce=True 时需要）
+        norm_adv_by_std: 是否除以 group std 做 z-score
+        adv_std_floor: group std 下界，防止 std 过小导致 adv 爆炸
+        clip_value: 归一化后的 clip 阈值
+
     Returns:
         advantages: (B, T) token-level advantage
-        filtered_response_mask: (B, T) 与 response_mask 相同（self_teacher 模式不过滤 token）
+        filtered_response_mask: (B, T) 与 response_mask 相同（self_teacher 模式不额外过滤 token）
     """
-    B, T, K = student_topk_log_probs.shape
-    
-    # ===== Q_t: teacher 对实际选择的评分 =====
-    Q = teacher_log_probs  # (B, T)
-    
-    # ===== V_CE: 横向 baseline（cross-entropy） =====
-    # V_CE_t = E_student[teacher(·)] = Σ π_student(a_k) · log π_teacher(a_k)
-    student_probs = student_topk_log_probs.exp()  # (B, T, K)
-    student_probs_norm = student_probs / student_probs.sum(-1, keepdim=True).clamp(min=1e-8)
-    V_CE = (student_probs_norm * teacher_at_student_topk).sum(-1)  # (B, T)
-    
-    # ===== V_EMA: 纵向 baseline（causal EMA） =====
-    V_EMA = torch.zeros_like(Q)  # (B, T)
-    V_EMA[:, 0] = Q[:, 0]
-    for t in range(1, T):
-        V_EMA[:, t] = ema_alpha * V_EMA[:, t-1] + (1 - ema_alpha) * Q[:, t-1]
-    
-    # ===== 融合 baseline =====
-    V = beta * V_CE + (1 - beta) * V_EMA  # (B, T)
-    
-    # ===== Raw advantage =====
-    A = Q - V  # (B, T)
-    
-    # ===== Per-response mean-centering（消除 prompt 难度差异，不除 std） =====
-    A_masked = A * response_mask
-    seq_means = A_masked.sum(-1, keepdim=True) / response_mask.sum(-1, keepdim=True).clamp(min=1)
-    A = (A - seq_means) * response_mask
-    
-    # ===== Clipping（数值保护） =====
-    A = torch.clamp(A, -clip_value, clip_value)
-    
-    return A, response_mask  # advantages, filtered_response_mask
+    B, T = teacher_log_probs.shape
+
+    with torch.no_grad():
+        # ===== Step 1: Compute A_raw =====
+        Q = teacher_log_probs  # (B, T)
+
+        if use_log_pi_s:
+            # SDPO-style: A_raw = Q - log π_s(y_t)
+            # 隐式包含熵 bonus：当 student 集中时 log π_s → 0，adv → log π_t < 0（负反馈）
+            assert student_log_probs is not None, \
+                "use_log_pi_s=True requires student_log_probs"
+            A_raw = Q - student_log_probs
+        elif use_vce:
+            assert student_topk_log_probs is not None and teacher_at_student_topk is not None, \
+                "use_vce=True requires student_topk_log_probs and teacher_at_student_topk"
+            # V_CE_t = E_student[log π_teacher] = Σ_k π_student(k) · log π_teacher(k)
+            student_probs = student_topk_log_probs.exp()  # (B, T, K)
+            student_probs_norm = student_probs / student_probs.sum(-1, keepdim=True).clamp(min=1e-8)
+            V_CE = (student_probs_norm * teacher_at_student_topk).sum(-1)  # (B, T)
+            A_raw = Q - V_CE
+        else:
+            # Q only: 退化为 GRPO + teacher_log_prob reward（消融用）
+            A_raw = Q
+
+        A_raw = A_raw * response_mask  # zero out padding
+
+        # ===== Step 2: Group-level normalization (seq mode) =====
+        advantages = torch.zeros_like(A_raw)
+        uid_to_indices = defaultdict(list)
+        for i in range(B):
+            uid_to_indices[index[i]].append(i)
+
+        for uid, indices in uid_to_indices.items():
+            seq_means = []
+            valid_indices = []
+            for i in indices:
+                valid_a = A_raw[i][response_mask[i].bool()]
+                if valid_a.numel() > 0:
+                    seq_means.append(valid_a.mean())
+                    valid_indices.append(i)
+
+            if len(seq_means) == 0:
+                continue
+
+            seq_means_t = torch.stack(seq_means)  # (N_valid,)
+            group_mean = seq_means_t.mean()
+
+            if norm_adv_by_std:
+                std_floor = max(1e-8, adv_std_floor)
+                group_std = seq_means_t.std(unbiased=False).clamp(min=std_floor)
+            else:
+                group_std = None
+
+            for i in valid_indices:
+                adv_i = A_raw[i] - group_mean
+                if norm_adv_by_std and group_std is not None:
+                    adv_i = adv_i / group_std
+                advantages[i] = adv_i * response_mask[i]
+
+        # ===== Step 3: Clip AFTER normalization =====
+        advantages = torch.clamp(advantages, -clip_value, clip_value)
+
+        return advantages, response_mask  # advantages, filtered_response_mask
 
 
 def compute_tasd_advantage(
@@ -2541,6 +2582,7 @@ def compute_tasd_advantage(
     teacher_entropy_norm: Optional[torch.Tensor] = None,  # (B, T) teacher 归一化熵
     student_entropy_norm: Optional[torch.Tensor] = None,  # (B, T) student 归一化熵
     teacher_log_probs: Optional[torch.Tensor] = None,  # (B, T) teacher log probs on response tokens
+    student_log_probs: Optional[torch.Tensor] = None,   # (B, T) student log probs on response tokens (old_log_probs)
     student_topk_log_probs: Optional[torch.Tensor] = None,  # (B, T, K) student top-K log probs
     student_topk_indices: Optional[torch.Tensor] = None,  # (B, T, K) student top-K token ids
     teacher_at_student_topk: Optional[torch.Tensor] = None,  # (B, T, K) teacher at student top-K
@@ -2594,22 +2636,34 @@ def compute_tasd_advantage(
     
     # ── Self-Teacher Advantage 模式 ─────────────────────────────
     if adv_mode == "self_teacher":
-        beta = tasd_cfg.get("beta", 0.7)
-        ema_alpha = tasd_cfg.get("ema_alpha", 0.9)
-        clip_value = tasd_cfg.get("clip_value", 5.0)
-        
-        print(f"[Self-Teacher Adv] mode=self_teacher, beta={beta}, ema_alpha={ema_alpha}, clip={clip_value}")
-        
-        return compute_self_teacher_advantage(
+        use_vce = tasd_cfg.get("use_vce", True)
+        use_log_pi_s = tasd_cfg.get("use_log_pi_s", False)
+        norm_adv_by_std = tasd_cfg.get("norm_adv_by_std", True)
+        clip_value = tasd_cfg.get("clip_value", 3.0)
+        # adv_std_floor 解析（与 GRPO 路径保持一致）
+        adv_std_floor_raw = tasd_cfg.get("adv_std_floor", 0.0)
+        if isinstance(adv_std_floor_raw, (int, float)):
+            adv_std_floor = float(adv_std_floor_raw)
+        else:
+            adv_std_floor = 0.0
+
+        print(f"[Self-Teacher Adv] use_log_pi_s={use_log_pi_s}, use_vce={use_vce}, "
+              f"norm_by_std={norm_adv_by_std}, adv_std_floor={adv_std_floor}, clip={clip_value}")
+
+        adv, mask = compute_self_teacher_advantage(
             teacher_log_probs=teacher_log_probs,
-            student_topk_log_probs=student_topk_log_probs,
-            student_topk_indices=student_topk_indices,
-            teacher_at_student_topk=teacher_at_student_topk,
             response_mask=response_mask,
-            beta=beta,
-            ema_alpha=ema_alpha,
+            index=index,
+            use_vce=use_vce,
+            use_log_pi_s=use_log_pi_s,
+            student_topk_log_probs=student_topk_log_probs,
+            teacher_at_student_topk=teacher_at_student_topk,
+            student_log_probs=student_log_probs,
+            norm_adv_by_std=norm_adv_by_std,
+            adv_std_floor=adv_std_floor,
             clip_value=clip_value,
         )
+        return adv, adv, mask
     
     # ── GRPO Advantage 模式（原有逻辑） ─────────────────────────
     clip_adv = tasd_cfg.get("clip_adv", True)

@@ -44,13 +44,18 @@ algorithm:
     
     # ── Self-Teacher Advantage 配置 ────────────────────
     # 仅 adv_mode="self_teacher" 时生效
-    beta: 0.7                     # V_CE vs V_EMA 融合系数
-                                  # 1.0 = 纯 V_CE（最安全，variance reduction 最优）
-                                  # 0.7 = 推荐默认值（V_CE 主导，V_EMA 辅助）
-                                  # 0.5 = 等权融合（信号最强）
-                                  # 0.0 = 纯 V_EMA（不稳定，不推荐单独使用）
-    ema_alpha: 0.9                # V_EMA 衰减系数（half-life ≈ 6.6 tokens）
-    clip_value: 5.0               # advantage clipping 阈值（数值保护）
+    use_vce: true                 # 是否使用 V_CE 作为 token-level baseline
+                                  # True：A_raw = Q - V_CE（默认，variance reduction 最优）
+                                  # False：A_raw = Q only（消融实验，等价于 GRPO+teacher_log_prob）
+    use_log_pi_s: false           # 是否使用 log π_s(y_t) 作为 baseline（SDPO-style，隐式熵保护）
+                                  # True：A_raw = Q - log π_s（需要 old_log_probs，优先级高于 use_vce）
+                                  # 优先级：use_log_pi_s > use_vce > Q only
+    norm_adv_by_std: true         # group-level z-score（seq 模式），消除跨 prompt 梯度尺度不一致
+    adv_std_floor: 0.0            # group std 下界（0.0=无下界；float=固定下界）
+    clip_value: 3.0               # clip 阈值，在 group normalization 之后应用（≈±3σ）
+    # 已移除（实验证伪无效）：
+    # beta: 0.7       # V_EMA 权重（beta=0.5/0.7/1.0 熵崩溃速度完全一致，V_EMA 无效）
+    # ema_alpha: 0.9  # EMA 衰减系数
     
     # ── 核心参数（GRPO 模式）────────────────────────────
     # adv_mode="grpo" 时使用

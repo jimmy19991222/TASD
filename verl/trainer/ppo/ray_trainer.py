@@ -357,6 +357,7 @@ def compute_advantage(
 
         # self-teacher advantage 需要的参数
         teacher_log_probs = data.batch.get("tasd_teacher_log_probs", None)
+        student_log_probs = data.batch.get("old_log_probs", None)  # (B,T) student log prob on sampled token
         student_topk_log_probs = data.batch.get("tasd_student_topk_log_probs", None)
         teacher_at_student_topk = data.batch.get("tasd_teacher_at_student_topk", None)
 
@@ -370,6 +371,7 @@ def compute_advantage(
             teacher_entropy_norm=teacher_entropy_norm,
             student_entropy_norm=student_entropy_norm,
             teacher_log_probs=teacher_log_probs,
+            student_log_probs=student_log_probs,
             student_topk_log_probs=student_topk_log_probs,
             student_topk_indices=None,  # 不需要（已有 teacher_at_student_topk）
             teacher_at_student_topk=teacher_at_student_topk,

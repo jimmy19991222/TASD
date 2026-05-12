@@ -46,9 +46,9 @@ FILTER_GROUPS_METRIC="${FILTER_GROUPS_METRIC:-acc}"    # 过滤指标：acc / se
 FILTER_GROUPS_MAX_GEN="${FILTER_GROUPS_MAX_GEN:-0}"    # 最大重采样次数，0=不限制
 # ── Self-Teacher Advantage 配置 ─────────────────────────────────────
 ADV_MODE="${ADV_MODE:-grpo}"           # grpo | self_teacher
-BETA="${BETA:-0.7}"                    # V_CE vs V_EMA 融合系数
-EMA_ALPHA="${EMA_ALPHA:-0.9}"          # V_EMA 衰减系数
-CLIP_VALUE="${CLIP_VALUE:-5.0}"        # self_teacher advantage clipping 阈值
+USE_VCE="${USE_VCE:-true}"             # true: A_raw=Q-V_CE | false: A_raw=Q only (消融)
+USE_LOG_PI_S="${USE_LOG_PI_S:-false}"  # true: A_raw=Q-log_pi_s (SDPO-style,熵保护) | 优先级高于 use_vce
+CLIP_VALUE="${CLIP_VALUE:-3.0}"        # post-normalization clip 阈值（≈±3σ）
 
 # ── 路径 ────────────────────────────────────────────────────────────────
 train_data_path="${OSS_ROOT}/datasets/${DATASET}/train.parquet"
@@ -116,7 +116,8 @@ echo "  FILTER_GROUPS: enable=${FILTER_GROUPS_ENABLE}, metric=${FILTER_GROUPS_ME
 echo "  DISTILL_TOPK: ${DISTILL_TOPK}"
 echo "  ADV_MODE: ${ADV_MODE}"
 if [ "$ADV_MODE" = "self_teacher" ]; then
-    echo "  BETA: ${BETA}, EMA_ALPHA: ${EMA_ALPHA}, CLIP_VALUE: ${CLIP_VALUE}"
+    echo "  USE_VCE: ${USE_VCE}, USE_LOG_PI_S: ${USE_LOG_PI_S}, CLIP_VALUE: ${CLIP_VALUE}"
+    echo "  NORM_ADV_BY_STD: ${NORM_ADV_BY_STD}, ADV_STD_FLOOR: ${ADV_STD_FLOOR}"
 fi
 echo "  SEED: ${SEED}"
 echo "============================================"
@@ -148,8 +149,8 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.temperature=${ROLLOUT_TEMPERATURE} \
     actor_rollout_ref.rollout.seed=${SEED} \
     algorithm.tasd.adv_mode=${ADV_MODE} \
-    algorithm.tasd.beta=${BETA} \
-    algorithm.tasd.ema_alpha=${EMA_ALPHA} \
+    algorithm.tasd.use_vce=${USE_VCE} \
+    algorithm.tasd.use_log_pi_s=${USE_LOG_PI_S} \
     algorithm.tasd.clip_value=${CLIP_VALUE} \
     algorithm.tasd.reward_type=${REWARD_TYPE} \
     algorithm.tasd.entropy_gate=${ENTROPY_GATE} \
