@@ -43,6 +43,14 @@ export CLIP_VALUE="${CLIP_VALUE:-3.0}"
 export TEACHER_REG="${TEACHER_REG:-ema}"
 export TEACHER_UPDATE_RATE="${TEACHER_UPDATE_RATE:-0.1}"
 
+# ── 校验脚本会读的可选变量，全部显式 export 兜底 ──────────────────────
+export ADV_ENTROPY_WEIGHT="${ADV_ENTROPY_WEIGHT:-none}"
+export NORM_ADV_BY_STD="${NORM_ADV_BY_STD:-false}"
+export DISTILL_TOPK="${DISTILL_TOPK:-100}"
+export CLIP_ADV="${CLIP_ADV:-true}"
+export GROUP_MEAN_MODE="${GROUP_MEAN_MODE:-token}"
+export INCLUDE_SUCCESSFUL_ROLLOUTS="${INCLUDE_SUCCESSFUL_ROLLOUTS:-True}"
+
 # ── 实验命名（PROJECT_NAME 控制 SwanLab project）────────────────────────
 SUFFIX="${1:-local_smoke}"
 export JOB_NAME="${JOB_NAME:-LOCAL-TASD-adv${ADV_MODE}-vce${USE_VCE}-emar${TEACHER_UPDATE_RATE}-${SUFFIX}}"

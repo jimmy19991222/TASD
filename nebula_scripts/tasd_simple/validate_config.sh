@@ -55,6 +55,7 @@ if [ "$ADV_MODE" = "self_teacher" ]; then
 fi
 
 # 3. 检查 adv_entropy_weight 值是否有效
+ADV_ENTROPY_WEIGHT="${ADV_ENTROPY_WEIGHT:-none}"
 VALID_AEW="none teacher_conf certainty_diff"
 if ! echo "$VALID_AEW" | grep -qw "$ADV_ENTROPY_WEIGHT"; then
     echo "❌ 错误: adv_entropy_weight='$ADV_ENTROPY_WEIGHT' 无效"
