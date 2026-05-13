@@ -21,7 +21,7 @@ export OSS_ROOT="${OSS_ROOT:-/data/oss_bucket_0/ad/loujieming.ljm}"
 # ── 必须参数（parametric 脚本要求显式传入）──────────────────────────────
 export DATASET="${DATASET:-sciknoweval}"                  # 数据集名
 export SUBJECT="${SUBJECT:-biology}"                      # sciknoweval 下的 subject（biology/chemistry/material/physics）
-export MODEL_PATH="${MODEL_PATH:-${OSS_ROOT}/models/Qwen3-8B}"
+export MODEL_PATH="${MODEL_PATH:-${OSS_ROOT}/base_models/Qwen3-8B}"
 export REWARD_TYPE="${REWARD_TYPE:-teacher_log_prob}"     # teacher_prob | teacher_log_prob
 export ENTROPY_GATE="${ENTROPY_GATE:-none}"               # none | hard | hard_keep_reward | soft
 export ENTROPY_GATE_RATIO="${ENTROPY_GATE_RATIO:-1.0}"
