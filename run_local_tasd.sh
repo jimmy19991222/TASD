@@ -54,17 +54,21 @@ export INCLUDE_SUCCESSFUL_ROLLOUTS="${INCLUDE_SUCCESSFUL_ROLLOUTS:-True}"
 
 # ── 数据路径解析（优先级：TRAIN_DATA_PATH > DATA_ROOT 拼接 > OSS_ROOT 拼接）─────────
 export DATA_ROOT="${DATA_ROOT:-${PROJECT_ROOT}/datasets}"
-# 优先试 subject 子目录（如 sciknoweval/biology/），退化到 flat （如 sciknoweval/）
-_subject_train="${DATA_ROOT}/${DATASET}/${SUBJECT}/train.parquet"
-_flat_train="${DATA_ROOT}/${DATASET}/train.parquet"
+# 依次试：本地 subject 子目录 → 本地 flat → OSS subject 子目录 → OSS flat
+_candidates_train=(
+    "${DATA_ROOT}/${DATASET}/${SUBJECT}/train.parquet"
+    "${DATA_ROOT}/${DATASET}/train.parquet"
+    "${OSS_ROOT}/datasets/${DATASET}/${SUBJECT}/train.parquet"
+    "${OSS_ROOT}/datasets/${DATASET}/train.parquet"
+)
 if [ -z "${TRAIN_DATA_PATH:-}" ]; then
-    if [ -f "${_subject_train}" ]; then
-        export TRAIN_DATA_PATH="${_subject_train}"
-        export VAL_DATA_PATH="${VAL_DATA_PATH:-${DATA_ROOT}/${DATASET}/${SUBJECT}/test.parquet}"
-    elif [ -f "${_flat_train}" ]; then
-        export TRAIN_DATA_PATH="${_flat_train}"
-        export VAL_DATA_PATH="${VAL_DATA_PATH:-${DATA_ROOT}/${DATASET}/test.parquet}"
-    fi
+    for _cand in "${_candidates_train[@]}"; do
+        if [ -f "${_cand}" ]; then
+            export TRAIN_DATA_PATH="${_cand}"
+            export VAL_DATA_PATH="${VAL_DATA_PATH:-${_cand%/train.parquet}/test.parquet}"
+            break
+        fi
+    done
 fi
 
 # ── 实验命名（PROJECT_NAME 控制 SwanLab project）────────────────────────
@@ -79,9 +83,8 @@ if [ ! -d "${OSS_ROOT}" ]; then
     echo "⚠️  OSS_ROOT=${OSS_ROOT} 不存在（未挂载）。save_path 依赖它，但本地 smoke 可忽略。"
 fi
 if [ -z "${TRAIN_DATA_PATH:-}" ]; then
-    echo "❌ 未找到本地数据："
-    echo "   - ${_subject_train}"
-    echo "   - ${_flat_train}"
+    echo "❌ 未找到数据（试过以下候选）："
+    for _cand in "${_candidates_train[@]}"; do echo "   - ${_cand}"; done
     echo "   请 export DATA_ROOT=/your/datasets 或直接 export TRAIN_DATA_PATH=/abs/path/train.parquet"
     exit 1
 fi
