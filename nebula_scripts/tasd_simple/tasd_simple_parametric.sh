@@ -51,8 +51,8 @@ USE_LOG_PI_S="${USE_LOG_PI_S:-false}"  # true: A_raw=Q-log_pi_s (SDPO-style,熵�
 CLIP_VALUE="${CLIP_VALUE:-3.0}"        # post-normalization clip 阈值（≈±3σ）
 
 # ── 路径 ────────────────────────────────────────────────────────────────
-train_data_path="${OSS_ROOT}/datasets/${DATASET}/train.parquet"
-val_data_path="${OSS_ROOT}/datasets/${DATASET}/test.parquet"
+train_data_path="${TRAIN_DATA_PATH:-${OSS_ROOT}/datasets/${DATASET}/train.parquet}"
+val_data_path="${VAL_DATA_PATH:-${OSS_ROOT}/datasets/${DATASET}/test.parquet}"
 model_path="${MODEL_PATH}"
 save_path="${OSS_ROOT}/models/${JOB_NAME:-tasd_simple}"
 

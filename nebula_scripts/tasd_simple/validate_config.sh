@@ -77,7 +77,7 @@ if [ "${INCLUDE_SUCCESSFUL_ROLLOUTS:-True}" = "True" ]; then
 fi
 
 # 6. 检查数据集存在
-TRAIN_DATA="/data/oss_bucket_0/ad/loujieming.ljm/datasets/${DATASET}/train.parquet"
+TRAIN_DATA="${TRAIN_DATA_PATH:-${OSS_ROOT:-/data/oss_bucket_0/ad/loujieming.ljm}/datasets/${DATASET}/train.parquet}"
 if [ ! -f "$TRAIN_DATA" ]; then
     echo "❌ 错误: 训练数据不存在: $TRAIN_DATA"
     exit 1

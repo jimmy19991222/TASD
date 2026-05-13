@@ -19,7 +19,8 @@ cd "${PROJECT_ROOT}"
 export OSS_ROOT="${OSS_ROOT:-/data/oss_bucket_0/ad/loujieming.ljm}"
 
 # ── 必须参数（parametric 脚本要求显式传入）──────────────────────────────
-export DATASET="${DATASET:-sciknoweval}"                  # 数据集名（${OSS_ROOT}/datasets/${DATASET}/{train,test}.parquet）
+export DATASET="${DATASET:-sciknoweval}"                  # 数据集名
+export SUBJECT="${SUBJECT:-biology}"                      # sciknoweval 下的 subject（biology/chemistry/material/physics）
 export MODEL_PATH="${MODEL_PATH:-${OSS_ROOT}/models/Qwen3-8B}"
 export REWARD_TYPE="${REWARD_TYPE:-teacher_log_prob}"     # teacher_prob | teacher_log_prob
 export ENTROPY_GATE="${ENTROPY_GATE:-none}"               # none | hard | hard_keep_reward | soft
@@ -51,6 +52,21 @@ export CLIP_ADV="${CLIP_ADV:-true}"
 export GROUP_MEAN_MODE="${GROUP_MEAN_MODE:-token}"
 export INCLUDE_SUCCESSFUL_ROLLOUTS="${INCLUDE_SUCCESSFUL_ROLLOUTS:-True}"
 
+# ── 数据路径解析（优先级：TRAIN_DATA_PATH > DATA_ROOT 拼接 > OSS_ROOT 拼接）─────────
+export DATA_ROOT="${DATA_ROOT:-${PROJECT_ROOT}/datasets}"
+# 优先试 subject 子目录（如 sciknoweval/biology/），退化到 flat （如 sciknoweval/）
+_subject_train="${DATA_ROOT}/${DATASET}/${SUBJECT}/train.parquet"
+_flat_train="${DATA_ROOT}/${DATASET}/train.parquet"
+if [ -z "${TRAIN_DATA_PATH:-}" ]; then
+    if [ -f "${_subject_train}" ]; then
+        export TRAIN_DATA_PATH="${_subject_train}"
+        export VAL_DATA_PATH="${VAL_DATA_PATH:-${DATA_ROOT}/${DATASET}/${SUBJECT}/test.parquet}"
+    elif [ -f "${_flat_train}" ]; then
+        export TRAIN_DATA_PATH="${_flat_train}"
+        export VAL_DATA_PATH="${VAL_DATA_PATH:-${DATA_ROOT}/${DATASET}/test.parquet}"
+    fi
+fi
+
 # ── 实验命名（PROJECT_NAME 控制 SwanLab project）────────────────────────
 SUFFIX="${1:-local_smoke}"
 export JOB_NAME="${JOB_NAME:-LOCAL-TASD-adv${ADV_MODE}-vce${USE_VCE}-emar${TEACHER_UPDATE_RATE}-${SUFFIX}}"
@@ -60,8 +76,13 @@ export GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
 
 # ── 关掉 OSS 依赖时的兜底（如果 OSS 没挂）────────────────────────────────
 if [ ! -d "${OSS_ROOT}" ]; then
-    echo "⚠️  OSS_ROOT=${OSS_ROOT} 不存在，请先挂载 OSS 或改本地路径"
-    echo "    需要存在: ${OSS_ROOT}/datasets/${DATASET}/{train,test}.parquet"
+    echo "⚠️  OSS_ROOT=${OSS_ROOT} 不存在（未挂载）。save_path 依赖它，但本地 smoke 可忽略。"
+fi
+if [ -z "${TRAIN_DATA_PATH:-}" ]; then
+    echo "❌ 未找到本地数据："
+    echo "   - ${_subject_train}"
+    echo "   - ${_flat_train}"
+    echo "   请 export DATA_ROOT=/your/datasets 或直接 export TRAIN_DATA_PATH=/abs/path/train.parquet"
     exit 1
 fi
 
@@ -72,7 +93,8 @@ export N_GPUS_PER_NODE=4
 echo "========================================================================"
 echo "Local TASD launch:"
 echo "  GPUs           : 4 × H20-3e (144GB each)"
-echo "  DATASET        : ${DATASET}"
+echo "  DATASET        : ${DATASET} (subject=${SUBJECT})"
+echo "  TRAIN_DATA     : ${TRAIN_DATA_PATH:-${OSS_ROOT}/datasets/${DATASET}/train.parquet}"
 echo "  MODEL          : ${MODEL_PATH}"
 echo "  ADV_MODE       : ${ADV_MODE} (use_vce=${USE_VCE}, use_log_pi_s=${USE_LOG_PI_S})"
 echo "  EMA rate       : ${TEACHER_UPDATE_RATE}  (修复后真生效)"
