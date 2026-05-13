@@ -20,7 +20,7 @@ export OSS_ROOT="${OSS_ROOT:-/data/oss_bucket_0/ad/loujieming.ljm}"
 
 # ── 必须参数（parametric 脚本要求显式传入）──────────────────────────────
 export DATASET="${DATASET:-sciknoweval}"                  # 数据集名（${OSS_ROOT}/datasets/${DATASET}/{train,test}.parquet）
-export MODEL_PATH="${MODEL_PATH:-Qwen/Qwen2.5-7B-Instruct}"
+export MODEL_PATH="${MODEL_PATH:-${OSS_ROOT}/models/Qwen3-8B}"
 export REWARD_TYPE="${REWARD_TYPE:-teacher_log_prob}"     # teacher_prob | teacher_log_prob
 export ENTROPY_GATE="${ENTROPY_GATE:-none}"               # none | hard | hard_keep_reward | soft
 export ENTROPY_GATE_RATIO="${ENTROPY_GATE_RATIO:-1.0}"
@@ -63,7 +63,7 @@ export N_GPUS_PER_NODE=4
 
 echo "========================================================================"
 echo "Local TASD launch:"
-echo "  GPUs           : 4 × H20-3e"
+echo "  GPUs           : 4 × H20-3e (144GB each)"
 echo "  DATASET        : ${DATASET}"
 echo "  MODEL          : ${MODEL_PATH}"
 echo "  ADV_MODE       : ${ADV_MODE} (use_vce=${USE_VCE}, use_log_pi_s=${USE_LOG_PI_S})"
