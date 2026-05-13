@@ -50,8 +50,7 @@ algorithm:
     use_log_pi_s: false           # 是否使用 log π_s(y_t) 作为 baseline（SDPO-style，隐式熵保护）
                                   # True：A_raw = Q - log π_s（需要 old_log_probs，优先级高于 use_vce）
                                   # 优先级：use_log_pi_s > use_vce > Q only
-    norm_adv_by_std: true         # group-level z-score（seq 模式），消除跨 prompt 梯度尺度不一致
-    adv_std_floor: 0.0            # group std 下界（0.0=无下界；float=固定下界）
+    # norm_adv_by_std / adv_std_floor 合并到下面“advantage clipping”区统一定义。
     clip_value: 3.0               # clip 阈值，在 group normalization 之后应用（≈±3σ）
     # 已移除（实验证伪无效）：
     # beta: 0.7       # V_EMA 权重（beta=0.5/0.7/1.0 熵崩溃速度完全一致，V_EMA 无效）
