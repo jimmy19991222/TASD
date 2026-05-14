@@ -394,6 +394,18 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    elif adv_estimator == "prior_shift":
+        # Prior-Shift (ours): A_t = A_seq · KL(P_T(·|y_≤t) ‖ P_T(·|y_<t)) / mean_t
+        adv_estimator_fn = core_algos.get_adv_estimator_fn("prior_shift")
+        advantages, returns = adv_estimator_fn(
+            token_level_rewards=data.batch["token_level_rewards"],
+            response_mask=data.batch["response_mask"],
+            index=data.non_tensor_batch["uid"],
+            teacher_prior_shift_surprise=data.batch.get("bc_teacher_prior_shift_surprise"),
+            config=config,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -2143,6 +2155,7 @@ class RayPPOTrainer:
                         if is_rlsd_like and "teacher_input_ids" in batch.batch:
                             _bc_temperature = self.config.actor_rollout_ref.rollout.temperature
                             _bc_micro_batch_size = self.config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu
+                            _bc_is_prior_shift = self.config.algorithm.adv_estimator == "prior_shift"
                             bc_fwd_batch = DataProto.from_dict(
                                 tensors={
                                     "teacher_input_ids":      batch.batch["teacher_input_ids"],
@@ -2159,6 +2172,8 @@ class RayPPOTrainer:
                                 "micro_batch_size": _bc_micro_batch_size,
                                 "pad_token_id":     self.tokenizer.pad_token_id,
                                 "distill_topk":     None,   # bayesian_credit baseline 不需要 top-K
+                                # Prior-Shift 需要在 teacher forward 内部算 KL(D_t ‖ D_{t-1})
+                                "compute_prior_shift_surprise": _bc_is_prior_shift,
                             }
                             with marked_timer("bc_teacher_fwd", timing_raw, color="cyan"):
                                 bc_teacher_result = self.actor_rollout_wg.compute_teacher_log_probs(
@@ -2167,6 +2182,10 @@ class RayPPOTrainer:
                             batch.batch["bc_teacher_log_probs"] = bc_teacher_result.batch[
                                 "teacher_log_probs_on_response"
                             ]
+                            if _bc_is_prior_shift and "prior_shift_surprise" in bc_teacher_result.batch:
+                                batch.batch["bc_teacher_prior_shift_surprise"] = bc_teacher_result.batch[
+                                    "prior_shift_surprise"
+                                ]
 
                         # ── TASD: 计算 teacher token-level rewards ─────────────────────
                         if is_tasd and "teacher_input_ids" in batch.batch:

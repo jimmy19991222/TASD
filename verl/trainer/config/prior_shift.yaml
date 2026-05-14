@@ -1,0 +1,69 @@
+defaults:
+  - ppo_trainer
+  - user
+  - _self_
+
+# Prior-Shift advantage (Bayesian Credit Assignment, ours, Tier 1 首发)
+#
+#   A_seq[i] = R_i - mean_{j∈group(i)} R_j
+#   g_t      = KL( P_T(·|x, y_≤t) ‖ P_T(·|x, y_<t) )    # teacher 自己 forward 的 Bayesian surprise
+#   ĝ_t      = g_t / mean_t(g_t)                          # per-sequence normalize on response_mask
+#   A_t      = A_seq · ĝ_t                                # 保持 mean_t A_t = A_seq
+#
+# 与 RLSD 关键差异：
+#   - credit 来源是 teacher 自己的 belief shift（不依赖 student log-prob）
+#   - 工程开销：仅 +1 次 teacher forward，logits 在 micro-batch 内消化为 (B,T)，不外传
+#
+# 与 SDPO 关键差异：
+#   - loss_mode 留默认 vanilla（PPO clip）
+#   - advantage 由 teacher Bayesian surprise reweight，不走 GRPO 原生
+
+max_model_len: 18944
+
+# ── 随机种子（可复现性）─────────────────────────────────────────────────
+seed: 42
+
+actor_rollout_ref:
+  actor:
+    ppo_mini_batch_size: 32
+    # loss_mode 留默认 vanilla（标准 PPO clip）
+    self_distillation:
+      max_reprompt_len: 10240
+      is_clip: 2.0
+      # ── teacher 来源 ─────────────────────────────────────
+      # ema       : 慢衰 EMA，update_rate 控制速率（推荐 0.05）
+      # hard_sync : 每 N step 把 teacher 拷贝为当前 student（待接入 sync_every）
+      teacher_regularization: ema
+      teacher_update_rate: 0.05
+      # ── 不需要 reprompt 注入 ─────────────────────────────
+      # Prior-Shift 仅需 teacher 在原始 (x, y) 上的 forward
+      include_environment_feedback: false
+      success_reward_threshold: 1.0
+      dont_reprompt_on_self_success: false
+    optim:
+      lr: 1e-5
+  rollout:
+    n: 8
+    calculate_log_probs: True
+
+algorithm:
+  adv_estimator: prior_shift
+  prior_shift:
+    # mean_t(g_t) 的下限，避免除 0
+    eps_norm: 1.0e-6
+    # ĝ_t 上限：超大 surprise token 不让 advantage 撑爆
+    max_ratio: 10.0
+    # 整序列 g≈0 时退化为 GRPO 平摊（ĝ_t = 1）
+    uniform_fallback: True
+    # 是否在 GRPO 阶段除 std（默认 False，与 baseline_grpo 对齐）
+    norm_adv_by_std_in_grpo: False
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+
+data:
+  train_batch_size: 32
+  gen_batch_size: ${data.train_batch_size}
+
+trainer:
+  val_before_train: False

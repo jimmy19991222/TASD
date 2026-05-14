@@ -778,6 +778,10 @@ class DataParallelPPOActor(BasePPOActor):
         为TASD计算teacher log-probs（清爽版）。
         支持 teacher_prob、teacher_log_prob reward_type 和 entropy_gate。
         当 entropy_gate != "none" 时需要 topk 信息。
+
+        额外支持 Prior-Shift 路径：当 meta_info["compute_prior_shift_surprise"]=True 时，
+        在 micro-batch 内部计算 g_t = KL( D_t ‖ D_{t-1} )，返回 (B, T) tensor
+        prior_shift_surprise，full-vocab logits 不外传（避免开销）。
         """
         self.actor_module.eval()
 
@@ -785,12 +789,14 @@ class DataParallelPPOActor(BasePPOActor):
         micro_batch_size = data.meta_info["micro_batch_size"]
         pad_token_id     = data.meta_info.get("pad_token_id", 0)
         distill_topk     = data.meta_info.get("distill_topk", None)
+        compute_prior_shift_surprise = data.meta_info.get("compute_prior_shift_surprise", False)
 
         teacher_model = self.teacher_module or self.actor_module
         micro_batches = data.split(micro_batch_size)
         teacher_log_probs_lst = []
         teacher_topk_lst = []
         student_topk_lst = []
+        prior_shift_surprise_lst = []
 
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
@@ -846,9 +852,26 @@ class DataParallelPPOActor(BasePPOActor):
                     teacher_outputs = self._forward_micro_batch(
                         teacher_inputs,
                         temperature=temperature,
+                        return_all_logps=compute_prior_shift_surprise,
                         module=teacher_model,
                     )
                 teacher_log_probs_lst.append(teacher_outputs["log_probs"])
+
+                # ── Prior-Shift: 在 micro-batch 内部算 g_t = KL(D_t ‖ D_{t-1}) ─────
+                if compute_prior_shift_surprise:
+                    log_p_curr = teacher_outputs["all_logps"]                # (b, T, V)
+                    # D_{t-1}: shift along T 轴（pos 0 无先验，后面手动置 0）
+                    log_p_prev = torch.roll(log_p_curr, shifts=1, dims=1)
+                    # KL(p_curr ‖ p_prev) = sum_v p_curr * (log_p_curr - log_p_prev)
+                    diff = log_p_curr - log_p_prev                          # (b, T, V)
+                    kl = (log_p_curr.exp() * diff).sum(dim=-1)              # (b, T)
+                    # 释放大 tensor
+                    del log_p_curr, log_p_prev, diff
+                    teacher_outputs.pop("all_logps", None)
+                    # pos 0 无 prior 可比 → g_0 = 0；数值安全：clamp 负值为 0
+                    kl[:, 0] = 0.0
+                    kl = kl.clamp(min=0.0)
+                    prior_shift_surprise_lst.append(kl.detach().to(torch.float32))
 
         result = {
             "teacher_log_probs_on_response": torch.cat(teacher_log_probs_lst, dim=0)
@@ -856,6 +879,8 @@ class DataParallelPPOActor(BasePPOActor):
         if teacher_topk_lst:
             result["teacher_topk_log_probs"] = torch.cat(teacher_topk_lst, dim=0)
             result["student_topk_log_probs"] = torch.cat(student_topk_lst, dim=0)
+        if prior_shift_surprise_lst:
+            result["prior_shift_surprise"] = torch.cat(prior_shift_surprise_lst, dim=0)
 
         return result
 
