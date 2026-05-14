@@ -1,0 +1,58 @@
+defaults:
+  - ppo_trainer
+  - user
+  - _self_
+
+# RLSD baseline (arXiv:2604.03128v2)
+# A_t = A_seq · clip( exp( sign(A_seq) · (log P_T(y_t) - log P_S(y_t)) ), 1±eps_w )
+#
+# 与 SDPO 的关键区别：
+#   - loss_mode: vanilla (PPO clip)，不走 KL 蒸馏 loss
+#   - advantage 由 teacher-student log-ratio 直接 reweight，不走 GRPO 原生
+#   - teacher 仍走 EMA self-distillation 框架装配，复用 fsdp_workers 装配链路
+
+max_model_len: 18944
+
+# ── 随机种子（可复现性）─────────────────────────────────────────────────
+seed: 42
+
+actor_rollout_ref:
+  actor:
+    ppo_mini_batch_size: 32
+    # loss_mode 留默认 vanilla（标准 PPO clip）
+    self_distillation:
+      max_reprompt_len: 10240
+      is_clip: 2.0
+      # ── teacher 来源 ─────────────────────────────────────
+      # ema       : 慢衰 EMA，update_rate 控制速率（推荐 0.05）
+      # hard_sync : 每 N step 把 teacher 拷贝为当前 student（待接入 sync_every）
+      teacher_regularization: ema
+      teacher_update_rate: 0.05
+      # ── 不需要 reprompt 注入 successful demo / feedback ─
+      # RLSD 公式只关心 teacher 在 student 同样 (x, y_<t) 上的 logit
+      include_environment_feedback: false
+      success_reward_threshold: 1.0
+      dont_reprompt_on_self_success: false
+    optim:
+      lr: 1e-5
+  rollout:
+    n: 8
+    calculate_log_probs: True
+
+algorithm:
+  adv_estimator: rlsd
+  rlsd:
+    # weight clip 半径，对应论文 ε_w
+    eps_w: 0.2
+    # 是否在 GRPO 阶段除 std（默认 False，与 baseline_grpo 对齐）
+    norm_adv_by_std_in_grpo: False
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+
+data:
+  train_batch_size: 32
+  gen_batch_size: ${data.train_batch_size}
+
+trainer:
+  val_before_train: False

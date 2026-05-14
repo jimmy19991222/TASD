@@ -893,11 +893,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if self._is_actor:
                 self_distillation_cfg = self.config.actor.get("self_distillation", None)
                 loss_mode = self.config.actor.policy_loss.get("loss_mode", "vanilla")
+                # adv_estimator-driven teacher: bayesian_credit 系列（rlsd / prior_shift / posterior_shift）
+                # 以 adv_estimator 触发 teacher_module 装配，不依赖 loss_mode。
+                _adv_est = None
+                _algo_cfg = getattr(self.config, "algorithm", None)
+                if _algo_cfg is not None:
+                    _adv_est = _algo_cfg.get("adv_estimator", None) if hasattr(_algo_cfg, "get") else getattr(_algo_cfg, "adv_estimator", None)
+                needs_teacher_module = loss_mode in ("sdpo", "tasd") or _adv_est in ("rlsd", "prior_shift", "posterior_shift")
                 # TASD/Self-Teacher 与 SDPO 共享 teacher_module 装配：两者的 teacher
                 # 架构应一致（独立参数 + EMA 滞后），仅 loss 路径不同（TASD 走 PPO vanilla，
                 # SDPO 走 KL/JSD 蒸馏）。此前漏判 'tasd' 会导致 TASD 下 teacher_module=None,
                 # forward 时 fallback 到 actor_module（student 当前权重），teacher 退化为 self。
-                if self_distillation_cfg is not None and loss_mode in ("sdpo", "tasd"):
+                if self_distillation_cfg is not None and needs_teacher_module:
                     teacher_regularization = self_distillation_cfg.get("teacher_regularization", "ema")
                     if teacher_regularization == "trust-region":
                         self.actor.teacher_module = TrustRegionTeacher(

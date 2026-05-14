@@ -206,10 +206,11 @@ class DataParallelPPOActor(BasePPOActor):
         """
         teacher_metrics: dict[str, float] = {}
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
-        loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-        # TASD/Self-Teacher 与 SDPO 共用 EMA teacher 机制：两者 teacher 架构一致，
-        # 仅 loss 路径不同（TASD 走 vanilla PPO，SDPO 走 KL 蒸馏）。
-        if not self_distillation_cfg or loss_mode not in ("sdpo", "tasd"):
+        # 依赖 teacher_module 是否装配作为运行闸：
+        #   - SDPO/TASD: fsdp_workers 里 loss_mode 装配
+        #   - RLSD/Prior-Shift/Posterior-Shift: fsdp_workers 里 adv_estimator 装配
+        # 以前用 loss_mode 判定会漏掉 RLSD（loss_mode=vanilla）。
+        if not self_distillation_cfg:
             return teacher_metrics
         teacher_regularization = getattr(self_distillation_cfg, "teacher_regularization", "ema")
         if teacher_regularization != "ema":
@@ -218,7 +219,8 @@ class DataParallelPPOActor(BasePPOActor):
         if update_rate == 0.0:
             return teacher_metrics
         if self.teacher_module is None or self.teacher_module is self.actor_module:
-            raise ValueError("EMA teacher requires a separate teacher_module in the actor worker.")
+            # 未装配独立 teacher（例如 GRPO baseline），跳过 EMA 更新。
+            return teacher_metrics
 
         # ─── 诊断：EMA 更新前的 teacher vs student 参数统计 ───
         pre_stats = self._compute_teacher_student_param_stats()

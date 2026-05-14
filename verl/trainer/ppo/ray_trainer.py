@@ -381,6 +381,19 @@ def compute_advantage(
         # filtered_response_mask 包含 effective_mask 的过滤（gate_mask + self_distillation_mask）
         # 被过滤的 token → advantage=0 且 response_mask=False → 不贡献梯度也不计入分母
         data.batch["response_mask"] = filtered_response_mask
+    elif adv_estimator == "rlsd":
+        # RLSD baseline (arXiv:2604.03128v2): A_t = A_seq · clip(exp(sign(A_seq)·(logp_T - logp_S)), 1±eps_w)
+        adv_estimator_fn = core_algos.get_adv_estimator_fn("rlsd")
+        advantages, returns = adv_estimator_fn(
+            token_level_rewards=data.batch["token_level_rewards"],
+            response_mask=data.batch["response_mask"],
+            index=data.non_tensor_batch["uid"],
+            teacher_log_probs=data.batch.get("bc_teacher_log_probs"),
+            student_log_probs=data.batch.get("old_log_probs"),
+            config=config,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -827,7 +840,10 @@ class RayPPOTrainer:
 
         is_sdpo = loss_mode == "sdpo"
         is_tasd = adv_estimator == "tasd"
-        if self_distillation_cfg is None or (not is_sdpo and not is_tasd):
+        # bayesian_credit estimators (rlsd / prior_shift / posterior_shift) all require
+        # the same self-distillation re-prompt machinery to assemble teacher inputs.
+        is_bayesian_credit = adv_estimator in ("rlsd", "prior_shift", "posterior_shift")
+        if self_distillation_cfg is None or (not is_sdpo and not is_tasd and not is_bayesian_credit):
             return None
 
         tasd_cfg = self.config.algorithm.get("tasd", {})
@@ -1897,8 +1913,11 @@ class RayPPOTrainer:
         )
         next_step_profile = False
 
-        # ── TASD 配置解析（循环外，避免每step重复读取）──────────
+        # ── TASD / RLSD 配置解析（循环外，避免每step重复读取）──────────
         is_tasd = self.config.algorithm.adv_estimator == AdvantageEstimator.TASD
+        # bayesian_credit estimators share the same lightweight teacher-forward path
+        # (only need teacher_log_probs_on_response, no entropy gate / token rewards).
+        is_rlsd_like = self.config.algorithm.adv_estimator in ("rlsd", "prior_shift", "posterior_shift")
         if is_tasd:
             _tasd_cfg = self.config.algorithm.get("tasd", {})
             tasd_reward_type = _tasd_cfg.get("reward_type", "teacher_prob")
@@ -2118,6 +2137,36 @@ class RayPPOTrainer:
                             metrics.update(kl_metrics)
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                        # ── RLSD/Prior-Shift/Posterior-Shift: lightweight teacher forward ──
+                        # 只取 teacher_log_probs_on_response，不动 token_level_rewards、不算 entropy gate。
+                        if is_rlsd_like and "teacher_input_ids" in batch.batch:
+                            _bc_temperature = self.config.actor_rollout_ref.rollout.temperature
+                            _bc_micro_batch_size = self.config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu
+                            bc_fwd_batch = DataProto.from_dict(
+                                tensors={
+                                    "teacher_input_ids":      batch.batch["teacher_input_ids"],
+                                    "teacher_attention_mask": batch.batch["teacher_attention_mask"],
+                                    "teacher_position_ids":   batch.batch["teacher_position_ids"],
+                                    "responses":              batch.batch["responses"],
+                                    "input_ids":              batch.batch["input_ids"],
+                                    "attention_mask":         batch.batch["attention_mask"],
+                                    "position_ids":           batch.batch["position_ids"],
+                                }
+                            )
+                            bc_fwd_batch.meta_info = {
+                                "temperature":      _bc_temperature,
+                                "micro_batch_size": _bc_micro_batch_size,
+                                "pad_token_id":     self.tokenizer.pad_token_id,
+                                "distill_topk":     None,   # bayesian_credit baseline 不需要 top-K
+                            }
+                            with marked_timer("bc_teacher_fwd", timing_raw, color="cyan"):
+                                bc_teacher_result = self.actor_rollout_wg.compute_teacher_log_probs(
+                                    bc_fwd_batch
+                                )
+                            batch.batch["bc_teacher_log_probs"] = bc_teacher_result.batch[
+                                "teacher_log_probs_on_response"
+                            ]
 
                         # ── TASD: 计算 teacher token-level rewards ─────────────────────
                         if is_tasd and "teacher_input_ids" in batch.batch:
