@@ -27,10 +27,23 @@ check_env EPS_W
 check_env TEACHER_REGULARIZATION
 check_env TEACHER_UPDATE_RATE
 
-# 数据集路径
-train_data_path="${OSS_ROOT}/datasets/${DATASET}/train.parquet"
-val_data_path="${OSS_ROOT}/datasets/${DATASET}/test.parquet"
-model_path="${OSS_ROOT}/base_models/${MODEL_NAME}"
+# 数据集路径：优先用 wrapper 已 export 的 TRAIN_DATA_PATH/VAL_DATA_PATH，
+# 否则按 SUBJECT（若提供）回退到 OSS 路径
+if [ -n "${TRAIN_DATA_PATH:-}" ]; then
+    train_data_path="${TRAIN_DATA_PATH}"
+elif [ -n "${SUBJECT:-}" ]; then
+    train_data_path="${OSS_ROOT}/datasets/${DATASET}/${SUBJECT}/train.parquet"
+else
+    train_data_path="${OSS_ROOT}/datasets/${DATASET}/train.parquet"
+fi
+if [ -n "${VAL_DATA_PATH:-}" ]; then
+    val_data_path="${VAL_DATA_PATH}"
+elif [ -n "${SUBJECT:-}" ]; then
+    val_data_path="${OSS_ROOT}/datasets/${DATASET}/${SUBJECT}/test.parquet"
+else
+    val_data_path="${OSS_ROOT}/datasets/${DATASET}/test.parquet"
+fi
+model_path="${MODEL_PATH:-${OSS_ROOT}/base_models/${MODEL_NAME}}"
 save_path="${OSS_ROOT}/models/${JOB_NAME:-rlsd_sweep}"
 
 # ── 动态 save_best_metric（按 DATASET 区分 val 指标路径）──────────────
