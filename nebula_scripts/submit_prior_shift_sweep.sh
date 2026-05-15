@@ -1,16 +1,17 @@
 #!/bin/bash
 # =============================================================================
-# Prior-Shift (Tier 1, Bayesian Credit Assignment 主菜) - Nebula 提交脚本
+# Prior-Shift v2 (Tier 1 改进) - Nebula 提交脚本
 #
-# 核心思想：
-#   - g_t = KL( P_T(·|x, y_≤t) ‖ P_T(·|x, y_<t) )（teacher belief shift）
-#   - A_t = A_seq · g_t / mean_t(g_t)  with clip(max=PS_MAX_RATIO)
-#   - 退化保护：mean(g)<eps 时 fallback 为 GRPO 平摊
+# v2 改动 vs v1 smoke:
+#   - max_ratio: 10 → 3 (P0: 防 advantage 爆炸 & length collapse)
+#   - min_response_length=50 + linear penalty (P0: 抵抗 stub answer)
+#   - renormalize_after_clip=True (P1: clip 后保 mean(ĝ)=1)
 #
-# 默认配置：1 个 smoke job（biology + 默认 PS_MAX_RATIO=10 + EMA r=0.05）
-# 扩展：把对应 LIST 里注释掉的项打开即可 sweep
+# 提交 2 个 job:
+#   Job 1 (PS-v2a): P0 only — renormalize_after_clip=False
+#   Job 2 (PS-v2b): P0+P1 — renormalize_after_clip=True
 #
-# 使用方式：
+# 使用方式:
 #   bash nebula_scripts/submit_prior_shift_sweep.sh [--dry-run]
 # =============================================================================
 set -euo pipefail
@@ -45,14 +46,20 @@ fi
 # 超参配置
 # =============================================================================
 
-# ── Prior-Shift 专属 ─────────────────────────────────────────────────
+# ── Prior-Shift v2 专属参数 ───────────────────────────────────────────
 PS_MAX_RATIO_LIST=(
-    "10.0"
-    # "5.0"
-    # "20.0"
+    "3.0"
 )
 PS_EPS_NORM="1.0e-6"
 PS_UNIFORM_FALLBACK="True"
+PS_MIN_RESPONSE_LENGTH="50"
+PS_LENGTH_PENALTY_TYPE="linear"
+
+# v2 ablation: renormalize_after_clip 分两组
+PS_RENORMALIZE_LIST=(
+    "False"   # v2a: P0 only
+    "True"    # v2b: P0+P1
+)
 
 # ── Teacher EMA ──────────────────────────────────────────────────────
 TEACHER_UPDATE_RATE_LIST=(
@@ -81,6 +88,7 @@ SUBMITTED=0
 
 for DATASET in "${DATASETS[@]}"; do
 for PS_MAX_RATIO in "${PS_MAX_RATIO_LIST[@]}"; do
+for PS_RENORMALIZE in "${PS_RENORMALIZE_LIST[@]}"; do
 for TEACHER_UPDATE_RATE in "${TEACHER_UPDATE_RATE_LIST[@]}"; do
     TOTAL=$((TOTAL + 1))
 
@@ -91,11 +99,16 @@ for TEACHER_UPDATE_RATE in "${TEACHER_UPDATE_RATE_LIST[@]}"; do
     MODEL_PATH="${OSS_ROOT}/base_models/${MODEL_NAME}"
 
     # Tags
+    if [ "$PS_RENORMALIZE" = "True" ]; then
+        VERSION_TAG="v2b"
+    else
+        VERSION_TAG="v2a"
+    fi
     MR_TAG="-mr${PS_MAX_RATIO}"
     EMA_TAG="-ema${TEACHER_UPDATE_RATE}"
     CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
 
-    JOB_NAME="PS-${DATASET_SHORT}${MR_TAG}${EMA_TAG}-${MODEL_SHORT}-${CURRENT_TIME}"
+    JOB_NAME="PS-${VERSION_TAG}-${DATASET_SHORT}${MR_TAG}${EMA_TAG}-${MODEL_SHORT}-${CURRENT_TIME}"
 
     # ── 提交 ────────────────────────────────────────────────────────
     if [ "$DRY_RUN" = true ]; then
@@ -103,6 +116,7 @@ for TEACHER_UPDATE_RATE in "${TEACHER_UPDATE_RATE_LIST[@]}"; do
         echo "Job #${TOTAL}: ${JOB_NAME}"
         echo "  DATASET=$DATASET"
         echo "  PS_MAX_RATIO=$PS_MAX_RATIO PS_EPS_NORM=$PS_EPS_NORM PS_UNIFORM_FALLBACK=$PS_UNIFORM_FALLBACK"
+        echo "  PS_RENORMALIZE=$PS_RENORMALIZE PS_MIN_RESP_LEN=$PS_MIN_RESPONSE_LENGTH PS_LEN_PENALTY=$PS_LENGTH_PENALTY_TYPE"
         echo "  TEACHER_REG=$TEACHER_REGULARIZATION TEACHER_UPDATE_RATE=$TEACHER_UPDATE_RATE"
         echo "  LR=$LR BS=$TRAIN_BATCH_SIZE/$MINI_BATCH_SIZE N=$ROLLOUT_N MODEL=$MODEL_NAME"
         echo "  GIT_BRANCH=$GIT_BRANCH GIT_COMMIT=$GIT_COMMIT"
@@ -114,7 +128,7 @@ for TEACHER_UPDATE_RATE in "${TEACHER_UPDATE_RATE_LIST[@]}"; do
             --engine=xdl \
             --queue=${QUEUE} \
             --entry=nebula_scripts/entry.py \
-            --user_params="--script_path=${SCRIPT_PATH} --world_size=${WORLD_SIZE} --job_name=${JOB_NAME} --env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=DATASET=${DATASET} --env=MODEL_NAME=${MODEL_NAME} --env=MODEL_PATH=${MODEL_PATH} --env=LR=${LR} --env=SEED=${SEED} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=MINI_BATCH_SIZE=${MINI_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=TEACHER_REGULARIZATION=${TEACHER_REGULARIZATION} --env=TEACHER_UPDATE_RATE=${TEACHER_UPDATE_RATE} --env=PS_MAX_RATIO=${PS_MAX_RATIO} --env=PS_EPS_NORM=${PS_EPS_NORM} --env=PS_UNIFORM_FALLBACK=${PS_UNIFORM_FALLBACK} --env=GIT_BRANCH=${GIT_BRANCH} --env=GIT_COMMIT=${GIT_COMMIT} --env=DINGTALK_WEBHOOK=https://oapi.dingtalk.com/robot/send?access_token=f598ad33b071751bf79d2484d8e1acefe8df9d879e129cae40340a158854f9cb --env=DINGTALK_SECRET=SECc5b9e4f61f56b32b46abf1ecedc11bdcba10dc35fbba8fa0ff62c084a1cc6ad3" \
+            --user_params="--script_path=${SCRIPT_PATH} --world_size=${WORLD_SIZE} --job_name=${JOB_NAME} --env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=DATASET=${DATASET} --env=MODEL_NAME=${MODEL_NAME} --env=MODEL_PATH=${MODEL_PATH} --env=LR=${LR} --env=SEED=${SEED} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=MINI_BATCH_SIZE=${MINI_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=TEACHER_REGULARIZATION=${TEACHER_REGULARIZATION} --env=TEACHER_UPDATE_RATE=${TEACHER_UPDATE_RATE} --env=PS_MAX_RATIO=${PS_MAX_RATIO} --env=PS_EPS_NORM=${PS_EPS_NORM} --env=PS_UNIFORM_FALLBACK=${PS_UNIFORM_FALLBACK} --env=PS_RENORMALIZE_AFTER_CLIP=${PS_RENORMALIZE} --env=PS_MIN_RESPONSE_LENGTH=${PS_MIN_RESPONSE_LENGTH} --env=PS_LENGTH_PENALTY_TYPE=${PS_LENGTH_PENALTY_TYPE} --env=GIT_BRANCH=${GIT_BRANCH} --env=GIT_COMMIT=${GIT_COMMIT} --env=DINGTALK_WEBHOOK=https://oapi.dingtalk.com/robot/send?access_token=f598ad33b071751bf79d2484d8e1acefe8df9d879e129cae40340a158854f9cb --env=DINGTALK_SECRET=SECc5b9e4f61f56b32b46abf1ecedc11bdcba10dc35fbba8fa0ff62c084a1cc6ad3" \
             --worker_count=${WORLD_SIZE} \
             --file.cluster_file=${CLUSTER_FILE} \
             --job_name=${JOB_NAME} \
@@ -138,6 +152,7 @@ for TEACHER_UPDATE_RATE in "${TEACHER_UPDATE_RATE_LIST[@]}"; do
         sleep 2
     fi
 
+done
 done
 done
 done

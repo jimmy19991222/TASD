@@ -28,8 +28,11 @@ check_env TEACHER_UPDATE_RATE
 
 # Prior-Shift 专属超参（带默认值）
 PS_EPS_NORM="${PS_EPS_NORM:-1.0e-6}"
-PS_MAX_RATIO="${PS_MAX_RATIO:-10.0}"
+PS_MAX_RATIO="${PS_MAX_RATIO:-3.0}"                   # v2: 10→3 防 length collapse
 PS_UNIFORM_FALLBACK="${PS_UNIFORM_FALLBACK:-True}"
+PS_RENORMALIZE_AFTER_CLIP="${PS_RENORMALIZE_AFTER_CLIP:-True}"   # v2 新增
+PS_MIN_RESPONSE_LENGTH="${PS_MIN_RESPONSE_LENGTH:-50}"           # v2 新增
+PS_LENGTH_PENALTY_TYPE="${PS_LENGTH_PENALTY_TYPE:-linear}"       # v2 新增: linear / zero
 
 # 数据集路径：优先用 wrapper 已 export 的 TRAIN_DATA_PATH/VAL_DATA_PATH，
 # 否则按 SUBJECT（若提供）回退到 OSS 路径
@@ -104,6 +107,9 @@ python -m verl.trainer.main_ppo \
     algorithm.prior_shift.eps_norm=${PS_EPS_NORM} \
     algorithm.prior_shift.max_ratio=${PS_MAX_RATIO} \
     algorithm.prior_shift.uniform_fallback=${PS_UNIFORM_FALLBACK} \
+    algorithm.prior_shift.renormalize_after_clip=${PS_RENORMALIZE_AFTER_CLIP} \
+    algorithm.prior_shift.min_response_length=${PS_MIN_RESPONSE_LENGTH} \
+    algorithm.prior_shift.length_penalty_type=${PS_LENGTH_PENALTY_TYPE} \
     algorithm.rollout_correction.rollout_is=token \
     trainer.total_epochs=30 \
     trainer.total_training_steps=250 \

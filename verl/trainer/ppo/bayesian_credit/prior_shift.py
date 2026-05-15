@@ -70,9 +70,14 @@ def compute_prior_shift_advantage(
     if config is not None:
         ps_cfg = config.get("prior_shift", {}) or {}
     eps_norm: float = float(ps_cfg.get("eps_norm", 1e-6))           # mean(g_t) 的下限，避免除 0
-    max_ratio: float = float(ps_cfg.get("max_ratio", 10.0))         # ĝ_t 的上限，防超大 surprise 撑爆 advantage
+    max_ratio: float = float(ps_cfg.get("max_ratio", 3.0))          # ĝ_t 的上限 (v2: 10→3 防 length collapse)
     uniform_fallback: bool = bool(ps_cfg.get("uniform_fallback", True))  # mean(g_t) ≈ 0 时退化为 GRPO 平摊
     norm_adv_by_std_in_grpo: bool = bool(ps_cfg.get("norm_adv_by_std_in_grpo", False))
+    # v2 新增：clip 后重新归一化（保证 mean(ĝ)=1，梯度量级不随 clip 比例漂移）
+    renormalize_after_clip: bool = bool(ps_cfg.get("renormalize_after_clip", True))
+    # v2 新增：response 长度下限惩罚（抵抗 length collapse）
+    min_response_length: int = int(ps_cfg.get("min_response_length", 50))
+    length_penalty_type: str = str(ps_cfg.get("length_penalty_type", "linear"))  # linear / zero
 
     B, T = token_level_rewards.shape
     device = token_level_rewards.device
@@ -114,6 +119,12 @@ def compute_prior_shift_advantage(
         # 上限保护：超大 surprise 不让 advantage 爆掉
         g_hat = g_hat.clamp(max=max_ratio)
 
+        # v2: clip 后重新归一化，保证 mean_t(ĝ_t)=1 → total magnitude = A_seq
+        if renormalize_after_clip:
+            g_hat_mean = (g_hat * mask).sum(dim=-1, keepdim=True) / L.unsqueeze(-1).clamp(min=1.0)
+            g_hat = g_hat / g_hat_mean.clamp(min=eps_norm)
+            g_hat = g_hat * mask  # 再 mask 一遍防 leak
+
         # 退化 fallback：整序列 g≈0 → ĝ_t = 1（与 GRPO 平摊一致）
         if uniform_fallback and degenerate.any():
             uniform = mask.clone()                                         # (B, T) =1 on response, else 0
@@ -124,5 +135,16 @@ def compute_prior_shift_advantage(
 
         # ── Step 3: 合成 token-level advantage ──────────────────────────────
         advantages = A_seq * g_hat * mask
+
+        # v2: length floor penalty — 抵抗 length collapse
+        if min_response_length > 0:
+            length_ratio = (L / float(min_response_length)).clamp(max=1.0)  # (B,) ∈ (0,1] 短序列<1
+            if length_penalty_type == "zero":
+                # 极端：短于阈值直接清零 advantage（不学这些 stub 回答）
+                length_scale = (L >= min_response_length).float()
+            else:
+                # linear：L/min_len 线性衰减，越短惩罚越重
+                length_scale = length_ratio
+            advantages = advantages * length_scale.unsqueeze(-1)
 
     return advantages, advantages
