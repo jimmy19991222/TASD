@@ -407,10 +407,12 @@ def compute_advantage(
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
     elif adv_estimator == "intervention_credit":
-        # Intervention-Credit (ours, base-agnostic causal layer):
-        #   A_seq = base_estimator_seq_advantage + λ·ΔR · 𝟙[intervention sample]
-        #   A_t   = A_seq · base_token_reweight · length_scale
-        # ΔR = R(y_intervened) - R(y_original), 由 intervention_rollout block 写入 batch
+        # TCCA (Token-level Causal Credit Assignment, ours):
+        #   A_seq = base_estimator_seq_advantage [+ λ_seq · ΔR · 𝟙[intervention] (legacy, 默认关)]
+        #   weight = base_token_reweight · (1 + λ_token · clip(c_t, ±clip))      ← TCCA token-level core
+        #   A_t   = A_seq · weight · length_scale
+        # c_t (token_causal_credit) 由 intervention_rollout block 在 top-K positions 写入:
+        #   composite y'_k 上 c_t = +ΔR_k at teacher 位置; 原 y 上 c_t = -ΔR_k at 相同位置
         # base_estimator ∈ {grpo, rlsd, prior_shift} 由 algorithm.intervention_credit.base_estimator 切换
         adv_estimator_fn = core_algos.get_adv_estimator_fn("intervention_credit")
         advantages, returns = adv_estimator_fn(
@@ -422,6 +424,7 @@ def compute_advantage(
             teacher_prior_shift_surprise=data.batch.get("bc_teacher_prior_shift_surprise"),  # base=prior_shift
             intervention_delta_reward=data.batch.get("intervention_delta_reward"),
             intervention_used=data.batch.get("intervention_used"),
+            token_causal_credit=data.batch.get("token_causal_credit"),        # TCCA per-token c_t
             config=config,
         )
         data.batch["advantages"] = advantages

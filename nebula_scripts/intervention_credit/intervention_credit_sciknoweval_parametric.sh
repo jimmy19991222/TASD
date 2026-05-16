@@ -42,11 +42,14 @@ IC_BASE_ESTIMATOR="${IC_BASE_ESTIMATOR:-grpo}"                    # grpo | rlsd 
 IC_RLSD_EPS_W="${IC_RLSD_EPS_W:-0.2}"                             # base=rlsd 专属
 IC_DIVERGENCE_METRIC="${IC_DIVERGENCE_METRIC:-argmax_excl_eos}"   # 3 种策略消融
 IC_EXCLUDE_TAIL_TOKENS="${IC_EXCLUDE_TAIL_TOKENS:-8}"
-IC_K="${IC_K:-2}"                                                 # intervention 长度
+IC_K="${IC_K:-2}"                                                 # intervention 长度 (每位置)
+IC_TOP_K="${IC_TOP_K:-3}"                                         # TCCA: top-K intervention 位置
 IC_FAILED_THRESHOLD="${IC_FAILED_THRESHOLD:-0.5}"
-IC_MAX_INTERVENTION_PER_GROUP="${IC_MAX_INTERVENTION_PER_GROUP:-7}"
+IC_MAX_INTERVENTION_PER_GROUP="${IC_MAX_INTERVENTION_PER_GROUP:-9}"  # TCCA: top_k 个 composite per failed
 IC_TEACHER_DECODE_TEMPERATURE="${IC_TEACHER_DECODE_TEMPERATURE:-0.0}"
-IC_LAMBDA_DR="${IC_LAMBDA_DR:-1.0}"
+IC_LAMBDA_DR="${IC_LAMBDA_DR:-0.0}"                               # legacy seq-level (TCCA 后默认关)
+IC_LAMBDA_TOKEN_CREDIT="${IC_LAMBDA_TOKEN_CREDIT:-1.0}"           # TCCA 核心
+IC_TOKEN_CREDIT_CLIP="${IC_TOKEN_CREDIT_CLIP:-2.0}"
 
 # g_t 防护参数（复用 prior_shift v2）
 IC_GT_EPS_NORM="${IC_GT_EPS_NORM:-1.0e-6}"
@@ -134,10 +137,13 @@ python -m verl.trainer.main_ppo \
     algorithm.intervention_credit.divergence_metric=${IC_DIVERGENCE_METRIC} \
     algorithm.intervention_credit.exclude_tail_tokens=${IC_EXCLUDE_TAIL_TOKENS} \
     algorithm.intervention_credit.intervention_length_k=${IC_K} \
+    algorithm.intervention_credit.top_k_positions=${IC_TOP_K} \
     algorithm.intervention_credit.failed_threshold=${IC_FAILED_THRESHOLD} \
     algorithm.intervention_credit.max_intervention_per_group=${IC_MAX_INTERVENTION_PER_GROUP} \
     algorithm.intervention_credit.teacher_decode_temperature=${IC_TEACHER_DECODE_TEMPERATURE} \
     algorithm.intervention_credit.lambda_delta_r=${IC_LAMBDA_DR} \
+    algorithm.intervention_credit.lambda_token_credit=${IC_LAMBDA_TOKEN_CREDIT} \
+    algorithm.intervention_credit.token_credit_clip=${IC_TOKEN_CREDIT_CLIP} \
     algorithm.intervention_credit.g_t.eps_norm=${IC_GT_EPS_NORM} \
     algorithm.intervention_credit.g_t.max_ratio=${IC_GT_MAX_RATIO} \
     algorithm.intervention_credit.g_t.renormalize_after_clip=${IC_GT_RENORMALIZE_AFTER_CLIP} \

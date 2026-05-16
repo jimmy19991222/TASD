@@ -72,20 +72,31 @@ algorithm:
     exclude_tail_tokens: 8
 
     # ── intervention 长度 / 触发条件 ──────────────────────────────────
-    # k: teacher 接管的 token 数
+    # k: teacher 接管的 token 数 (每个 intervention 位置)
     intervention_length_k: 2
+    # TCCA 核心: 每个失败 sample 在 top-K 位置分别做 intervention
+    top_k_positions: 3
     # reward < failed_threshold 视为失败 → 触发 intervention
     failed_threshold: 0.5
     # 每个 prompt 最多 append 几个 composite 样本（防 group 过大）
-    max_intervention_per_group: 7
+    # 注意: TCCA 下实际 append 数 = max_intervention_per_group (每 failed sample 产生 top_k composites)
+    max_intervention_per_group: 9
     # teacher 单步 forward 时的采样温度 (0.0=greedy)
     teacher_decode_temperature: 0.0
 
-    # ── ΔR 加权策略 ─────────────────────────────────────────────────
-    # lambda_delta_r: ΔR 在 seq-level credit 中的权重
-    #   A_seq[i] = (R_i - mean_group(R)) + λ · ΔR_i (仅对 intervention 样本)
-    # 当 enable_intervention=False 时此项无效（ΔR=0）
-    lambda_delta_r: 1.0
+    # ── TCCA: per-token causal credit ─────────────────────────────────
+    # lambda_token_credit: c_t 在 token-level reweight 中的权重
+    #   weight_t' = weight_t · (1 + λ_token · clip(c_t, ±clip))
+    #   c_t 来自 intervention_rollout: +ΔR at teacher 位置 / -ΔR at 原样本同位置
+    # 这是 TCCA 的核心创新通道, 默认 1.0
+    lambda_token_credit: 1.0
+    # c_t magnitude clip (避免单点极端 ΔR 让 token 权重爆炸)
+    token_credit_clip: 2.0
+
+    # ── (legacy) ΔR seq-level injection ──────────────────────────────
+    # TCCA 升级后默认关掉 (避免 double counting，c_t 已注入 token 级因果)
+    # 设 > 0 可同时启用 seq + token 两条信号
+    lambda_delta_r: 0.0
 
     # ── g_t per-token reweight (复用 prior_shift v2 防护) ─────────────
     g_t:

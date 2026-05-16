@@ -1,8 +1,43 @@
-# Teacher-Guided Dynamic Intervention Rollout
+# Teacher-Guided Dynamic Intervention Rollout → **TCCA (Token-level Causal Credit Assignment)**
 
-> **状态**：方案设计阶段  
-> **关联**：[Prior-Shift](file:///Users/awesome_jimmy/lazada/SDPO/verl/trainer/ppo/bayesian_credit/prior_shift.py) / [Bayesian Credit Assignment](#7-与-bayesian-credit-assignment-叙事的关系)  
-> **更新**：2026-05-15
+> **状态**：2026-05-16 升级为 TCCA (top-K interventions per failed sample → per-token causal credit)
+> **关联**：[Prior-Shift](file:///Users/awesome_jimmy/lazada/SDPO/verl/trainer/ppo/bayesian_credit/prior_shift.py) (ablation) / [实验进展报告](file:///Users/awesome_jimmy/lazada/SDPO/实验进展报告.md)
+> **更新**：2026-05-16 19:00
+
+---
+
+## 0. TCCA 升级说明 (2026-05-16)
+
+旧 TGDI (Phase 2 V1) 只在单点 t\* 做 intervention，本质是"数据增强 + 微弱 seq-level advantage tweak"，**不算 token-level credit assignment 创新**。
+
+升级为 TCCA：对每个失败 sample 在 **top-K 位置**分别做 intervention，得到 K 个独立 ΔR_{t_k}，作为 **per-token causal credit**：
+
+```
+对失败 sample y:
+  1. 选 top-K divergence 位置 {t_1, ..., t_K} (典型 K=3)
+  2. for k in 1..K:
+       teacher 在 t_k 改写 intervention_length_k 个 token → composite y'_{t_k}
+       ΔR_{t_k} = R(y'_{t_k}) - R(y)
+  3. 构造 per-token causal credit c_t:
+       For 原 sample y: c_t = -ΔR_{t_k} at t = t_k, 0 elsewhere
+       For composite y'_{t_k}: c_t = +ΔR_{t_k} at t = t_k, 0 elsewhere
+  4. token-level advantage:
+       A_t = A_seq · base_reweight · (1 + λ_token · c_t_normalized) · length_scale
+```
+
+K 个 composite 全部 append 到 batch (Mode B append × K)，GRPO group advantage 自然处理。
+
+**与 TGDI 相比的核心区别**：
+| | TGDI Phase 2 V1 | TCCA |
+|---|---|---|
+| 干预位置数 | 1 (单 t\*) | **K (top-K)** |
+| 信号粒度 | seq 级 scalar ΔR | **token 级 vector c_t** |
+| credit 类型 | 数据增强 + seq 注入 | **真 token 级 causal credit** |
+| 论文 contribution | 数据增强 | **新 credit assignment 方法** |
+
+详见本文末"附录: TCCA 实现 spec"。
+
+---
 
 ---
 

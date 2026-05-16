@@ -91,6 +91,9 @@ def run_teacher_intervention_rollout(
 
     if not enable_intervention:
         # Phase 1 默认路径：仅做失败样本检测和 divergence 统计，不修改 batch
+        # 但需要写 token_causal_credit=0 兜底（让 advantage estimator 一致取得到字段）
+        T = batch.batch["responses"].shape[1]
+        batch.batch["token_causal_credit"] = torch.zeros(B, T, device=device, dtype=torch.float32)
         diag = _diagnose_only(batch, ic_cfg)
         metrics.update(diag)
         return InterventionResult(batch=batch, metrics=metrics)
@@ -225,6 +228,67 @@ def compute_divergence_position(batch, ic_cfg: dict) -> Optional[torch.Tensor]:
     return t_star
 
 
+def compute_topk_divergence_positions(
+    batch, ic_cfg: dict, top_k: int = 3
+) -> Optional[torch.Tensor]:
+    """**TCCA 新增**：返回每个 sample 的 top-K divergence 位置。
+
+    Returns:
+        (B, K) long tensor: positions[i, k] = i 样本第 k 高 divergence 位置 (response 坐标);
+        若所需输入不在 batch 中则返回 None。
+        K 个位置之间至少相隔 max(intervention_length_k, 4) 个 token (避免重叠).
+    """
+    metric: str = str(ic_cfg.get("divergence_metric", "argmax_excl_eos"))
+    exclude_tail: int = int(ic_cfg.get("exclude_tail_tokens", 8))
+    intervention_length: int = int(ic_cfg.get("intervention_length_k", 2))
+    min_gap: int = max(intervention_length, 4)
+
+    response_mask = batch.batch.get("response_mask")
+    if response_mask is None:
+        return None
+
+    if metric == "g_t_argmax":
+        g = batch.batch.get("bc_teacher_prior_shift_surprise")
+        if g is None:
+            return None
+        score = g.float()  # (B, T)
+    else:
+        logp_T = batch.batch.get("bc_teacher_log_probs")
+        logp_S = batch.batch.get("old_log_probs")
+        if logp_T is None or logp_S is None:
+            return None
+        score = (logp_T.float() - logp_S.float()).abs()
+
+    score = score * response_mask.float()
+
+    if metric == "argmax_excl_eos":
+        B, T = score.shape
+        L = response_mask.sum(dim=-1).long()
+        idx = torch.arange(T, device=score.device).unsqueeze(0).expand(B, T)
+        keep = idx < (L - exclude_tail).unsqueeze(-1).clamp(min=1)
+        score = score * keep.float()
+
+    # ── greedy top-K with min_gap suppression ─────────────────────────
+    # 不能直接 topk(K)，因为相邻位置 score 可能都高且会 overlap。
+    # 用 greedy: 选最大 → 屏蔽 [t-min_gap, t+min_gap] → 选次大 → ...
+    B, T = score.shape
+    device = score.device
+    work_score = score.clone()
+    topk_positions = torch.zeros(B, top_k, dtype=torch.long, device=device)
+
+    for k in range(top_k):
+        t_k = work_score.argmax(dim=-1)  # (B,)
+        topk_positions[:, k] = t_k
+        # 屏蔽该位置周围 min_gap 区间
+        idx = torch.arange(T, device=device).unsqueeze(0).expand(B, T)
+        mask_around = (idx >= (t_k - min_gap).unsqueeze(-1)) & (idx <= (t_k + min_gap).unsqueeze(-1))
+        work_score = work_score.masked_fill(mask_around, float("-inf"))
+
+    # 若 sample 的所有 score 都 0（degenerate），所有 t_k 会指向 0；
+    # 调用方 (TCCA) 会按 failed_mask 过滤，degenerate 样本通常不在 failed_mask 内
+    return topk_positions
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Phase 2: 真实 intervention（占位）
 # ──────────────────────────────────────────────────────────────────────
@@ -239,29 +303,33 @@ def _do_real_intervention(
     tokenizer,
     ic_cfg: dict,
 ) -> InterventionResult:
-    """Phase 2 V1: 真实 teacher 介入 + Mode B append.
+    """**TCCA (Token-level Causal Credit Assignment)** — 真实 teacher 介入 + per-token causal credit.
+
+    对每个失败 sample 在 top-K positions 分别做 intervention，得到 K 个独立 ΔR_{t_k} 作为
+    **per-token causal credit**。这是 token-level credit assignment 的真创新（不是数据增强）。
 
     流程:
-      1. failed = R < threshold；t* = compute_divergence_position(batch)
-      2. 调用 actor_rollout_wg.teacher_generate_at_positions 在 [t*..t*+k-1] 生成 k 个 token
-      3. 构造 composite responses = y_<t* + intervention + y_{t*+k:T}（保留学生原 tail）
-      4. reward_fn(composite_batch) → R(y')；ΔR = R(y') - R(y_s)
-      5. composite 复制原样本的 old_log_probs / ref_log_prob / bc_teacher_*（V1 简化；
-         k 个 teacher 位置上 PPO ratio 略不准，但占比 k/T ≈ 0.5%，clip 兜底）
-      6. DataProto.concat([batch, composite_batch]) 同 uid 加权
-      7. 写入 intervention_delta_reward / intervention_used 到 augmented batch
+      1. failed = R < threshold；top_k_positions = compute_topk_divergence_positions
+      2. for k in 1..K:
+         a. teacher 在 t_k 改写 intervention_length 个 token → composite y'_{t_k}
+         b. R(y'_{t_k}) → ΔR_{t_k} = R(y'_{t_k}) - R(y)
+         c. 构造 composite_k 的 token_causal_credit: c_t[k] = +ΔR_{t_k} at [t_k, t_k+intervention_length)
+      3. 构造原 batch 的 token_causal_credit: c_t[k] = -ΔR_{t_k} at 相同位置 (惩罚错误 token)
+      4. DataProto.concat([batch, composite_1, ..., composite_K])
+      5. 写入 13 个 intervention/* 指标 (含每 K 的 ΔR 分布)
 
-    V1 限制 (留 Phase 2.1 follow-up):
-      - 不真做 student tail 续写（保留学生原 tail 接 teacher intervention）
-      - 不重算 old_log_prob 在 composite 上（复制原样本，仅 k 位置不准）
-      - 不重算 bc_teacher_fwd 在 composite 上（uniform_fallback 兜底）
+    V1 限制 (留 Phase 2.2 follow-up):
+      - 不真做 student tail 续写（保留学生原 tail）
+      - composite 复制原样本 old_log_probs (k 位置 PPO ratio 略不准, clip 兜底)
+      - 不重算 bc_teacher_* 在 composite (uniform_fallback 兜底)
     """
     from verl.protocol import DataProto
     import numpy as np
     import torch
 
     failed_threshold: float = float(ic_cfg.get("failed_threshold", 0.5))
-    k: int = int(ic_cfg.get("intervention_length_k", 2))
+    intervention_length: int = int(ic_cfg.get("intervention_length_k", 2))
+    top_k: int = int(ic_cfg.get("top_k_positions", 3))   # TCCA: K 个 intervention 位置
     teacher_temp: float = float(ic_cfg.get("teacher_decode_temperature", 0.0))
     max_per_group: int = int(ic_cfg.get("max_intervention_per_group", 7))
 
@@ -281,185 +349,209 @@ def _do_real_intervention(
         ),
     }
 
-    if n_failed_total == 0:
-        # 没有失败样本 → 不 intervention，写零通道
-        batch.batch["intervention_delta_reward"] = torch.zeros(B, device=device, dtype=torch.float32)
-        batch.batch["intervention_used"] = torch.zeros(B, device=device, dtype=torch.float32)
-        metrics.update({
-            "intervention/applied_rate": 0.0,
-            "intervention/delta_reward_mean": 0.0,
-        })
-        return InterventionResult(batch=batch, metrics=metrics)
+    def _write_zeros_and_return(b):
+        b.batch["intervention_delta_reward"] = torch.zeros(B, device=device, dtype=torch.float32)
+        b.batch["intervention_used"] = torch.zeros(B, device=device, dtype=torch.float32)
+        b.batch["token_causal_credit"] = torch.zeros(
+            B, b.batch["responses"].shape[1], device=device, dtype=torch.float32
+        )
+        return InterventionResult(batch=b, metrics={**metrics, "intervention/applied_rate": 0.0})
 
-    # 按 uid 限制每组最多 max_per_group 个 intervention（避免组膨胀）
+    if n_failed_total == 0:
+        return _write_zeros_and_return(batch)
+
+    # 按 uid 限制每组最多 max_per_group 个 intervention sample（不是 K，是 uid 内 intervention 样本数）
+    # 由于每个失败 sample 会产出 K 个 composite，max_per_group 应理解为"每个 prompt 最多挑出几个失败 sample 做 TCCA"
+    # 防止单个 prompt 占满整个 batch 的 intervention 配额
+    max_failed_per_group: int = max(1, max_per_group // max(top_k, 1))
     uid = batch.non_tensor_batch["uid"]
     failed_indices_all = failed_mask.nonzero(as_tuple=True)[0].cpu().numpy()
     selected_indices = []
     per_group_count: dict = {}
     for idx in failed_indices_all:
         u = uid[idx]
-        if per_group_count.get(u, 0) < max_per_group:
+        if per_group_count.get(u, 0) < max_failed_per_group:
             selected_indices.append(int(idx))
             per_group_count[u] = per_group_count.get(u, 0) + 1
     failed_idx = torch.tensor(selected_indices, device=device, dtype=torch.long)
     n_failed = len(failed_idx)
 
     if n_failed == 0:
-        batch.batch["intervention_delta_reward"] = torch.zeros(B, device=device, dtype=torch.float32)
-        batch.batch["intervention_used"] = torch.zeros(B, device=device, dtype=torch.float32)
-        return InterventionResult(batch=batch, metrics=metrics)
+        return _write_zeros_and_return(batch)
 
-    # ── Step 2: 计算 t_star (失败样本) ─────────────────────────────────
-    t_star_all = compute_divergence_position(batch, ic_cfg)  # (B,) long
-    if t_star_all is None:
-        # 没有 teacher logp / g_t 通道 → 退化
-        batch.batch["intervention_delta_reward"] = torch.zeros(B, device=device, dtype=torch.float32)
-        batch.batch["intervention_used"] = torch.zeros(B, device=device, dtype=torch.float32)
-        metrics["intervention/applied_rate"] = 0.0
-        return InterventionResult(batch=batch, metrics=metrics)
+    # ── Step 2: 计算 top-K t_star (失败样本) ───────────────────────────
+    topk_all = compute_topk_divergence_positions(batch, ic_cfg, top_k=top_k)  # (B, K)
+    if topk_all is None:
+        return _write_zeros_and_return(batch)
 
-    t_star_failed = t_star_all[failed_idx]  # (n_failed,) — relative to response
+    topk_failed = topk_all[failed_idx]  # (n_failed, K) — 在 response 坐标
 
-    # 推导 prompt_length: input_ids = (B, P+T), responses = (B, T) → P = (P+T) - T
+    # 推导 prompt_length
     T = batch.batch["responses"].shape[1]
     L = batch.batch["input_ids"].shape[1]
-    P = L - T  # 假定 batch 内固定 prompt_length（左 pad 到 max_prompt_len）
+    P = L - T
 
-    t_star_abs_failed = (P + t_star_failed).long()  # 在 input_ids / teacher_input_ids 坐标系
+    topk_abs_failed = (P + topk_failed).long()  # (n_failed, K) 在 teacher_input_ids 坐标
 
-    # ── Step 3: 调用 worker 让 teacher 生成 k 个 token ──────────────
-    # 仅传 failed 子集
-    teacher_input_ids_f = batch.batch["teacher_input_ids"][failed_idx]
-    teacher_attn_f = batch.batch["teacher_attention_mask"][failed_idx]
-    teacher_pos_f = batch.batch["teacher_position_ids"][failed_idx]
+    # ── Step 3: 对每个 k 做一次 intervention rollout ──────────────────
+    # 每个失败 sample 会产生 K 个 composite samples (Mode B append × K)
 
-    sub_proto = DataProto.from_dict(
-        tensors={
-            "teacher_input_ids": teacher_input_ids_f,
-            "teacher_attention_mask": teacher_attn_f,
-            "teacher_position_ids": teacher_pos_f,
-            "t_star_abs": t_star_abs_failed,
-        },
-        meta_info={
-            "k": k,
-            "temperature": teacher_temp,
-        },
-    )
-    teacher_gen_out = actor_rollout_wg.teacher_generate_at_positions(sub_proto)
-    intervention_tokens = teacher_gen_out.batch["intervention_tokens"].to(device)  # (n_failed, k)
+    all_composite_batches = []
+    all_delta_r_per_k = []          # K-list of (n_failed,) tensors
+    all_composite_response_masks = []  # K-list of (n_failed, T) tensors（用于度量）
 
-    # ── Step 4: 构造 composite responses (替换 [t*, t*+k]) ─────────────
-    # 复制 failed 子集的 batch 字段，原地替换 token
-    composite_responses = batch.batch["responses"][failed_idx].clone()       # (n_failed, T)
-    composite_input_ids = batch.batch["input_ids"][failed_idx].clone()       # (n_failed, L)
-    composite_attention = batch.batch["attention_mask"][failed_idx].clone()  # (n_failed, L)
-    composite_position = batch.batch["position_ids"][failed_idx].clone()     # (n_failed, L)
-    composite_response_mask = batch.batch["response_mask"][failed_idx].clone()  # (n_failed, T)
+    for k_step in range(top_k):
+        t_star_k = topk_failed[:, k_step]                  # (n_failed,) response 坐标
+        t_star_abs_k = topk_abs_failed[:, k_step]          # (n_failed,) input_ids 坐标
 
-    bidx = torch.arange(n_failed, device=device)
-    for step in range(k):
-        pos_rel = (t_star_failed + step).long()  # (n_failed,)
-        pos_abs = (t_star_abs_failed + step).long()
-        valid_rel = (pos_rel < T)
-        valid_abs = (pos_abs < L)
-        if valid_rel.any():
-            v_idx = bidx[valid_rel]
-            composite_responses[v_idx, pos_rel[valid_rel]] = intervention_tokens[v_idx, step].long()
-            composite_response_mask[v_idx, pos_rel[valid_rel]] = 1
-        if valid_abs.any():
-            v_idx = bidx[valid_abs]
-            composite_input_ids[v_idx, pos_abs[valid_abs]] = intervention_tokens[v_idx, step].long()
-            composite_attention[v_idx, pos_abs[valid_abs]] = 1
+        # 子 batch
+        sub_proto = DataProto.from_dict(
+            tensors={
+                "teacher_input_ids": batch.batch["teacher_input_ids"][failed_idx],
+                "teacher_attention_mask": batch.batch["teacher_attention_mask"][failed_idx],
+                "teacher_position_ids": batch.batch["teacher_position_ids"][failed_idx],
+                "t_star_abs": t_star_abs_k,
+            },
+            meta_info={"k": intervention_length, "temperature": teacher_temp},
+        )
+        teacher_gen_out = actor_rollout_wg.teacher_generate_at_positions(sub_proto)
+        intervention_tokens = teacher_gen_out.batch["intervention_tokens"].to(device)  # (n_failed, intervention_length)
 
-    # ── Step 5: 构造 composite DataProto，re-score reward ─────────────
-    # 复制全部 batch / non_tensor_batch / meta_info 字段，仅替换被改动的 tensor
-    composite_tensors = {}
-    for key, val in batch.batch.items():
-        if not torch.is_tensor(val):
-            continue
-        if val.shape[0] != B:
-            # 不是 batch 维度的 tensor，跳过（不应发生但保险）
-            continue
-        composite_tensors[key] = val[failed_idx].clone()
-    # 替换被改动的几项
-    composite_tensors["responses"] = composite_responses
-    composite_tensors["input_ids"] = composite_input_ids
-    composite_tensors["attention_mask"] = composite_attention
-    composite_tensors["position_ids"] = composite_position
-    composite_tensors["response_mask"] = composite_response_mask
+        # 构造 composite_k：复制 failed 子集，替换 [t_star_k, t_star_k+intervention_length) 位置
+        comp_responses = batch.batch["responses"][failed_idx].clone()
+        comp_input_ids = batch.batch["input_ids"][failed_idx].clone()
+        comp_attention = batch.batch["attention_mask"][failed_idx].clone()
+        comp_position = batch.batch["position_ids"][failed_idx].clone()
+        comp_response_mask = batch.batch["response_mask"][failed_idx].clone()
 
-    # non_tensor: copy 所有 numpy array 字段对应的子集
-    composite_non_tensor = {}
-    for key, arr in batch.non_tensor_batch.items():
-        if isinstance(arr, np.ndarray) and len(arr) == B:
-            composite_non_tensor[key] = arr[failed_idx.cpu().numpy()].copy()
+        bidx = torch.arange(n_failed, device=device)
+        for d in range(intervention_length):
+            pos_rel = (t_star_k + d).long()
+            pos_abs = (t_star_abs_k + d).long()
+            valid_rel = (pos_rel >= 0) & (pos_rel < T)
+            valid_abs = (pos_abs >= 0) & (pos_abs < L)
+            if valid_rel.any():
+                v = bidx[valid_rel]
+                comp_responses[v, pos_rel[valid_rel]] = intervention_tokens[v, d].long()
+                comp_response_mask[v, pos_rel[valid_rel]] = 1
+            if valid_abs.any():
+                v = bidx[valid_abs]
+                comp_input_ids[v, pos_abs[valid_abs]] = intervention_tokens[v, d].long()
+                comp_attention[v, pos_abs[valid_abs]] = 1
 
-    composite_batch = DataProto(
-        batch=DataProto.from_dict(tensors=composite_tensors).batch,
-        non_tensor_batch=composite_non_tensor,
-        meta_info=dict(batch.meta_info or {}),
-    )
+        # 构造 composite_k DataProto
+        comp_tensors = {}
+        for key, val in batch.batch.items():
+            if not torch.is_tensor(val) or val.shape[0] != B:
+                continue
+            comp_tensors[key] = val[failed_idx].clone()
+        comp_tensors["responses"] = comp_responses
+        comp_tensors["input_ids"] = comp_input_ids
+        comp_tensors["attention_mask"] = comp_attention
+        comp_tensors["position_ids"] = comp_position
+        comp_tensors["response_mask"] = comp_response_mask
 
-    # 删除会让 reward_fn 短路的字段（rm_scores 若存在会跳过重算）
-    if "rm_scores" in composite_batch.batch.keys():
-        composite_batch.batch.pop("rm_scores")
-    # 同样删除 token_level_scores / token_level_rewards 让 reward_fn 重新计算
-    for k_pop in ["token_level_scores", "token_level_rewards", "advantages", "returns"]:
-        if k_pop in composite_batch.batch.keys():
-            composite_batch.batch.pop(k_pop)
+        comp_non_tensor = {}
+        for key, arr in batch.non_tensor_batch.items():
+            if isinstance(arr, np.ndarray) and len(arr) == B:
+                comp_non_tensor[key] = arr[failed_idx.cpu().numpy()].copy()
 
-    # 调用 reward_fn 重新打分
-    try:
-        rew_result = reward_fn(composite_batch, return_dict=True)
-        new_reward_tensor = rew_result["reward_tensor"].to(device)  # (n_failed, T)
-    except TypeError:
-        # 兼容只返回 tensor 的 manager
-        new_reward_tensor = reward_fn(composite_batch).to(device)
+        composite_k = DataProto(
+            batch=DataProto.from_dict(tensors=comp_tensors).batch,
+            non_tensor_batch=comp_non_tensor,
+            meta_info=dict(batch.meta_info or {}),
+        )
 
-    # ── Step 6: ΔR 计算 ──────────────────────────────────────────────
-    composite_seq_reward = new_reward_tensor.sum(dim=-1)             # (n_failed,)
-    original_seq_reward = seq_reward[failed_idx]                     # (n_failed,)
-    delta_r = composite_seq_reward - original_seq_reward             # (n_failed,)
+        # 清掉会让 reward_fn 短路的字段
+        for k_pop in ["rm_scores", "token_level_scores", "token_level_rewards", "advantages", "returns"]:
+            if k_pop in composite_k.batch.keys():
+                composite_k.batch.pop(k_pop)
 
-    # 在 composite_batch 上写入新 reward 字段（让后续 advantage 计算能用）
-    composite_batch.batch["token_level_scores"] = new_reward_tensor
-    composite_batch.batch["token_level_rewards"] = new_reward_tensor
+        # 重打分
+        try:
+            rew_result = reward_fn(composite_k, return_dict=True)
+            new_reward_tensor_k = rew_result["reward_tensor"].to(device)
+        except TypeError:
+            new_reward_tensor_k = reward_fn(composite_k).to(device)
 
-    # composite 上的 intervention_delta_reward / intervention_used
-    composite_batch.batch["intervention_delta_reward"] = delta_r.float()
-    composite_batch.batch["intervention_used"] = torch.ones(n_failed, device=device, dtype=torch.float32)
+        # ΔR_k
+        composite_seq_reward_k = new_reward_tensor_k.sum(dim=-1)             # (n_failed,)
+        original_seq_reward = seq_reward[failed_idx]                          # (n_failed,)
+        delta_r_k = composite_seq_reward_k - original_seq_reward              # (n_failed,)
 
-    # ── Step 7: 原 batch 上写入零通道 ──────────────────────────────────
+        composite_k.batch["token_level_scores"] = new_reward_tensor_k
+        composite_k.batch["token_level_rewards"] = new_reward_tensor_k
+        composite_k.batch["intervention_delta_reward"] = delta_r_k.float()
+        composite_k.batch["intervention_used"] = torch.ones(n_failed, device=device, dtype=torch.float32)
+
+        # ── TCCA 核心：构造 composite_k 的 token_causal_credit ────
+        # composite_k 在 [t_star_k, t_star_k+intervention_length) 这些 token 是 teacher 选的,
+        # 它们造成了 R(y'_k) (相对 R(y) 有 ΔR_k 的因果效应)。
+        # → 这些 token 的 c_t = +ΔR_k (teacher token 应被奖励/惩罚, 由 ΔR_k 符号决定)
+        cc_k = torch.zeros(n_failed, T, device=device, dtype=torch.float32)
+        for d in range(intervention_length):
+            pos_rel = (t_star_k + d).long()
+            valid_rel = (pos_rel >= 0) & (pos_rel < T)
+            if valid_rel.any():
+                cc_k[bidx[valid_rel], pos_rel[valid_rel]] = delta_r_k[valid_rel].float()
+        composite_k.batch["token_causal_credit"] = cc_k
+
+        all_composite_batches.append(composite_k)
+        all_delta_r_per_k.append(delta_r_k)
+        all_composite_response_masks.append(comp_response_mask)
+
+    # ── Step 4: 构造原 batch 的 token_causal_credit ──────────────────
+    # 对原 sample, 同样位置 c_t = -ΔR_k (惩罚 student 在这些位置的错误选择)
+    # 多个 k 落到同一位置时取 sum (罕见, 我们已用 min_gap 避免大量重叠)
+    original_cc = torch.zeros(B, T, device=device, dtype=torch.float32)
+    for k_step in range(top_k):
+        t_star_k = topk_failed[:, k_step]
+        delta_r_k = all_delta_r_per_k[k_step]
+        for d in range(intervention_length):
+            pos_rel = (t_star_k + d).long()
+            valid_rel = (pos_rel >= 0) & (pos_rel < T)
+            if valid_rel.any():
+                bidx_valid = torch.arange(n_failed, device=device)[valid_rel]
+                target_b = failed_idx[bidx_valid]
+                # c_t accumulate (subtraction = penalty for wrong tokens)
+                original_cc[target_b, pos_rel[valid_rel]] -= delta_r_k[valid_rel].float()
+
+    batch.batch["token_causal_credit"] = original_cc
     batch.batch["intervention_delta_reward"] = torch.zeros(B, device=device, dtype=torch.float32)
     batch.batch["intervention_used"] = torch.zeros(B, device=device, dtype=torch.float32)
 
-    # ── Step 8: concat ────────────────────────────────────────────────
-    augmented_batch = DataProto.concat([batch, composite_batch])
+    # ── Step 5: concat 全部 K 个 composite + 原 batch ────────────────
+    augmented_batch = DataProto.concat([batch] + all_composite_batches)
 
-    # ── Phase 2 metrics（7 个新指标）─────────────────────────────────
-    composite_resp_mask_sum = composite_response_mask.float().sum(dim=-1)  # (n_failed,)
+    # ── TCCA metrics ─────────────────────────────────────────────────
+    # 汇总所有 K 个 ΔR
+    all_delta_r_flat = torch.cat(all_delta_r_per_k, dim=0)  # (K * n_failed,)
+    composite_resp_mean = torch.cat(
+        [m.float().sum(dim=-1) for m in all_composite_response_masks], dim=0
+    ).mean()
+
     metrics.update({
         "intervention/applied_rate": n_failed / max(B, 1),
-        "intervention/delta_reward_mean": float(delta_r.mean().item()),
-        "intervention/delta_reward_std": float(delta_r.std().item()) if delta_r.numel() > 1 else 0.0,
-        "intervention/delta_reward_min": float(delta_r.min().item()),
-        "intervention/delta_reward_max": float(delta_r.max().item()),
-        "intervention/delta_reward_pos_rate": float((delta_r > 0).float().mean().item()),
-        "intervention/composite_response_length_mean": float(composite_resp_mask_sum.mean().item()),
-        "intervention/n_appended_per_group_mean": (
-            float(np.mean(list(per_group_count.values()))) if per_group_count else 0.0
-        ),
-        "intervention/group_size_post_append_mean": float(B + n_failed) / float(len(set(uid))),
-        "intervention/group_size_post_append_max": (
-            float(max(per_group_count.values()) + max_per_group) if per_group_count else float(max_per_group)
-        ),
+        "intervention/top_k_positions": float(top_k),
+        "intervention/delta_reward_mean": float(all_delta_r_flat.mean().item()),
+        "intervention/delta_reward_std": float(all_delta_r_flat.std().item()) if all_delta_r_flat.numel() > 1 else 0.0,
+        "intervention/delta_reward_min": float(all_delta_r_flat.min().item()),
+        "intervention/delta_reward_max": float(all_delta_r_flat.max().item()),
+        "intervention/delta_reward_pos_rate": float((all_delta_r_flat > 0).float().mean().item()),
+        "intervention/composite_response_length_mean": float(composite_resp_mean.item()),
         "intervention/n_failed_total": float(n_failed_total),
-        "intervention/n_intervention_applied": float(n_failed),
+        "intervention/n_failed_selected": float(n_failed),
+        "intervention/n_composites_total": float(n_failed * top_k),
+        "intervention/group_size_post_append_mean": float(B + n_failed * top_k) / float(len(set(uid))),
+        # token causal credit 度量
+        "intervention/token_causal_credit_abs_mean": float(
+            (original_cc.abs().sum() + sum(c.batch["token_causal_credit"].abs().sum() for c in all_composite_batches))
+            / max(1.0, (original_cc.numel() + sum(c.batch["token_causal_credit"].numel() for c in all_composite_batches)))
+        ),
     })
 
-    # 还要补上 divergence position 度量（与 _diagnose_only 同款，保证两条路径指标一致）
+    # divergence position 度量（用第一个位置 t_star_k=0 当代表）
     diag_metrics = _diagnose_only(batch, ic_cfg)
-    # diag_metrics 里有些已被覆盖，仅补 divergence_position_*
     for key in [
         "intervention/divergence_position_mean",
         "intervention/divergence_position_std",

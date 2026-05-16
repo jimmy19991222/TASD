@@ -130,17 +130,26 @@ def compute_intervention_credit_advantage(
     teacher_log_probs: Optional[torch.Tensor] = None,             # (B, T)  for base=rlsd
     student_log_probs: Optional[torch.Tensor] = None,             # (B, T)  for base=rlsd (= old_log_probs)
     teacher_prior_shift_surprise: Optional[torch.Tensor] = None,  # (B, T)  for base=prior_shift
-    intervention_delta_reward: Optional[torch.Tensor] = None,     # (B,)    ΔR; None → no causal injection
+    intervention_delta_reward: Optional[torch.Tensor] = None,     # (B,)    ΔR (legacy seq-level)
     intervention_used: Optional[torch.Tensor] = None,             # (B,)    bool/float
+    token_causal_credit: Optional[torch.Tensor] = None,           # (B, T)  TCCA per-token causal credit c_t
     config: Optional[dict] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Intervention-Credit (base-agnostic causal layer)。
+    """**TCCA (Token-level Causal Credit Assignment)** — base-agnostic causal token-level credit.
 
     流程:
-      1. base seq advantage A_seq_base = base_estimator_seq_advantage(R, group)
-      2. ΔR 注入: A_seq = A_seq_base + λ·ΔR · 𝟙[intervention sample]
-      3. base token reweight: weight_t = ...    (依 base_estimator 不同)
-      4. 最终: A_t = A_seq · weight_t · length_scale(L)
+      1. base seq advantage A_seq_base = grpo_seq_advantage(R, group)
+      2. ΔR seq 级注入 (legacy 兼容, 默认 λ_seq=0): A_seq = A_seq_base + λ_seq · ΔR · 𝟙[intervention]
+      3. base token reweight: weight_t (依 base_estimator)
+      4. **TCCA: per-token causal credit modulation**: weight_t' = weight_t · (1 + λ_token · c_t_norm)
+      5. 最终: A_t = A_seq · weight_t' · length_scale(L)
+
+    c_t (token_causal_credit) 由 intervention_rollout 写入:
+      - For original samples y: c_t = -ΔR_{t_k} at intervention positions (penalty for wrong tokens)
+      - For composite samples y'_{t_k}: c_t = +ΔR_{t_k} at teacher-replaced positions (reward correct)
+      - Else: c_t = 0
+
+    若 c_t 缺失或全 0: TCCA 退化为旧 TGDI (Mode B append + λ_seq·ΔR)
 
     Args:
         token_level_rewards: (B, T) rule-based reward。
@@ -162,7 +171,13 @@ def compute_intervention_credit_advantage(
         ic_cfg = config.get("intervention_credit", {}) or {}
 
     base_estimator: str = str(ic_cfg.get("base_estimator", "grpo")).lower()
-    lambda_delta_r: float = float(ic_cfg.get("lambda_delta_r", 1.0))
+    # legacy seq-level ΔR injection (TCCA 升级后默认关掉，避免 double counting，
+    # 因为 c_t 已经把因果信号注入 token 级了)
+    lambda_delta_r: float = float(ic_cfg.get("lambda_delta_r", 0.0))
+    # TCCA 核心: per-token causal credit modulation strength
+    lambda_token_credit: float = float(ic_cfg.get("lambda_token_credit", 1.0))
+    # c_t 归一化的 magnitude clip (防止极端 ΔR 单点爆炸)
+    token_credit_clip: float = float(ic_cfg.get("token_credit_clip", 2.0))
     norm_adv_by_std: bool = bool(ic_cfg.get("norm_adv_by_std_in_grpo", False))
 
     min_response_length: int = int(ic_cfg.get("min_response_length", 50))
@@ -231,6 +246,18 @@ def compute_intervention_credit_advantage(
                 )
         else:
             raise ValueError(f"Unknown base_estimator: {base_estimator}. Choose grpo|rlsd|prior_shift.")
+
+        # ── Step 3.5 (TCCA core): per-token causal credit modulation ──
+        # weight_t' = weight_t · (1 + λ_token · clip(c_t, ±token_credit_clip))
+        # c_t > 0 (composite at teacher position 且 ΔR>0): boost weight (奖励正确选择)
+        # c_t < 0 (original sample 同位置): reduce/flip weight (惩罚错误选择)
+        if token_causal_credit is not None and lambda_token_credit > 0.0:
+            c_t = token_causal_credit.to(device=device, dtype=dtype)  # (B, T)
+            c_t = c_t.clamp(min=-token_credit_clip, max=token_credit_clip)
+            tcca_factor = 1.0 + lambda_token_credit * c_t            # (B, T)
+            # 保证 weight non-negative (避免符号翻转干扰 PPO)
+            tcca_factor = tcca_factor.clamp(min=0.0)
+            weight = weight * tcca_factor * mask                     # 再 mask 一遍防 leak
 
         # ── Step 4: 合成 token-level advantage ────────────────────────────
         advantages = A_seq * weight * mask
