@@ -30,6 +30,12 @@ check_env MODEL_NAME
 check_env TEACHER_REGULARIZATION
 check_env TEACHER_UPDATE_RATE
 
+# 可选 env: 用于本地 notebook smoke / tstar 模式覆盖 (默认值与 Nebula 任务一致)
+TOTAL_STEPS="${TOTAL_STEPS:-250}"
+VAL_N="${VAL_N:-16}"
+VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-False}"
+N_GPUS_PER_NODE="${N_GPUS_PER_NODE:-4}"
+
 # Intervention-Credit 专属超参（带默认值）
 IC_ENABLE_INTERVENTION="${IC_ENABLE_INTERVENTION:-False}"        # Phase 1 默认 False
 IC_DIVERGENCE_METRIC="${IC_DIVERGENCE_METRIC:-argmax_excl_eos}"   # 3 种策略消融
@@ -116,7 +122,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.self_distillation.teacher_update_rate=${TEACHER_UPDATE_RATE} \
     actor_rollout_ref.actor.self_distillation.include_environment_feedback=False \
     actor_rollout_ref.rollout.n=${ROLLOUT_N} \
-    actor_rollout_ref.rollout.val_kwargs.n=16 \
+    actor_rollout_ref.rollout.val_kwargs.n=${VAL_N} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
     algorithm.adv_estimator=intervention_credit \
@@ -136,11 +142,11 @@ python -m verl.trainer.main_ppo \
     algorithm.intervention_credit.length_penalty_type=${IC_LENGTH_PENALTY_TYPE} \
     algorithm.rollout_correction.rollout_is=token \
     trainer.total_epochs=30 \
-    trainer.total_training_steps=250 \
+    trainer.total_training_steps=${TOTAL_STEPS} \
     trainer.save_freq=-1 \
     trainer.save_best_metric="${SAVE_BEST_METRIC}" \
-    trainer.n_gpus_per_node=4 \
-    trainer.val_before_train=False \
+    trainer.n_gpus_per_node=${N_GPUS_PER_NODE} \
+    trainer.val_before_train=${VAL_BEFORE_TRAIN} \
     trainer.default_local_dir="${save_path}" \
     trainer.project_name="${PROJECT_NAME:-TGDI-Tier3}" \
     trainer.experiment_name="${JOB_NAME:-intervention_credit_sweep}" \
