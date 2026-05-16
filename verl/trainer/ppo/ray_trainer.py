@@ -427,6 +427,25 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    elif adv_estimator == "dpo_teacher_guided":
+        # DPO-TGS (On-Policy DPO + Teacher-Guided Sampling): linearized DPO encoded
+        # as per-token advantage flowing through standard PPO surrogate.
+        #   margin_pair = β · Σ_t mask · (logπ_old − logπ_ref) for (chosen, rejected)
+        #   g = β · σ(−margin), A_t[chosen]=+g/L, A_t[rejected]=−g/L
+        #   Non-pair samples fall back to GRPO group-relative (mixed via α).
+        adv_estimator_fn = core_algos.get_adv_estimator_fn("dpo_teacher_guided")
+        advantages, returns = adv_estimator_fn(
+            token_level_rewards=data.batch["token_level_rewards"],
+            response_mask=data.batch["response_mask"],
+            index=data.non_tensor_batch["uid"],
+            rollout_log_probs=data.batch.get("rollout_log_probs"),
+            ref_log_prob=data.batch.get("ref_log_prob"),
+            dpo_pair_id=data.batch.get("dpo_pair_id"),
+            dpo_pair_role=data.batch.get("dpo_pair_role"),
+            config=config,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -1043,6 +1062,14 @@ class RayPPOTrainer:
         sample_turns = []
         sample_uids = []
 
+        # DPO-TGS: accumulate val batches for implicit-reward-accuracy at end-of-val
+        _is_dpo_tgs = self.config.algorithm.adv_estimator == "dpo_teacher_guided"
+        _dpo_val_enabled = _is_dpo_tgs and bool(
+            (self.config.algorithm.get("dpo", {}) or {}).get("val_implicit_reward_accuracy", True)
+        )
+        _dpo_val_batches: list = []
+        _dpo_val_rewards: list = []
+
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
 
@@ -1130,6 +1157,12 @@ class RayPPOTrainer:
 
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
 
+            # DPO-TGS: stash batch + per-row reward for end-of-val implicit-reward accuracy
+            if _dpo_val_enabled:
+                test_batch.batch["token_level_rewards"] = reward_tensor.to(test_batch.batch["responses"].device)
+                _dpo_val_batches.append(test_batch)
+                _dpo_val_rewards.append(reward_tensor.sum(-1).detach().cpu().numpy())
+
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
         # dump generations
@@ -1156,7 +1189,115 @@ class RayPPOTrainer:
                 "reward_extra_infos_dict": reward_extra_infos_dict,
             }
         data_sources = np.concatenate(data_source_lst, axis=0)
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        metric_dict = self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+
+        # DPO-TGS: compute val implicit-reward-accuracy (end-of-val one-shot)
+        if _dpo_val_enabled and _dpo_val_batches:
+            try:
+                _dpo_extra = self._compute_dpo_val_implicit_accuracy(
+                    _dpo_val_batches, _dpo_val_rewards
+                )
+                metric_dict.update(_dpo_extra)
+            except Exception as e:  # don't let DPO val crash standard val
+                print(f"[DPO val] implicit-reward-accuracy computation failed: {e}")
+
+        return metric_dict
+
+    def _compute_dpo_val_implicit_accuracy(
+        self,
+        val_batches: list,
+        val_rewards: list,
+    ) -> dict:
+        """Compute DPO implicit-reward-accuracy over held-out val batches.
+
+        Procedure:
+          1. Concat val batches.
+          2. Run actor.compute_log_prob (π_θ) + ref_policy.compute_ref_log_prob (π_ref)
+             over the full val batch.
+          3. Group samples by uid, split correct (R>=correct_threshold) vs incorrect.
+          4. For each prompt with both: form one pair (best correct vs worst incorrect),
+             compute β·Σmask·(logπ_θ−logπ_ref) for each, count chosen-wins.
+          5. Return val-core/dpo_implicit_reward_accuracy + val-aux/dpo_*.
+
+        This adds ~2 model forwards per val (small fraction of total val time).
+        """
+        _dpo_cfg = self.config.algorithm.get("dpo", {}) or {}
+        beta = float(_dpo_cfg.get("beta", 0.1))
+        correct_threshold = float(_dpo_cfg.get("correct_threshold", 1.0))
+
+        # Concat all val batches into one DataProto
+        full = DataProto.concat(val_batches)
+        # Concat rewards (B,) np arrays
+        rewards_np = np.concatenate(val_rewards, axis=0)
+        uids = full.non_tensor_batch.get("uid")
+        if uids is None or len(uids) != rewards_np.shape[0]:
+            return {}
+        if not isinstance(uids, np.ndarray):
+            uids = np.array(uids, dtype=object)
+
+        # Ensure response_mask exists (val gen produces responses + attention_mask; build mask if absent)
+        if "response_mask" not in full.batch.keys():
+            full.batch["response_mask"] = compute_response_mask(full)
+
+        # Step 1: actor.compute_log_prob → old_log_probs over val responses
+        try:
+            old_lp_out = self.actor_rollout_wg.compute_log_prob(full)
+            full = full.union(old_lp_out)
+        except Exception as e:
+            print(f"[DPO val] compute_log_prob failed: {e}")
+            return {}
+
+        # Step 2: ref_policy compute_ref_log_prob → ref_log_prob
+        try:
+            ref_lp_out = self._compute_ref_log_prob(full)
+            full = full.union(ref_lp_out)
+        except Exception as e:
+            print(f"[DPO val] _compute_ref_log_prob failed: {e}")
+            return {}
+
+        mask = full.batch["response_mask"].float()
+        logp_actor = full.batch.get("old_log_probs")
+        logp_ref = full.batch.get("ref_log_prob")
+        if logp_actor is None or logp_ref is None:
+            return {}
+        per_token = (logp_actor.float() - logp_ref.float()) * mask
+        seq_diff = per_token.sum(dim=-1).detach().cpu().numpy()       # (B,) Σmask·(logπ−logπ_ref)
+        s_per_row = beta * seq_diff                                    # implicit reward / β
+
+        # Step 3: group by uid → form one (best_correct, worst_incorrect) pair per prompt
+        uid_to_idx: dict = defaultdict(list)
+        for i, u in enumerate(uids):
+            uid_to_idx[u].append(i)
+
+        n_pairs = 0
+        n_chosen_wins = 0
+        margins = []
+        for u, idxs in uid_to_idx.items():
+            corrects = [i for i in idxs if rewards_np[i] >= correct_threshold]
+            incorrects = [i for i in idxs if rewards_np[i] < correct_threshold]
+            if not corrects or not incorrects:
+                continue
+            # best correct = highest reward; worst incorrect = lowest reward.
+            corrects.sort(key=lambda i: rewards_np[i], reverse=True)
+            incorrects.sort(key=lambda i: rewards_np[i])
+            c, r = corrects[0], incorrects[0]
+            margin = float(s_per_row[c] - s_per_row[r])
+            margins.append(margin)
+            n_pairs += 1
+            if margin > 0:
+                n_chosen_wins += 1
+
+        out: dict = {
+            "val-aux/dpo_val_pairs_total": float(n_pairs),
+        }
+        if n_pairs > 0:
+            acc = n_chosen_wins / n_pairs
+            out["val-core/dpo_implicit_reward_accuracy"] = float(acc)
+            margins_arr = np.array(margins, dtype=np.float64)
+            out["val-aux/dpo_val_margin_mean"] = float(margins_arr.mean())
+            sigma_neg = 1.0 / (1.0 + np.exp(margins_arr))
+            out["val-aux/dpo_val_sigma_neg_margin_mean"] = float(sigma_neg.mean())
+        return out
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
@@ -2007,20 +2148,38 @@ class RayPPOTrainer:
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
-                gen_batch_output = gen_batch.repeat(
-                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+
+                # DPO-TGS uses chain rollout (tcca_v2_chain_rollout) which takes the
+                # un-repeated B-prompt batch and produces B*chain_length internally.
+                _dpo_tgs_chain_rollout = (
+                    self.config.algorithm.adv_estimator == "dpo_teacher_guided"
                 )
+
+                if not _dpo_tgs_chain_rollout:
+                    gen_batch_output = gen_batch.repeat(
+                        repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                    )
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
-                        if not self.async_rollout_mode:
+                        if _dpo_tgs_chain_rollout:
+                            from verl.trainer.ppo.dpo_tgs import dpo_tgs_adaptive_rollout
+                            gen_batch_output = dpo_tgs_adaptive_rollout(
+                                prompt_batch=gen_batch,
+                                actor_rollout_wg=self.actor_rollout_wg,
+                                async_rollout_manager=getattr(self, "async_rollout_manager", None),
+                                reward_fn=self.reward_fn,
+                                config=self.config,
+                                tokenizer=self.tokenizer,
+                            )
+                        elif not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
 
-                        timing_raw.update(gen_batch_output.meta_info["timing"])
+                        timing_raw.update(gen_batch_output.meta_info.get("timing", {}))
                         gen_batch_output.meta_info.pop("timing", None)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
@@ -2479,6 +2638,31 @@ class RayPPOTrainer:
                             batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
                             # IS and off-policy metrics already have rollout_corr/ prefix
                             metrics.update(is_metrics)
+
+                        # ── DPO-TGS: collect (chosen, rejected) pairs + log diagnostics ──
+                        # Pairs are built from the chain-rollout structure already in batch.
+                        # Must run AFTER token_level_rewards is finalized AND AFTER ref_log_prob
+                        # is added to batch, so margin metrics can be computed.
+                        if self.config.algorithm.adv_estimator == "dpo_teacher_guided":
+                            from verl.trainer.ppo.dpo_tgs import (
+                                collect_dpo_pairs,
+                                compute_dpo_metrics,
+                            )
+                            _dpo_cfg = self.config.algorithm.get("dpo", {}) or {}
+                            with marked_timer("dpo_pair_collect", timing_raw, color="magenta"):
+                                pair_info = collect_dpo_pairs(
+                                    batch,
+                                    strategy=str(_dpo_cfg.get("pair_strategy", "chain_consecutive")),
+                                    margin=float(_dpo_cfg.get("pair_margin", 0.0)),
+                                    correct_threshold=float(_dpo_cfg.get("correct_threshold", 1.0)),
+                                )
+                                dpo_metrics = compute_dpo_metrics(
+                                    batch,
+                                    pair_info,
+                                    beta=float(_dpo_cfg.get("beta", 0.1)),
+                                    correct_threshold=float(_dpo_cfg.get("correct_threshold", 1.0)),
+                                )
+                                metrics.update(dpo_metrics)
 
                         # compute advantages, executed on the driver process
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(

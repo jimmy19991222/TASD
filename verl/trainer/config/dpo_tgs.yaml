@@ -1,0 +1,118 @@
+defaults:
+  - ppo_trainer
+  - user
+  - _self_
+
+# DPO-TGS V2: On-Policy DPO + Teacher-Guided Sampling (adaptive rollout)
+#
+# 设计文档: research/dpo_teacher_guided_sampling.md
+# 理论锚点: OPD_Deep_Analysis.html "Online DPO 理论锚点"
+#   (OAIF + OFS-DPO + Samplers-in-DPO + RPO + Meta Bridging Offline-Online)
+#
+# Pipeline:
+#   1. dpo_tgs_adaptive_rollout (复用 tcca_chain helpers):
+#      Phase 1: standard rollout n_init per prompt (small, e.g. 2)
+#      Phase 2: per-prompt SDPO teacher ctx from sibling correct rollout
+#               (sdpo_ctx_source='sibling_correct'; 'gt' fallback per all_failed_strategy)
+#      Phase 3: for each failed sample, n_attempts iterative interventions
+#               - argmax divergence (排尾 8)
+#               - teacher decode 1 token, enforce z_T != y_S[t*] via reselect_t
+#               - student continue from prefix
+#      Phase 4: concat y_init + all chain attempts with lineage tags
+#   2. ref_log_prob (reference model forward over augmented batch)
+#   3. collect_dpo_pairs (chain_consecutive | hybrid_init_chain):
+#      lineage-aware grouping; R(chain[i]) > R(chain[i-1]) + margin → pair
+#   4. compute_dpo_tgs_advantage (linearized DPO):
+#         margin = β · Σ (logπ_old − logπ_ref) for (chosen, rejected)
+#         g = β · σ(−margin)
+#         A_t[chosen]   = +g / L_chosen   * response_mask
+#         A_t[rejected] = −g / L_rejected * response_mask
+#         pair-free samples fallback to GRPO group-relative (α-mix).
+#   5. standard PPO clipped surrogate update.
+
+max_model_len: 18944
+seed: 42
+
+actor_rollout_ref:
+  actor:
+    ppo_mini_batch_size: 32
+    # EMA teacher infra reused (planned v2 chase regularizer)
+    self_distillation:
+      max_reprompt_len: 10240
+      is_clip: 2.0
+      teacher_regularization: ema
+      teacher_update_rate: 0.05
+      include_environment_feedback: false
+    optim:
+      lr: 1e-5
+  rollout:
+    # n MUST equal dpo.n_init — Phase 1 produces n_init samples per prompt.
+    # Phase 3 adds n_attempts more samples per failed sample (variable count per prompt).
+    n: 2
+    calculate_log_probs: True
+
+algorithm:
+  adv_estimator: dpo_teacher_guided
+
+  # ── DPO-TGS adaptive rollout + loss config ───────────────────────
+  dpo:
+    # ── Rollout shape ─────────────────────────────────────────────
+    n_init: 2                        # Phase 1 standard rollouts per prompt
+    n_attempts: 2                    # Phase 3 max intervention attempts per failed sample
+    correct_threshold: 1.0           # R >= this → sample is correct (sciknoweval: 1.0)
+
+    # ── SDPO teacher ctx ──────────────────────────────────────────
+    # 'sibling_correct': use decoded correct sibling rollout (SDPO-style, no GT dependency)
+    # 'gt':              use dataset ground_truth (legacy OPSD)
+    sdpo_ctx_source: sibling_correct
+    sdpo_ref_template: "Refer to this correct answer: {r}\n"
+    # When no correct sibling exists for a prompt:
+    # 'skip':         skip intervention on these prompts (Meta-style; default)
+    # 'gt_fallback':  fall back to dataset GT for those prompts (ablation)
+    all_failed_strategy: skip
+
+    # ── Token mismatch enforcement (z_T != y_S[t*]) ────────────────
+    exclude_tail_tokens: 8
+    max_reselect_attempts: 3         # how many alternative t* to try before giving up
+
+    # ── DPO loss ──────────────────────────────────────────────────
+    beta: 0.1                        # DPO temperature
+    alpha: 1.0                       # mix weight: 1.0 = pure DPO, 0.0 = pure GRPO
+
+    # ── Pair collection ────────────────────────────────────────────
+    # 'chain_consecutive': lineage-aware (chain[i] vs chain[i-1])
+    # 'hybrid_init_chain': chain pairs + (best_correct, worst_failed) from init pool
+    pair_strategy: chain_consecutive
+    pair_margin: 0.0                 # min R_gap to form pair
+
+    # ── GRPO fallback / length protection ─────────────────────────
+    norm_adv_by_std_in_grpo: False
+    min_response_length: 50
+    length_penalty_type: linear      # linear | zero
+
+    # ── Validation: DPO implicit-reward-accuracy ─────────────────
+    # Adds 2 model forwards (actor + ref) per val to compute the standard DPO eval metric.
+    # Logged as val-core/dpo_implicit_reward_accuracy.
+    val_implicit_reward_accuracy: true
+
+  # Legacy compat: intervention_credit knobs still exist but most ignored by adaptive_rollout
+  intervention_credit:
+    enable_intervention: true
+    chain_length: 2                  # unused by adaptive_rollout (uses dpo.n_attempts)
+    opsd_ref_template: "The correct answer is {r}.\n"
+    divergence_metric: argmax_excl_eos
+    exclude_tail_tokens: 8
+    failed_threshold: 0.5
+    max_intervention_per_prompt: 4
+    teacher_decode_temperature: 0.0
+
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+
+data:
+  train_batch_size: 32
+  gen_batch_size: ${data.train_batch_size}
+
+trainer:
+  val_before_train: False

@@ -72,6 +72,9 @@ class Role(Enum):
 def need_reference_policy(
     config: DictConfig,
 ) -> bool:
+    # DPO-TGS needs π_ref for the linearized DPO advantage (β · (logπ_old − logπ_ref))
+    if str(config.algorithm.get("adv_estimator", "")) == "dpo_teacher_guided":
+        return True
     return config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss
 
 

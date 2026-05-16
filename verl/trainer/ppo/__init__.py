@@ -15,3 +15,4 @@
 # Trigger registration of bayesian_credit advantage estimators (rlsd / prior_shift / ...).
 # Must run before any AdvantageEstimator dispatch.
 from . import bayesian_credit  # noqa: E402, F401
+from . import dpo_tgs           # noqa: E402, F401  (registers @register_adv_est("dpo_teacher_guided"))
