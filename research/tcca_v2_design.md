@@ -539,14 +539,44 @@ total ≈ 5.15 T_rollout
 
 ---
 
-## 7. Open questions（待 user 决定）
+## 7. Open questions（已 user 决定 2026-05-16 20:30）
 
-1. ~~**chain_length 默认值**：8（你的初衷） vs 4-6（折中 compute）？~~ → **修正后 ~15h/job, 直接用 8**
-2. **Step 0 的 y_0**：用标准 generate_sequences 还是直接 async_rollout_manager？
-3. **Iteration i 的 t_i 选择**：是否允许 t_i 和 t_{i-1} 接近？（已在 t_i 在 y_{i-1} 上选, 自动是新位置, 不需要 min_gap）
-4. **OPSD ref_template 模板**：`"The correct answer is {r}.\n"` 还是更详细的？
-5. **失败 fallback**：如果某个 prompt 在 iteration 5 续写空了（continuation = []）, 接下来怎么办？跳过剩余 iter 用 y_5？
-6. ~~**Compute budget**：你的开发机配额能支持 chain_length=8 的 250-step job (~100h)？~~ → **修正后 ~15h/job, 配额内 OK**
+1. ✅ **chain_length = 8** (默认), 可配置, 论文 ablation 跑 {2, 4, 8}
+2. ✅ **Step 0 的 y_0**：用 `async_rollout_manager.generate_sequences`（与 ray_trainer 主路径一致）
+3. ✅ **t_i 选择**：argmax divergence + exclude tail 8 token, 无需 min_gap (chain 自然不重叠)
+4. ✅ **OPSD ref_template**：`"The correct answer is {r}.\n"` 加到 user prompt 前缀
+5. ✅ **失败 fallback**：选项 A — 跳过该 prompt 后续 iter, 最终 group 不够 8 个 (GRPO 变长 group 自然处理)
+6. ✅ **Compute**：~15h/job 配额内 OK
+
+## 7.1 Layer 3 决策（2026-05-16 20:30）
+
+**选 C + D 双跳作论文 ablation**：
+
+```
+选项 D (baseline): A_t = A_seq · response_mask · length_scale     (纯 GRPO + mask shared prefix)
+选项 C (main):     A_t = A_seq · response_mask · (1 + λ_div · clip(c_t, ±clip_max)) · length_scale
+                                                  └────────────────────────────┘
+                                                  TCCA divergence-point modulation
+```
+
+c_t (B_augmented, T) 构造规则：
+```
+for each prompt's chain (y_0, y_1, ..., y_{n-1}):
+  for i in 1..n-1:
+    ΔR_i = R(y_i) - R(y_{i-1})
+    c_t[y_i,    t_i] += ΔR_i      # positive: teacher's choice at t_i
+    c_t[y_{i-1}, t_i] -= ΔR_i      # negative: student's wrong choice at same position
+  # 端点处理 (照公式自然成立):
+  # y_0 只在 t_1 收到 negative credit (-ΔR_1)
+  # y_{n-1} 只在 t_{n-1} 收到 positive credit (+ΔR_{n-1})
+```
+
+参数:
+- `lambda_div_credit`: default **1.0** (weight × [0, 2], 无符号翻转风险)
+  论文 ablation: {0, 0.5, 1.0, 2.0} (λ=0 等价选项 D)
+- `divergence_credit_clip`: default **1.0** (clip(c_t, ±1.0))
+
+Loss function 不动 PPO (沿用 clipped surrogate)。
 
 ---
 
