@@ -406,6 +406,21 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    elif adv_estimator == "intervention_credit":
+        # Intervention-Credit (ours, Tier 3): A_seq += λ·ΔR; A_t = A_seq · ĝ_t · length_scale
+        # ΔR = R(y_intervened) - R(y_original), 由 intervention_rollout block 写入 batch
+        adv_estimator_fn = core_algos.get_adv_estimator_fn("intervention_credit")
+        advantages, returns = adv_estimator_fn(
+            token_level_rewards=data.batch["token_level_rewards"],
+            response_mask=data.batch["response_mask"],
+            index=data.non_tensor_batch["uid"],
+            teacher_prior_shift_surprise=data.batch.get("bc_teacher_prior_shift_surprise"),
+            intervention_delta_reward=data.batch.get("intervention_delta_reward"),
+            intervention_used=data.batch.get("intervention_used"),
+            config=config,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -854,7 +869,9 @@ class RayPPOTrainer:
         is_tasd = adv_estimator == "tasd"
         # bayesian_credit estimators (rlsd / prior_shift / posterior_shift) all require
         # the same self-distillation re-prompt machinery to assemble teacher inputs.
-        is_bayesian_credit = adv_estimator in ("rlsd", "prior_shift", "posterior_shift")
+        # bayesian_credit estimators (rlsd / prior_shift / posterior_shift / intervention_credit)
+        # all reuse the same self-distillation re-prompt machinery to assemble teacher inputs.
+        is_bayesian_credit = adv_estimator in ("rlsd", "prior_shift", "posterior_shift", "intervention_credit")
         if self_distillation_cfg is None or (not is_sdpo and not is_tasd and not is_bayesian_credit):
             return None
 
@@ -1929,7 +1946,9 @@ class RayPPOTrainer:
         is_tasd = self.config.algorithm.adv_estimator == AdvantageEstimator.TASD
         # bayesian_credit estimators share the same lightweight teacher-forward path
         # (only need teacher_log_probs_on_response, no entropy gate / token rewards).
-        is_rlsd_like = self.config.algorithm.adv_estimator in ("rlsd", "prior_shift", "posterior_shift")
+        # bayesian_credit estimators that share the lightweight teacher-forward path
+        # (only need teacher_log_probs_on_response + optional g_t, no entropy gate).
+        is_rlsd_like = self.config.algorithm.adv_estimator in ("rlsd", "prior_shift", "posterior_shift", "intervention_credit")
         if is_tasd:
             _tasd_cfg = self.config.algorithm.get("tasd", {})
             tasd_reward_type = _tasd_cfg.get("reward_type", "teacher_prob")
@@ -2155,7 +2174,9 @@ class RayPPOTrainer:
                         if is_rlsd_like and "teacher_input_ids" in batch.batch:
                             _bc_temperature = self.config.actor_rollout_ref.rollout.temperature
                             _bc_micro_batch_size = self.config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu
-                            _bc_is_prior_shift = self.config.algorithm.adv_estimator == "prior_shift"
+                            # prior_shift / intervention_credit 都需要 g_t (KL Bayes surprise)
+                            _bc_needs_g_t = self.config.algorithm.adv_estimator in ("prior_shift", "intervention_credit")
+                            _bc_is_prior_shift = _bc_needs_g_t
                             bc_fwd_batch = DataProto.from_dict(
                                 tensors={
                                     "teacher_input_ids":      batch.batch["teacher_input_ids"],
@@ -2186,6 +2207,25 @@ class RayPPOTrainer:
                                 batch.batch["bc_teacher_prior_shift_surprise"] = bc_teacher_result.batch[
                                     "prior_shift_surprise"
                                 ]
+
+                        # ── Intervention-Credit (Tier 3): 失败样本 t* 检测 + 真实 intervention rollout ──
+                        # Phase 1: enable_intervention=False 时只做 divergence 度量，batch 不变
+                        # Phase 2: enable_intervention=True 时调用 teacher generate + student tail
+                        if self.config.algorithm.adv_estimator == "intervention_credit":
+                            from verl.trainer.ppo.bayesian_credit.intervention_rollout import (
+                                run_teacher_intervention_rollout,
+                            )
+                            with marked_timer("intervention_rollout", timing_raw, color="magenta"):
+                                ic_result = run_teacher_intervention_rollout(
+                                    batch=batch,
+                                    actor_rollout_wg=self.actor_rollout_wg,
+                                    async_rollout_manager=getattr(self, "async_rollout_manager", None),
+                                    reward_fn=self.reward_fn,
+                                    config=self.config,
+                                    tokenizer=self.tokenizer,
+                                )
+                            batch = ic_result.batch
+                            metrics.update(ic_result.metrics)
 
                         # ── TASD: 计算 teacher token-level rewards ─────────────────────
                         if is_tasd and "teacher_input_ids" in batch.batch:

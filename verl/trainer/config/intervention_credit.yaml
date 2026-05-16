@@ -1,0 +1,104 @@
+defaults:
+  - ppo_trainer
+  - user
+  - _self_
+
+# Teacher-Guided Dynamic Intervention (Bayesian Credit Assignment, Tier 3, ours).
+#
+# Causal counterfactual credit assignment:
+#
+#   1. Student rollout: y_s ~ P_S(·|x)                                       (n_initial 个)
+#   2. Teacher forward: 算 g_t (Prior-Shift surprise) + teacher_log_probs
+#   3. Find divergence position t* = argmax_metric(divergence)              (per failed sample)
+#   4. Teacher intervention: y_int ~ P_T(·|x, y_<t*)                       (k 个 token)
+#   5. Student tail rollout: y_tail ~ P_S(·|x, y_<t*, y_int)
+#   6. Composite y' = (y_<t*, y_int, y_tail), 与 y_s 同 uid append 进 group
+#   7. ΔR = R(y') - R(y_s)；以 ΔR 为 seq-level credit，以 g_t 做 token-level reweight
+#
+# 与 prior_shift 的关系:
+#   - prior_shift 仅用 g_t 做相关性 reweight (Tier 1)
+#   - intervention_credit 在此基础上叠加 ΔR 因果证据 (Tier 3)
+#   - 当 enable_intervention=False 时，本估计器退化为 prior_shift（用于 plumbing 验证）
+
+max_model_len: 18944
+
+# ── 随机种子（可复现性）────────────────────────────────────────────────
+seed: 42
+
+actor_rollout_ref:
+  actor:
+    ppo_mini_batch_size: 32
+    self_distillation:
+      max_reprompt_len: 10240
+      is_clip: 2.0
+      teacher_regularization: ema
+      teacher_update_rate: 0.05
+      # intervention_credit 仅需要 teacher 在原始 (x, y) 上的 forward
+      # （g_t、teacher_log_probs 都不需要 reprompt 注入）
+      include_environment_feedback: false
+      success_reward_threshold: 1.0
+      dont_reprompt_on_self_success: false
+    optim:
+      lr: 1e-5
+  rollout:
+    # n_initial = 7（比 baseline n=8 少 1，腾出 append 配额）
+    # 实际 effective group_size = n + 失败样本数（最多 +n_initial = 14）
+    n: 7
+    calculate_log_probs: True
+
+algorithm:
+  adv_estimator: intervention_credit
+  intervention_credit:
+    # ── 工作模式 ─────────────────────────────────────────────────────
+    # false: ΔR 通道留空 (=0), 估计器退化为 prior_shift（plumbing 验证 / 对照）
+    # true : 真实 intervention rollout, ΔR = R(y') - R(y_s)
+    enable_intervention: true
+
+    # ── divergence 位置选择策略 (t* 消融维度) ──────────────────────────
+    # argmax_excl_eos: argmax |logp_T - logp_S|，但排除尾部 N 个 token + punctuation token
+    # argmax_raw    : 纯 argmax |logp_T - logp_S|
+    # g_t_argmax    : 复用 prior_shift 的 g_t = KL(D_t‖D_{t-1}) 的 argmax
+    divergence_metric: argmax_excl_eos
+    # argmax_excl_eos 时排除尾部 token 数（防止选到 EOS）
+    exclude_tail_tokens: 8
+
+    # ── intervention 长度 / 触发条件 ──────────────────────────────────
+    # k: teacher 接管的 token 数
+    intervention_length_k: 2
+    # reward < failed_threshold 视为失败 → 触发 intervention
+    failed_threshold: 0.5
+    # 每个 prompt 最多 append 几个 composite 样本（防 group 过大）
+    max_intervention_per_group: 7
+    # teacher 单步 forward 时的采样温度 (0.0=greedy)
+    teacher_decode_temperature: 0.0
+
+    # ── ΔR 加权策略 ─────────────────────────────────────────────────
+    # lambda_delta_r: ΔR 在 seq-level credit 中的权重
+    #   A_seq[i] = (R_i - mean_group(R)) + λ · ΔR_i (仅对 intervention 样本)
+    # 当 enable_intervention=False 时此项无效（ΔR=0）
+    lambda_delta_r: 1.0
+
+    # ── g_t per-token reweight (复用 prior_shift v2 防护) ─────────────
+    g_t:
+      eps_norm: 1.0e-6
+      max_ratio: 3.0
+      uniform_fallback: True
+      renormalize_after_clip: True
+
+    # ── length protection (复用 v2 的 length floor penalty) ────────────
+    min_response_length: 50
+    length_penalty_type: linear   # linear | zero
+
+    # ── GRPO 风格归一化 ────────────────────────────────────────────
+    norm_adv_by_std_in_grpo: False
+
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+
+data:
+  train_batch_size: 32
+  gen_batch_size: ${data.train_batch_size}
+
+trainer:
+  val_before_train: False

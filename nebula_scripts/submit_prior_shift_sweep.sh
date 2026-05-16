@@ -14,7 +14,7 @@
 # 使用方式:
 #   bash nebula_scripts/submit_prior_shift_sweep.sh [--dry-run]
 # =============================================================================
-set -euo pipefail
+# set -euo pipefail
 
 # ── Nebula 账号配置 ──────────────────────────────────────────────────────
 QUEUE="lazada_llm_ad_h20"
