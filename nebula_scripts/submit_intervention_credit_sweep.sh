@@ -54,36 +54,22 @@ fi
 # 超参配置（默认 Phase 3：base × {grpo, rlsd}，single t* strategy）
 # =============================================================================
 
-# ── Phase 3 主轴：base estimator (论文核心 sweep 维度) ──────────────────
-# 默认 grpo + rlsd 两个 base，每个 base 都开 ΔR 看增益
-IC_BASE_ESTIMATORS_DEFAULT="grpo rlsd"
-read -r -a IC_BASE_ESTIMATOR_LIST <<< "${IC_BASE_ESTIMATORS:-$IC_BASE_ESTIMATORS_DEFAULT}"
-
 # ── 是否开 intervention (默认开，跑论文主结果) ──────────────────────────
 IC_ENABLE_INTERVENTION_LIST_DEFAULT="True"
 read -r -a IC_ENABLE_INTERVENTION_LIST <<< "${IC_ENABLE_INTERVENTION_LIST:-$IC_ENABLE_INTERVENTION_LIST_DEFAULT}"
 
-# ── t* 选择策略（默认单一推荐策略 argmax_excl_eos）─────────────────────
-IC_DIVERGENCE_METRIC_LIST_DEFAULT="argmax_excl_eos"
-read -r -a IC_DIVERGENCE_METRIC_LIST <<< "${IC_DIVERGENCE_METRIC_LIST:-$IC_DIVERGENCE_METRIC_LIST_DEFAULT}"
+# ── λ_div_credit ablation (论文核心) ─────────────────────────────────
+IC_LAMBDA_DIV_CREDIT_LIST_DEFAULT="1.0"
+read -r -a IC_LAMBDA_DIV_CREDIT_LIST <<< "${IC_LAMBDA_DIV_CREDIT_LIST:-$IC_LAMBDA_DIV_CREDIT_LIST_DEFAULT}"
 
-# ── 其他 IC 超参 (TCCA 默认) ────────────────────────────────────────
+# ── TCCA-Lite 默认超参 ─────────────────────────────────────────────
+IC_DIVERGENCE_METRIC="argmax_excl_eos"
 IC_EXCLUDE_TAIL_TOKENS="8"
-IC_K="2"                              # intervention 长度 (每位置)
-IC_TOP_K="3"                          # TCCA: top-K positions per failed sample
 IC_FAILED_THRESHOLD="0.5"
-IC_MAX_INTERVENTION_PER_GROUP="9"     # TCCA: per failed → K composites, 控制总膨胀
+IC_MAX_INTERVENTION_PER_PROMPT="4"
 IC_TEACHER_DECODE_TEMPERATURE="0.0"
-IC_LAMBDA_DR="0.0"                    # legacy seq-level ΔR (TCCA 默认关)
-IC_LAMBDA_TOKEN_CREDIT="1.0"          # TCCA 核心: per-token causal credit modulation
-IC_TOKEN_CREDIT_CLIP="2.0"
-IC_RLSD_EPS_W="0.2"
-
-# ── g_t 防护（仅 base=prior_shift 用到）──────────────────────────────
-IC_GT_EPS_NORM="1.0e-6"
-IC_GT_MAX_RATIO="3.0"
-IC_GT_RENORMALIZE_AFTER_CLIP="True"
-IC_GT_UNIFORM_FALLBACK="True"
+IC_DIVERGENCE_CREDIT_CLIP="1.0"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.85}"   # 共享 GPU 时降到 0.7
 
 # ── Length floor (复用 PS v2 防护) ──────────────────────────────────
 IC_MIN_RESPONSE_LENGTH="50"
@@ -114,9 +100,8 @@ TOTAL=0
 SUBMITTED=0
 
 for DATASET in "${DATASETS[@]}"; do
-for IC_BASE_ESTIMATOR in "${IC_BASE_ESTIMATOR_LIST[@]}"; do
 for IC_ENABLE_INTERVENTION in "${IC_ENABLE_INTERVENTION_LIST[@]}"; do
-for IC_DIVERGENCE_METRIC in "${IC_DIVERGENCE_METRIC_LIST[@]}"; do
+for IC_LAMBDA_DIV_CREDIT in "${IC_LAMBDA_DIV_CREDIT_LIST[@]}"; do
 for TEACHER_UPDATE_RATE in "${TEACHER_UPDATE_RATE_LIST[@]}"; do
     TOTAL=$((TOTAL + 1))
 
@@ -126,31 +111,27 @@ for TEACHER_UPDATE_RATE in "${TEACHER_UPDATE_RATE_LIST[@]}"; do
     MODEL_PATH="${OSS_ROOT}/base_models/${MODEL_NAME}"
 
     # Tags: 体现核心维度
-    BASE_TAG="${IC_BASE_ESTIMATOR}"
     if [ "$IC_ENABLE_INTERVENTION" = "True" ]; then
-        DR_TAG="dR"
-        VERSION_TAG="v3"
+        DR_TAG="dR-l${IC_LAMBDA_DIV_CREDIT}"
+        VERSION_TAG="TCCA-Lite"
     else
         DR_TAG="noDR"
-        VERSION_TAG="v3p1"
+        VERSION_TAG="GRPO-base"
     fi
-    TSTAR_TAG=$(echo "$IC_DIVERGENCE_METRIC" | sed 's/argmax_excl_eos/aexEOS/; s/argmax_raw/araw/; s/g_t_argmax/gtarg/')
     EMA_TAG="ema${TEACHER_UPDATE_RATE}"
     CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
 
-    JOB_NAME="TGDI-${VERSION_TAG}-${BASE_TAG}-${DR_TAG}-${DATASET_SHORT}-${TSTAR_TAG}-${EMA_TAG}-${MODEL_SHORT}-${CURRENT_TIME}"
+    JOB_NAME="${VERSION_TAG}-${DR_TAG}-${DATASET_SHORT}-${EMA_TAG}-${MODEL_SHORT}-${CURRENT_TIME}"
 
     # ── 提交 ────────────────────────────────────────────────────────
     if [ "$DRY_RUN" = true ]; then
         echo "------------------------------------------------------------"
         echo "Job #${TOTAL}: ${JOB_NAME}"
         echo "  DATASET=$DATASET MODEL=$MODEL_NAME"
-        echo "  IC_BASE_ESTIMATOR=$IC_BASE_ESTIMATOR  IC_ENABLE_INTERVENTION=$IC_ENABLE_INTERVENTION"
-        echo "  TCCA: IC_TOP_K=$IC_TOP_K  IC_LAMBDA_TOKEN_CREDIT=$IC_LAMBDA_TOKEN_CREDIT  IC_TOKEN_CREDIT_CLIP=$IC_TOKEN_CREDIT_CLIP"
-        echo "  IC_DIVERGENCE_METRIC=$IC_DIVERGENCE_METRIC  IC_K=$IC_K  IC_FAILED_THRESHOLD=$IC_FAILED_THRESHOLD"
-        echo "  IC_LAMBDA_DR=$IC_LAMBDA_DR (legacy seq-level)  IC_MAX_INT_PER_GRP=$IC_MAX_INTERVENTION_PER_GROUP"
-        echo "  IC_RLSD_EPS_W=$IC_RLSD_EPS_W (用于 base=rlsd)"
-        echo "  IC_MIN_RESP_LEN=$IC_MIN_RESPONSE_LENGTH IC_LEN_PENALTY=$IC_LENGTH_PENALTY_TYPE"
+        echo "  IC_ENABLE_INTERVENTION=$IC_ENABLE_INTERVENTION  IC_LAMBDA_DIV_CREDIT=$IC_LAMBDA_DIV_CREDIT"
+        echo "  IC_DIVERGENCE_METRIC=$IC_DIVERGENCE_METRIC  IC_FAILED_THRESHOLD=$IC_FAILED_THRESHOLD  IC_MAX_INT_PER_PROMPT=$IC_MAX_INTERVENTION_PER_PROMPT"
+        echo "  IC_DIVERGENCE_CREDIT_CLIP=$IC_DIVERGENCE_CREDIT_CLIP"
+        echo "  GPU_MEMORY_UTILIZATION=$GPU_MEMORY_UTILIZATION"
         echo "  TEACHER_REG=$TEACHER_REGULARIZATION TEACHER_UPDATE_RATE=$TEACHER_UPDATE_RATE"
         echo "  LR=$LR BS=$TRAIN_BATCH_SIZE/$MINI_BATCH_SIZE N=$ROLLOUT_N"
         echo "  GIT_BRANCH=$GIT_BRANCH GIT_COMMIT=$GIT_COMMIT"
@@ -162,7 +143,7 @@ for TEACHER_UPDATE_RATE in "${TEACHER_UPDATE_RATE_LIST[@]}"; do
             --engine=xdl \
             --queue=${QUEUE} \
             --entry=nebula_scripts/entry.py \
-            --user_params="--script_path=${SCRIPT_PATH} --world_size=${WORLD_SIZE} --job_name=${JOB_NAME} --env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=DATASET=${DATASET} --env=MODEL_NAME=${MODEL_NAME} --env=MODEL_PATH=${MODEL_PATH} --env=LR=${LR} --env=SEED=${SEED} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=MINI_BATCH_SIZE=${MINI_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=TEACHER_REGULARIZATION=${TEACHER_REGULARIZATION} --env=TEACHER_UPDATE_RATE=${TEACHER_UPDATE_RATE} --env=IC_ENABLE_INTERVENTION=${IC_ENABLE_INTERVENTION} --env=IC_BASE_ESTIMATOR=${IC_BASE_ESTIMATOR} --env=IC_RLSD_EPS_W=${IC_RLSD_EPS_W} --env=IC_DIVERGENCE_METRIC=${IC_DIVERGENCE_METRIC} --env=IC_EXCLUDE_TAIL_TOKENS=${IC_EXCLUDE_TAIL_TOKENS} --env=IC_K=${IC_K} --env=IC_TOP_K=${IC_TOP_K} --env=IC_FAILED_THRESHOLD=${IC_FAILED_THRESHOLD} --env=IC_MAX_INTERVENTION_PER_GROUP=${IC_MAX_INTERVENTION_PER_GROUP} --env=IC_TEACHER_DECODE_TEMPERATURE=${IC_TEACHER_DECODE_TEMPERATURE} --env=IC_LAMBDA_DR=${IC_LAMBDA_DR} --env=IC_LAMBDA_TOKEN_CREDIT=${IC_LAMBDA_TOKEN_CREDIT} --env=IC_TOKEN_CREDIT_CLIP=${IC_TOKEN_CREDIT_CLIP} --env=IC_GT_EPS_NORM=${IC_GT_EPS_NORM} --env=IC_GT_MAX_RATIO=${IC_GT_MAX_RATIO} --env=IC_GT_RENORMALIZE_AFTER_CLIP=${IC_GT_RENORMALIZE_AFTER_CLIP} --env=IC_GT_UNIFORM_FALLBACK=${IC_GT_UNIFORM_FALLBACK} --env=IC_MIN_RESPONSE_LENGTH=${IC_MIN_RESPONSE_LENGTH} --env=IC_LENGTH_PENALTY_TYPE=${IC_LENGTH_PENALTY_TYPE} --env=GIT_BRANCH=${GIT_BRANCH} --env=GIT_COMMIT=${GIT_COMMIT} --env=DINGTALK_WEBHOOK=https://oapi.dingtalk.com/robot/send?access_token=f598ad33b071751bf79d2484d8e1acefe8df9d879e129cae40340a158854f9cb --env=DINGTALK_SECRET=SECc5b9e4f61f56b32b46abf1ecedc11bdcba10dc35fbba8fa0ff62c084a1cc6ad3" \
+            --user_params="--script_path=${SCRIPT_PATH} --world_size=${WORLD_SIZE} --job_name=${JOB_NAME} --env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=DATASET=${DATASET} --env=MODEL_NAME=${MODEL_NAME} --env=MODEL_PATH=${MODEL_PATH} --env=LR=${LR} --env=SEED=${SEED} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=MINI_BATCH_SIZE=${MINI_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=TEACHER_REGULARIZATION=${TEACHER_REGULARIZATION} --env=TEACHER_UPDATE_RATE=${TEACHER_UPDATE_RATE} --env=IC_ENABLE_INTERVENTION=${IC_ENABLE_INTERVENTION} --env=IC_DIVERGENCE_METRIC=${IC_DIVERGENCE_METRIC} --env=IC_EXCLUDE_TAIL_TOKENS=${IC_EXCLUDE_TAIL_TOKENS} --env=IC_FAILED_THRESHOLD=${IC_FAILED_THRESHOLD} --env=IC_MAX_INTERVENTION_PER_PROMPT=${IC_MAX_INTERVENTION_PER_PROMPT} --env=IC_TEACHER_DECODE_TEMPERATURE=${IC_TEACHER_DECODE_TEMPERATURE} --env=IC_LAMBDA_DIV_CREDIT=${IC_LAMBDA_DIV_CREDIT} --env=IC_DIVERGENCE_CREDIT_CLIP=${IC_DIVERGENCE_CREDIT_CLIP} --env=IC_MIN_RESPONSE_LENGTH=${IC_MIN_RESPONSE_LENGTH} --env=IC_LENGTH_PENALTY_TYPE=${IC_LENGTH_PENALTY_TYPE} --env=GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION} --env=GIT_BRANCH=${GIT_BRANCH} --env=GIT_COMMIT=${GIT_COMMIT} --env=DINGTALK_WEBHOOK=https://oapi.dingtalk.com/robot/send?access_token=f598ad33b071751bf79d2484d8e1acefe8df9d879e129cae40340a158854f9cb --env=DINGTALK_SECRET=SECc5b9e4f61f56b32b46abf1ecedc11bdcba10dc35fbba8fa0ff62c084a1cc6ad3" \
             --worker_count=${WORLD_SIZE} \
             --file.cluster_file=${CLUSTER_FILE} \
             --job_name=${JOB_NAME} \
@@ -190,15 +171,14 @@ done
 done
 done
 done
-done
 
 echo ""
 echo "============================================================"
 if [ "$DRY_RUN" = true ]; then
     echo "Dry-run 完成，共 ${TOTAL} 个 job"
     echo ""
-    echo "[Phase 3 默认 sweep] 2 jobs：base ∈ {grpo, rlsd} × ΔR=True × tstar=argmax_excl_eos"
-    echo "  → 论文核心实验：ΔR 因果层在 GRPO/RLSD baseline 上的增益"
+    echo "[TCCA-Lite 默认 sweep] enable_intervention=True × lambda_div_credit=1.0 × 1 dataset = 1 job"
+    echo "  → 论文核心: GRPO base + TCCA-Lite divergence-point credit modulation"
 else
     echo "提交完成：${SUBMITTED} / ${TOTAL} 个 job"
 fi

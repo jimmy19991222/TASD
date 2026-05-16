@@ -3,26 +3,35 @@ defaults:
   - user
   - _self_
 
-# Teacher-Guided Dynamic Intervention (Bayesian Credit Assignment, Tier 3, ours).
+# TCCA-Lite (Token-level Causal Credit Assignment, ours).
 #
-# Causal counterfactual credit assignment:
+# 完整设计: research/tcca_v2_design.md (pivot 2026-05-16 chain → Lite)
 #
-#   1. Student rollout: y_s ~ P_S(·|x)                                       (n_initial 个)
-#   2. Teacher forward: 算 g_t (Prior-Shift surprise) + teacher_log_probs
-#   3. Find divergence position t* = argmax_metric(divergence)              (per failed sample)
-#   4. Teacher intervention: y_int ~ P_T(·|x, y_<t*)                       (k 个 token)
-#   5. Student tail rollout: y_tail ~ P_S(·|x, y_<t*, y_int)
-#   6. Composite y' = (y_<t*, y_int, y_tail), 与 y_s 同 uid append 进 group
-#   7. ΔR = R(y') - R(y_s)；以 ΔR 为 seq-level credit，以 g_t 做 token-level reweight
+# 流程:
+#   Step 0: 标准 GRPO student rollout n=8 per prompt (复用现有 generate_sequences)
+#   Step 1: 对 reward < threshold 的失败样本:
+#           a. teacher 用 OPSD context (含 reference answer) forward → divergence
+#           b. t* = argmax |logp_T_opsd - logp_S| (排尾 8 token)
+#           c. teacher 写 1 token at t* (under OPSD ctx)
+#           d. student 续写到 EOS (async per-sample via vLLM server_manager)
+#           e. composite y' = y_<t* + teacher_token + student_continuation
+#           f. reward_fn(composite) → R(y'); ΔR = R(y') - R(y_s)
+#   Step 2: Mode B append composite to batch (同 uid, GRPO group reduction 自然处理变长 group)
+#   Step 3: divergence_credit:
+#           - 原 y at t*: c_t = -ΔR (negative credit at student's wrong choice)
+#           - composite y' at t*: c_t = +ΔR (positive credit at teacher's choice)
+#           - composite y'.response_mask[:, :t*] = 0 (Layer 2: shared prefix off)
+#   Step 4: Advantage:
+#           A_t = (A_seq + λ_div · clip(c_t, ±clip)) · response_mask · length_scale
+#                 └────GRPO base────┘   └─── TCCA divergence-point modulation ───┘
 #
-# 与 prior_shift 的关系:
-#   - prior_shift 仅用 g_t 做相关性 reweight (Tier 1)
-#   - intervention_credit 在此基础上叠加 ΔR 因果证据 (Tier 3)
-#   - 当 enable_intervention=False 时，本估计器退化为 prior_shift（用于 plumbing 验证）
+# 与 prior_shift / RLSD / SDZ (Self-Distilled Zero) 差异:
+#   - prior_shift: 用 g_t 作 token 重权重, 不做 intervention (相关性归因)
+#   - RLSD: 用 (P_T/P_S) ratio 作 magnitude (统计学), 无 counterfactual
+#   - SDZ: 同模型 self-correct, 无外部 teacher, sequence-level process supervision
+#   - TCCA: OPSD teacher 单 token 介入 + 真实 ΔR token-level causal credit
 
 max_model_len: 18944
-
-# ── 随机种子（可复现性）────────────────────────────────────────────────
 seed: 42
 
 actor_rollout_ref:
@@ -33,79 +42,52 @@ actor_rollout_ref:
       is_clip: 2.0
       teacher_regularization: ema
       teacher_update_rate: 0.05
-      # intervention_credit 仅需要 teacher 在原始 (x, y) 上的 forward
-      # （g_t、teacher_log_probs 都不需要 reprompt 注入）
       include_environment_feedback: false
       success_reward_threshold: 1.0
       dont_reprompt_on_self_success: false
     optim:
       lr: 1e-5
   rollout:
-    # n_initial = 7（比 baseline n=8 少 1，腾出 append 配额）
-    # 实际 effective group_size = n + 失败样本数（最多 +n_initial = 14）
-    n: 7
+    # 标准 GRPO rollout n=8 per prompt (TCCA-Lite 在此之上对失败样本加 1 个 composite)
+    n: 8
     calculate_log_probs: True
 
 algorithm:
   adv_estimator: intervention_credit
   intervention_credit:
     # ── 工作模式 ─────────────────────────────────────────────────────
-    # false: ΔR 通道留空 (=0), 估计器退化为纯 base estimator（plumbing 验证 / 对照）
-    # true : 真实 intervention rollout, ΔR = R(y') - R(y_s) [Phase 2 已实现]
+    # false: 不做 intervention, 退化为纯 GRPO (plumbing 验证 / baseline 对照)
+    # true : 失败样本上做 OPSD teacher + student 真续写 + ΔR token credit (TCCA-Lite 主路径)
     enable_intervention: false
 
-    # ── base estimator (ΔR 因果层叠加在哪个 baseline 上) ───────────────
-    # grpo        : A_t = A_seq · response_mask                         (uniform, 默认)
-    # rlsd        : A_t = A_seq · clip(exp(sign(A) · (logp_T - logp_S)), 1±ε_w)
-    # prior_shift : A_t = A_seq · ĝ_t  (legacy, 已知 v2 best 0.33 < RLSD 0.585)
-    base_estimator: grpo
+    # ── OPSD teacher context (Layer 1 关键) ────────────────────────
+    # 加 "The correct answer is {r}.\n" 到 user prompt 前缀, teacher forward 时用
+    # {r} 来自 batch.non_tensor_batch['reward_model'][i]['ground_truth']
+    opsd_ref_template: "The correct answer is {r}.\n"
 
-    # RLSD 专属（仅 base_estimator=rlsd 时使用）
-    rlsd_eps_w: 0.2
-
-    # ── divergence 位置选择策略 (t* 消融维度) ──────────────────────────
-    # argmax_excl_eos: argmax |logp_T - logp_S|，但排除尾部 N 个 token + punctuation token
-    # argmax_raw    : 纯 argmax |logp_T - logp_S|
-    # g_t_argmax    : 复用 prior_shift 的 g_t = KL(D_t‖D_{t-1}) 的 argmax
+    # ── divergence 位置选择 ───────────────────────────────────────────
+    # 当前 TCCA-Lite 仅支持 argmax_excl_eos (排尾 N token)
     divergence_metric: argmax_excl_eos
-    # argmax_excl_eos 时排除尾部 token 数（防止选到 EOS）
     exclude_tail_tokens: 8
 
-    # ── intervention 长度 / 触发条件 ──────────────────────────────────
-    # k: teacher 接管的 token 数 (每个 intervention 位置)
-    intervention_length_k: 2
-    # TCCA 核心: 每个失败 sample 在 top-K 位置分别做 intervention
-    top_k_positions: 3
+    # ── intervention 触发条件 / 容量限制 ─────────────────────────────
     # reward < failed_threshold 视为失败 → 触发 intervention
     failed_threshold: 0.5
-    # 每个 prompt 最多 append 几个 composite 样本（防 group 过大）
-    # 注意: TCCA 下实际 append 数 = max_intervention_per_group (每 failed sample 产生 top_k composites)
-    max_intervention_per_group: 9
-    # teacher 单步 forward 时的采样温度 (0.0=greedy)
+    # 每个 prompt 最多 intervention 几个 failed sample (cap)
+    max_intervention_per_prompt: 4
+    # teacher 采样温度 (0.0 = greedy argmax)
     teacher_decode_temperature: 0.0
 
-    # ── TCCA: per-token causal credit ─────────────────────────────────
-    # lambda_token_credit: c_t 在 token-level reweight 中的权重
-    #   weight_t' = weight_t · (1 + λ_token · clip(c_t, ±clip))
-    #   c_t 来自 intervention_rollout: +ΔR at teacher 位置 / -ΔR at 原样本同位置
-    # 这是 TCCA 的核心创新通道, 默认 1.0
-    lambda_token_credit: 1.0
-    # c_t magnitude clip (避免单点极端 ΔR 让 token 权重爆炸)
-    token_credit_clip: 2.0
+    # ── Layer 3: divergence-point credit modulation (additive) ─────
+    # A_t = (A_seq + λ_div · clip(c_t, ±clip)) · response_mask · length_scale
+    #   λ_div = 0: 退化为纯 GRPO + Layer 2 mask (选项 D baseline)
+    #   λ_div > 0: TCCA divergence-point modulation (选项 C main)
+    # 论文 ablation: {0, 0.5, 1.0, 2.0}
+    lambda_div_credit: 1.0
+    # c_t magnitude clip (避免单点极端 ΔR 爆炸)
+    divergence_credit_clip: 1.0
 
-    # ── (legacy) ΔR seq-level injection ──────────────────────────────
-    # TCCA 升级后默认关掉 (避免 double counting，c_t 已注入 token 级因果)
-    # 设 > 0 可同时启用 seq + token 两条信号
-    lambda_delta_r: 0.0
-
-    # ── g_t per-token reweight (复用 prior_shift v2 防护) ─────────────
-    g_t:
-      eps_norm: 1.0e-6
-      max_ratio: 3.0
-      uniform_fallback: True
-      renormalize_after_clip: True
-
-    # ── length protection (复用 v2 的 length floor penalty) ────────────
+    # ── length protection (复用 prior_shift v2 防护) ──────────────────
     min_response_length: 50
     length_penalty_type: linear   # linear | zero
 

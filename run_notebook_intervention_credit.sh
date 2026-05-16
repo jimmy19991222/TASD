@@ -82,6 +82,7 @@ export MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-${DEFAULT_MINI_BATCH_SIZE}}"
 export ROLLOUT_N="${ROLLOUT_N:-${DEFAULT_ROLLOUT_N}}"
 export VAL_N="${VAL_N:-${DEFAULT_VAL_N}}"
 export VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-${DEFAULT_VAL_BEFORE_TRAIN}}"
+export GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.85}"  # 共享 GPU 降到 0.7
 export LR="${LR:-1e-5}"
 
 # ── teacher 装配 ─────────────────────────────────────────────────────

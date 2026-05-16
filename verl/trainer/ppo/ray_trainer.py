@@ -407,24 +407,22 @@ def compute_advantage(
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
     elif adv_estimator == "intervention_credit":
-        # TCCA (Token-level Causal Credit Assignment, ours):
-        #   A_seq = base_estimator_seq_advantage [+ λ_seq · ΔR · 𝟙[intervention] (legacy, 默认关)]
-        #   weight = base_token_reweight · (1 + λ_token · clip(c_t, ±clip))      ← TCCA token-level core
-        #   A_t   = A_seq · weight · length_scale
-        # c_t (token_causal_credit) 由 intervention_rollout block 在 top-K positions 写入:
-        #   composite y'_k 上 c_t = +ΔR_k at teacher 位置; 原 y 上 c_t = -ΔR_k at 相同位置
-        # base_estimator ∈ {grpo, rlsd, prior_shift} 由 algorithm.intervention_credit.base_estimator 切换
+        # TCCA-Lite (Token-level Causal Credit Assignment):
+        #   A_t = (A_seq + λ_div · c_t) · response_mask · length_scale  (additive)
+        # c_t (divergence_credit) 由 intervention_rollout._do_real_intervention 在失败样本上写入:
+        #   composite 上 c_t = +ΔR at t* (teacher's choice positive credit)
+        #   原 y 上 c_t = -ΔR at t* (student's wrong choice mirror)
+        # response_mask 在 composite 上 prefix [0, t*) 已置 0 (Layer 2)
         adv_estimator_fn = core_algos.get_adv_estimator_fn("intervention_credit")
         advantages, returns = adv_estimator_fn(
             token_level_rewards=data.batch["token_level_rewards"],
             response_mask=data.batch["response_mask"],
             index=data.non_tensor_batch["uid"],
-            teacher_log_probs=data.batch.get("bc_teacher_log_probs"),         # base=rlsd
-            student_log_probs=data.batch.get("old_log_probs"),                # base=rlsd
-            teacher_prior_shift_surprise=data.batch.get("bc_teacher_prior_shift_surprise"),  # base=prior_shift
+            divergence_credit=data.batch.get("divergence_credit"),          # TCCA per-token c_t
+            # legacy compat (will be ignored if divergence_credit set):
+            token_causal_credit=data.batch.get("token_causal_credit"),
             intervention_delta_reward=data.batch.get("intervention_delta_reward"),
             intervention_used=data.batch.get("intervention_used"),
-            token_causal_credit=data.batch.get("token_causal_credit"),        # TCCA per-token c_t
             config=config,
         )
         data.batch["advantages"] = advantages
@@ -877,9 +875,11 @@ class RayPPOTrainer:
         is_tasd = adv_estimator == "tasd"
         # bayesian_credit estimators (rlsd / prior_shift / posterior_shift) all require
         # the same self-distillation re-prompt machinery to assemble teacher inputs.
-        # bayesian_credit estimators (rlsd / prior_shift / posterior_shift / intervention_credit)
-        # all reuse the same self-distillation re-prompt machinery to assemble teacher inputs.
-        is_bayesian_credit = adv_estimator in ("rlsd", "prior_shift", "posterior_shift", "intervention_credit")
+        # bayesian_credit estimators (rlsd / prior_shift / posterior_shift) reuse the same
+        # self-distillation re-prompt machinery to assemble teacher inputs.
+        # Note: intervention_credit (TCCA-Lite) does its own OPSD teacher fwd inside
+        # intervention_rollout, doesn't need ray_trainer's SD batch construction. Skip.
+        is_bayesian_credit = adv_estimator in ("rlsd", "prior_shift", "posterior_shift")
         if self_distillation_cfg is None or (not is_sdpo and not is_tasd and not is_bayesian_credit):
             return None
 
@@ -1956,7 +1956,8 @@ class RayPPOTrainer:
         # (only need teacher_log_probs_on_response, no entropy gate / token rewards).
         # bayesian_credit estimators that share the lightweight teacher-forward path
         # (only need teacher_log_probs_on_response + optional g_t, no entropy gate).
-        is_rlsd_like = self.config.algorithm.adv_estimator in ("rlsd", "prior_shift", "posterior_shift", "intervention_credit")
+        # Note: intervention_credit (TCCA-Lite) skipped - does OPSD teacher fwd inside intervention_rollout.
+        is_rlsd_like = self.config.algorithm.adv_estimator in ("rlsd", "prior_shift", "posterior_shift")
         if is_tasd:
             _tasd_cfg = self.config.algorithm.get("tasd", {})
             tasd_reward_type = _tasd_cfg.get("reward_type", "teacher_prob")
@@ -2006,47 +2007,21 @@ class RayPPOTrainer:
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
-                # ── TCCA V2 chain rollout 路径 ─────────────────────────────────
-                # 若 adv_estimator=intervention_credit AND enable_intervention=True,
-                # 用 chain rollout 替换标准 rollout: 每 prompt 产 chain_length 个 derived samples
-                # (y_0..y_{n-1}), 同 uid; reward 已 rescore; divergence_credit 已写入.
-                _ic_cfg = self.config.algorithm.get("intervention_credit", {}) or {}
-                _is_tcca_chain = (
-                    self.config.algorithm.adv_estimator == "intervention_credit"
-                    and bool(_ic_cfg.get("enable_intervention", False))
-                )
-                if _is_tcca_chain:
-                    _chain_length = int(_ic_cfg.get("chain_length", 8))
-                    effective_n = _chain_length
-                else:
-                    effective_n = self.config.actor_rollout_ref.rollout.n
                 gen_batch_output = gen_batch.repeat(
-                    repeat_times=effective_n, interleave=True
-                ) if not _is_tcca_chain else gen_batch  # chain mode 内部自己 repeat
+                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                )
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
-                        if _is_tcca_chain:
-                            # TCCA V2 chain rollout
-                            from verl.trainer.ppo.bayesian_credit.tcca_chain import tcca_v2_chain_rollout
-                            gen_batch_output = tcca_v2_chain_rollout(
-                                prompt_batch=gen_batch_output,
-                                actor_rollout_wg=self.actor_rollout_wg,
-                                async_rollout_manager=self.async_rollout_manager,
-                                reward_fn=self.reward_fn,
-                                config=self.config,
-                                tokenizer=self.tokenizer,
-                            )
-                        elif not self.async_rollout_mode:
+                        if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
 
-                        if "timing" in gen_batch_output.meta_info:
-                            timing_raw.update(gen_batch_output.meta_info["timing"])
-                            gen_batch_output.meta_info.pop("timing", None)
+                        timing_raw.update(gen_batch_output.meta_info["timing"])
+                        gen_batch_output.meta_info.pop("timing", None)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
