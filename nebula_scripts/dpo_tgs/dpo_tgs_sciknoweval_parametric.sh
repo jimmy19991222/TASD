@@ -37,7 +37,9 @@ DPO_N_INIT="${DPO_N_INIT:-2}"
 DPO_N_ATTEMPTS="${DPO_N_ATTEMPTS:-2}"
 DPO_CORRECT_THRESHOLD="${DPO_CORRECT_THRESHOLD:-1.0}"
 DPO_SDPO_CTX_SOURCE="${DPO_SDPO_CTX_SOURCE:-sibling_correct}"
-DPO_SDPO_REF_TEMPLATE="${DPO_SDPO_REF_TEMPLATE:-Refer to this correct answer: {r}\n}"
+# NOTE: sdpo_ref_template is set in dpo_tgs.yaml (default: "Refer to this correct answer: {r}\n").
+# We don't pass it via CLI because Hydra's grammar treats `{...}` as variable interpolation,
+# causing "mismatched input '{'" parse errors. To customize, edit dpo_tgs.yaml directly.
 DPO_ALL_FAILED_STRATEGY="${DPO_ALL_FAILED_STRATEGY:-skip}"
 DPO_MAX_RESELECT="${DPO_MAX_RESELECT:-3}"
 DPO_EXCLUDE_TAIL="${DPO_EXCLUDE_TAIL:-8}"
@@ -129,7 +131,6 @@ python -m verl.trainer.main_ppo \
     algorithm.dpo.n_attempts=${DPO_N_ATTEMPTS} \
     algorithm.dpo.correct_threshold=${DPO_CORRECT_THRESHOLD} \
     algorithm.dpo.sdpo_ctx_source=${DPO_SDPO_CTX_SOURCE} \
-    algorithm.dpo.sdpo_ref_template="${DPO_SDPO_REF_TEMPLATE}" \
     algorithm.dpo.all_failed_strategy=${DPO_ALL_FAILED_STRATEGY} \
     algorithm.dpo.max_reselect_attempts=${DPO_MAX_RESELECT} \
     algorithm.dpo.exclude_tail_tokens=${DPO_EXCLUDE_TAIL} \
