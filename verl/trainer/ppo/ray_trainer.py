@@ -2006,21 +2006,47 @@ class RayPPOTrainer:
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
-                gen_batch_output = gen_batch.repeat(
-                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                # ── TCCA V2 chain rollout 路径 ─────────────────────────────────
+                # 若 adv_estimator=intervention_credit AND enable_intervention=True,
+                # 用 chain rollout 替换标准 rollout: 每 prompt 产 chain_length 个 derived samples
+                # (y_0..y_{n-1}), 同 uid; reward 已 rescore; divergence_credit 已写入.
+                _ic_cfg = self.config.algorithm.get("intervention_credit", {}) or {}
+                _is_tcca_chain = (
+                    self.config.algorithm.adv_estimator == "intervention_credit"
+                    and bool(_ic_cfg.get("enable_intervention", False))
                 )
+                if _is_tcca_chain:
+                    _chain_length = int(_ic_cfg.get("chain_length", 8))
+                    effective_n = _chain_length
+                else:
+                    effective_n = self.config.actor_rollout_ref.rollout.n
+                gen_batch_output = gen_batch.repeat(
+                    repeat_times=effective_n, interleave=True
+                ) if not _is_tcca_chain else gen_batch  # chain mode 内部自己 repeat
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
-                        if not self.async_rollout_mode:
+                        if _is_tcca_chain:
+                            # TCCA V2 chain rollout
+                            from verl.trainer.ppo.bayesian_credit.tcca_chain import tcca_v2_chain_rollout
+                            gen_batch_output = tcca_v2_chain_rollout(
+                                prompt_batch=gen_batch_output,
+                                actor_rollout_wg=self.actor_rollout_wg,
+                                async_rollout_manager=self.async_rollout_manager,
+                                reward_fn=self.reward_fn,
+                                config=self.config,
+                                tokenizer=self.tokenizer,
+                            )
+                        elif not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
 
-                        timing_raw.update(gen_batch_output.meta_info["timing"])
-                        gen_batch_output.meta_info.pop("timing", None)
+                        if "timing" in gen_batch_output.meta_info:
+                            timing_raw.update(gen_batch_output.meta_info["timing"])
+                            gen_batch_output.meta_info.pop("timing", None)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
