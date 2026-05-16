@@ -37,10 +37,11 @@ SCRIPT_PATH="nebula_scripts/intervention_credit/intervention_credit_sciknoweval_
 CUSTOM_DOCKER_IMAGE="${CUSTOM_DOCKER_IMAGE:-hub.docker.alibaba-inc.com/mdl/notebook_saved:loujieming.ljm_yueqiu_sdpo_env_torch260_20260324155942}"
 PROJECT_NAME="TGDI-Tier3"
 
-# ── 数据集配置 ──────────────────────────────────────────────────────
-DATASETS=(
-    "sciknoweval/biology"
-)
+# ── 数据集配置 (可通过 DATASETS_OVERRIDE env var 覆盖, 空格分隔) ────────
+# 示例:
+#   DATASETS_OVERRIDE="sciknoweval/biology sciknoweval/chemistry" bash submit_..sh
+DATASETS_DEFAULT="sciknoweval/biology"
+read -r -a DATASETS <<< "${DATASETS_OVERRIDE:-$DATASETS_DEFAULT}"
 
 # ── dry-run 模式 ─────────────────────────────────────────────────────────
 DRY_RUN=false
