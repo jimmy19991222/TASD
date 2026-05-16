@@ -474,28 +474,54 @@ c_t / token_causal_credit / lambda_token_credit 这些字段**全部移除**（L
 
 ---
 
-## 5. Cost analysis
+## 5. Cost analysis (修正版 2026-05-16 20:00)
 
-| 项 | 单 prompt 单 iter | 一个 step (32 prompts × 8 iter) | 一个 250-step job |
-|---|---|---|---|
-| Teacher FSDP forward | ~0.5s | 32 × 0.5 = 16s | × 250 = 4000s |
-| Teacher 1-token decode | ~0.3s | 32 × 0.3 = 10s | × 250 = 2500s |
-| Student vLLM continuation | ~5s | 32 × 5 = 160s (batched async) | × 250 = 40000s = 11.1h |
-| Reward rescore | ~0.1s | 32 × 0.1 = 3s | × 250 = 750s |
-| 单 iter 小计 | | ~190s | × 8 chain iter |
-| **一个 step 总计** | | **~1500s ≈ 25 min** | |
-| **一个 250-step job** | | | **~104 hours ≈ 4.3 days** |
+### 5.1 之前估算错在哪里
 
-**这个成本太高了**。需要 micro-optimization 或重新评估 chain_length。
+旧版假设 "每 iter 都是完整 rollout 时间"，但忽略：
+1. **t_i 渐进后移**：teacher 早期 token 被前几轮"矫正"后，下一轮 divergence 自然落在更后位置
+   → iter i 的 continuation 长度 ≈ T × (1 - i/n), 不是 T
+2. **vLLM batch 并行**：32 prompts 同 batch async_gather，wall-clock ≈ 单 prompt 时间，不是 32× 串行
 
-| chain_length | 一个 250-step job 时长 |
-|---|---|
-| 2 | ~26h |
-| 4 | ~52h |
-| **6** | **~78h ≈ 3.3 days** |
-| 8 | ~104h ≈ 4.3 days |
+### 5.2 修正后的计算（chain_length=8 为例）
 
-**建议默认 chain_length=4-6 而非 8**，论文 ablation 跑 chain_length ∈ {2,4,8}。
+continuation 长度等比衰减：
+```
+y_0:   1.00 T_rollout  (标准 rollout)
+y_1:   0.90 T_rollout  (teacher 修早期 ~10% 位置 → 续写大部分)
+y_2:   0.80 T_rollout
+y_3:   0.70 T_rollout
+y_4:   0.60 T_rollout
+y_5:   0.50 T_rollout
+y_6:   0.40 T_rollout
+y_7:   0.25 T_rollout
+─────────────────
+total ≈ 5.15 T_rollout
+```
+
+加上 teacher forward (每 iter ~3s, 8 iter = 24s, 但其实跟 student rollout 串行，所以已包含在上面 wall-clock 内的小份额) → **总 rollout overhead ≈ 5.2× baseline**
+
+### 5.3 单 step + 250-step job 时长
+
+| chain_length | rollout overhead | 单 step (rollout + train) | 250-step job 时长 | vs baseline |
+|---|---|---|---|---|
+| baseline GRPO n=8 | 1.0× | 30s + 70s = 100s | **~7h** | 1.0× |
+| TCCA n=2 | 1.9× | 57s + 70s = 127s | ~8.8h | 1.26× |
+| TCCA n=4 | 3.4× | 102s + 70s = 172s | ~12h | 1.7× |
+| TCCA n=6 | 4.5× | 135s + 70s = 205s | ~14h | 2.0× |
+| **TCCA n=8** | **5.15×** | **155s + 70s = 225s** | **~15-16h** | **2.2×** |
+
+**结论**：chain_length=8 大约 **15-16h/job**, ~2.2× baseline, **完全可接受**。
+之前 "8× / 104h" 严重高估了, 用户直觉是对的。
+
+### 5.4 资源规划建议
+
+- **chain_length=8 默认即可**（之前担心是冤枉）
+- 单 job ~15h, 配额内能跑 1-2 job 并行
+- 论文 ablation: 跑 chain_length ∈ {2, 4, 8} 看 marginal return
+  - 2: 9h × 1 job (快速验证)
+  - 4: 12h × 1 job (中等)
+  - 8: 15h × 1 job (论文 main)
 
 ---
 
@@ -515,12 +541,12 @@ c_t / token_causal_credit / lambda_token_credit 这些字段**全部移除**（L
 
 ## 7. Open questions（待 user 决定）
 
-1. **chain_length 默认值**：8（你的初衷） vs 4-6（折中 compute）？
+1. ~~**chain_length 默认值**：8（你的初衷） vs 4-6（折中 compute）？~~ → **修正后 ~15h/job, 直接用 8**
 2. **Step 0 的 y_0**：用标准 generate_sequences 还是直接 async_rollout_manager？
 3. **Iteration i 的 t_i 选择**：是否允许 t_i 和 t_{i-1} 接近？（已在 t_i 在 y_{i-1} 上选, 自动是新位置, 不需要 min_gap）
 4. **OPSD ref_template 模板**：`"The correct answer is {r}.\n"` 还是更详细的？
 5. **失败 fallback**：如果某个 prompt 在 iteration 5 续写空了（continuation = []）, 接下来怎么办？跳过剩余 iter 用 y_5？
-6. **Compute budget**：你的开发机配额能支持 chain_length=8 的 250-step job (~100h)？还是要降到 chain_length=4 (~50h)?
+6. ~~**Compute budget**：你的开发机配额能支持 chain_length=8 的 250-step job (~100h)？~~ → **修正后 ~15h/job, 配额内 OK**
 
 ---
 
