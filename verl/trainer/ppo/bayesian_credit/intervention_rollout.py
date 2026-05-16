@@ -322,6 +322,11 @@ def _do_real_intervention(
       - 不真做 student tail 续写（保留学生原 tail）
       - composite 复制原样本 old_log_probs (k 位置 PPO ratio 略不准, clip 兜底)
       - 不重算 bc_teacher_* 在 composite (uniform_fallback 兜底)
+
+    2026-05-16 关键修复（FSDP DataProto chunk divisibility）:
+      - 截断 n_failed 让 augmented batch size = B + n_failed*top_k 可被 world_size 整除
+      - 在 K-loop 内对 sub_proto (teacher_generate 调用) padding 到 world_size 整除
+      - 否则 worker dispatch_lazy_compute_data_proto 会 assert "only support equal chunk"
     """
     from verl.protocol import DataProto
     import numpy as np
@@ -335,6 +340,16 @@ def _do_real_intervention(
 
     B = batch.batch.batch_size[0]
     device = batch.batch["responses"].device
+
+    # ── FIX (2026-05-16): DataProto chunk 要求 size % world_size == 0 ──
+    # 否则在 actor_rollout_wg.teacher_generate_at_positions 内部 dispatch 时崩。
+    # 假设 DP size = n_gpus_per_node (TP=1, SP=1, 单机)。
+    try:
+        world_size_for_dispatch = int(config.trainer.n_gpus_per_node)
+    except Exception:
+        world_size_for_dispatch = 1
+    if world_size_for_dispatch < 1:
+        world_size_for_dispatch = 1
 
     # ── Step 1: 失败样本检测 ──────────────────────────────────────────
     seq_reward = batch.batch["token_level_rewards"].sum(dim=-1)  # (B,)
@@ -379,6 +394,23 @@ def _do_real_intervention(
     if n_failed == 0:
         return _write_zeros_and_return(batch)
 
+    # ── FIX (2026-05-16): 截断 n_failed 让 augmented batch 大小可被 world_size 整除 ──
+    # augmented_batch_size = B + n_failed * top_k, 下游 _compute_old_log_prob 等
+    # worker 调用 dispatch 时要求 size % world_size == 0
+    target_total = B + n_failed * top_k
+    remainder = target_total % world_size_for_dispatch
+    n_failed_truncated = n_failed
+    while remainder != 0 and n_failed_truncated > 0:
+        n_failed_truncated -= 1
+        target_total = B + n_failed_truncated * top_k
+        remainder = target_total % world_size_for_dispatch
+    if n_failed_truncated < n_failed:
+        failed_idx = failed_idx[:n_failed_truncated]
+        n_failed = n_failed_truncated
+
+    if n_failed == 0:
+        return _write_zeros_and_return(batch)
+
     # ── Step 2: 计算 top-K t_star (失败样本) ───────────────────────────
     topk_all = compute_topk_divergence_positions(batch, ic_cfg, top_k=top_k)  # (B, K)
     if topk_all is None:
@@ -404,18 +436,31 @@ def _do_real_intervention(
         t_star_k = topk_failed[:, k_step]                  # (n_failed,) response 坐标
         t_star_abs_k = topk_abs_failed[:, k_step]          # (n_failed,) input_ids 坐标
 
-        # 子 batch
+        # ── PAD sub_proto to multiple of world_size_for_dispatch ──
+        remainder = n_failed % world_size_for_dispatch
+        pad_n = (world_size_for_dispatch - remainder) % world_size_for_dispatch
+        # 用第一个失败样本重复填充 (后面会丢弃 padded 输出)
+        if pad_n > 0:
+            pad_idx_local = torch.zeros(pad_n, device=device, dtype=torch.long)  # 重复 idx 0
+            failed_idx_padded = torch.cat([failed_idx, failed_idx[pad_idx_local]])
+            t_star_abs_padded = torch.cat([t_star_abs_k, t_star_abs_k[pad_idx_local]])
+        else:
+            failed_idx_padded = failed_idx
+            t_star_abs_padded = t_star_abs_k
+
         sub_proto = DataProto.from_dict(
             tensors={
-                "teacher_input_ids": batch.batch["teacher_input_ids"][failed_idx],
-                "teacher_attention_mask": batch.batch["teacher_attention_mask"][failed_idx],
-                "teacher_position_ids": batch.batch["teacher_position_ids"][failed_idx],
-                "t_star_abs": t_star_abs_k,
+                "teacher_input_ids": batch.batch["teacher_input_ids"][failed_idx_padded],
+                "teacher_attention_mask": batch.batch["teacher_attention_mask"][failed_idx_padded],
+                "teacher_position_ids": batch.batch["teacher_position_ids"][failed_idx_padded],
+                "t_star_abs": t_star_abs_padded,
             },
             meta_info={"k": intervention_length, "temperature": teacher_temp},
         )
         teacher_gen_out = actor_rollout_wg.teacher_generate_at_positions(sub_proto)
-        intervention_tokens = teacher_gen_out.batch["intervention_tokens"].to(device)  # (n_failed, intervention_length)
+        intervention_tokens_padded = teacher_gen_out.batch["intervention_tokens"].to(device)
+        # 丢弃 padded 输出
+        intervention_tokens = intervention_tokens_padded[:n_failed]  # (n_failed, intervention_length)
 
         # 构造 composite_k：复制 failed 子集，替换 [t_star_k, t_star_k+intervention_length) 位置
         comp_responses = batch.batch["responses"][failed_idx].clone()
