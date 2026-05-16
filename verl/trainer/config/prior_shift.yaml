@@ -51,12 +51,18 @@ algorithm:
   prior_shift:
     # mean_t(g_t) 的下限，避免除 0
     eps_norm: 1.0e-6
-    # ĝ_t 上限：超大 surprise token 不让 advantage 撑爆
-    max_ratio: 10.0
+    # ĝ_t 上限：超大 surprise token 不让 advantage 撑爆 (v2: 10→3)
+    max_ratio: 3.0
     # 整序列 g≈0 时退化为 GRPO 平摊（ĝ_t = 1）
     uniform_fallback: True
     # 是否在 GRPO 阶段除 std（默认 False，与 baseline_grpo 对齐）
     norm_adv_by_std_in_grpo: False
+    # v2 新增: clip 后重新归一化，保持 mean(ĝ)=1（梯度量级不随 clip 比例漂移）
+    renormalize_after_clip: True
+    # v2 新增: response 长度下限（抵抗 length collapse）
+    min_response_length: 50
+    # v2 新增: 长度惩罚类型 (linear / zero)
+    length_penalty_type: linear
   rollout_correction:
     rollout_is: token
     rollout_is_threshold: 2.0
