@@ -38,6 +38,8 @@ N_GPUS_PER_NODE="${N_GPUS_PER_NODE:-4}"
 
 # Intervention-Credit 专属超参（带默认值）
 IC_ENABLE_INTERVENTION="${IC_ENABLE_INTERVENTION:-False}"        # Phase 1 默认 False
+IC_BASE_ESTIMATOR="${IC_BASE_ESTIMATOR:-grpo}"                    # grpo | rlsd | prior_shift
+IC_RLSD_EPS_W="${IC_RLSD_EPS_W:-0.2}"                             # base=rlsd 专属
 IC_DIVERGENCE_METRIC="${IC_DIVERGENCE_METRIC:-argmax_excl_eos}"   # 3 种策略消融
 IC_EXCLUDE_TAIL_TOKENS="${IC_EXCLUDE_TAIL_TOKENS:-8}"
 IC_K="${IC_K:-2}"                                                 # intervention 长度
@@ -127,6 +129,8 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
     algorithm.adv_estimator=intervention_credit \
     algorithm.intervention_credit.enable_intervention=${IC_ENABLE_INTERVENTION} \
+    algorithm.intervention_credit.base_estimator=${IC_BASE_ESTIMATOR} \
+    algorithm.intervention_credit.rlsd_eps_w=${IC_RLSD_EPS_W} \
     algorithm.intervention_credit.divergence_metric=${IC_DIVERGENCE_METRIC} \
     algorithm.intervention_credit.exclude_tail_tokens=${IC_EXCLUDE_TAIL_TOKENS} \
     algorithm.intervention_credit.intervention_length_k=${IC_K} \

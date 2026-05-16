@@ -6,27 +6,36 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 """
-Teacher-Guided Dynamic Intervention advantage (Bayesian Credit Assignment Tier 3, ours).
+Teacher-Guided Dynamic Intervention advantage (ours, base-agnostic causal layer).
 
-Causal counterfactual credit on top of Prior-Shift's correlational g_t reweight.
+ΔR causal credit can be applied **on top of any base advantage estimator**:
 
-Formula (per sample i, after intervention rollout has appended composite samples to batch):
+    A_seq[i]_base = base_estimator_seq_advantage(R_i, group)            # 不同 base 不同算法
+    A_seq[i]      = A_seq[i]_base + λ·ΔR_i · 𝟙[i is intervention sample]
+    A_t           = A_seq[i] · base_token_reweight(t, ...) · length_scale
 
-    A_seq[i] = (R_i - mean_{j ∈ group(i)} R_j)         # GRPO baseline
-             + λ · ΔR_i · 𝟙[i is intervention sample]   # causal credit
-    g_t      = KL( P_T(·|x, y_≤t) ‖ P_T(·|x, y_<t) )   # teacher forward Bayes surprise
-    ĝ_t      = clip(g_t / mean_t(g_t), max_ratio)       # per-sequence normalize + clip
-    A_t      = A_seq · ĝ_t · length_scale(L)            # final per-token advantage
+支持的 base estimator:
+  - "grpo"        : A_t = A_seq · response_mask  (uniform, no token reweight)
+  - "rlsd"        : A_t = A_seq · clip(exp(sign(A_seq) · (logp_T - logp_S)), 1±ε_w)
+                    (RLSD baseline, arXiv:2604.03128v2)
+  - "prior_shift" : A_t = A_seq · ĝ_t  where g_t = KL(P_T(·|y_≤t) ‖ P_T(·|y_<t))
+                    (Tier 1 自家方法，已知在 sciknoweval 上 v2 best 0.33 < RLSD 0.585)
+
+论文叙事:
+    ΔR = R(y_intervened) - R(y_original) 是 base-agnostic 因果证据 layer。
+    通过在 GRPO / RLSD 等已知 baseline 上加 ΔR 验证："causal credit 是否能在最强相关性
+    baseline 上仍能涨 val_acc"——这是论文真正的 claim。
 
 Mode B (append) 关键性质:
-    - 失败样本 y_s (R_s 低)         → A_seq < 0, 推低对应 token
-    - 复合样本 y' (R' > R_s)        → A_seq > 0 + λ·ΔR > 0, 推高 teacher 推荐 token
+    - 失败样本 y_s (R_s 低)         → A_seq < 0
+    - 复合样本 y' (R' > R_s)        → A_seq > 0 + λ·ΔR > 0
     天然形成 contrastive pair on the same prefix。
 
 实现层面:
-    - ΔR 通道由 ray_trainer 的 intervention_rollout block 写入 batch.batch["intervention_delta_reward"]
-    - g_t 通道复用 prior_shift 的 batch.batch["bc_teacher_prior_shift_surprise"]
-    - 当 enable_intervention=False (或 ΔR/used 通道缺失) 时退化为 prior_shift
+    - ΔR 通道: ray_trainer 的 intervention_rollout block 写入 batch.batch["intervention_delta_reward"]
+    - prior_shift 通道: batch.batch["bc_teacher_prior_shift_surprise"]
+    - rlsd 通道:        batch.batch["bc_teacher_log_probs"] + batch.batch["old_log_probs"]
+    - 当 enable_intervention=False 时, ΔR 始终为 0, 估计器退化为 pure base estimator
 """
 
 from __future__ import annotations
@@ -39,28 +48,110 @@ import torch
 from verl.trainer.ppo.core_algos import register_adv_est
 
 
+def _grpo_baseline_seq_advantage(
+    token_level_rewards: torch.Tensor,
+    index,
+    norm_adv_by_std: bool,
+) -> torch.Tensor:
+    """GRPO group-relative seq advantage: (R_i - mean_group(R)) / [std]."""
+    B = token_level_rewards.shape[0]
+    device = token_level_rewards.device
+    dtype = token_level_rewards.dtype
+
+    seq_reward = token_level_rewards.sum(dim=-1)
+    uid_to_indices: dict = defaultdict(list)
+    for i in range(B):
+        uid_to_indices[index[i]].append(i)
+
+    seq_advantage = torch.zeros(B, device=device, dtype=dtype)
+    for uid, idxs in uid_to_indices.items():
+        group_r = seq_reward[idxs]
+        mu = group_r.mean()
+        if norm_adv_by_std and group_r.numel() > 1:
+            sigma = group_r.std(unbiased=False).clamp(min=1e-8)
+            seq_advantage[idxs] = (group_r - mu) / sigma
+        else:
+            seq_advantage[idxs] = group_r - mu
+    return seq_advantage
+
+
+def _rlsd_token_reweight(
+    A_seq: torch.Tensor,                # (B, T) seq adv broadcast
+    teacher_log_probs: torch.Tensor,    # (B, T)
+    student_log_probs: torch.Tensor,    # (B, T)
+    response_mask: torch.Tensor,        # (B, T)
+    eps_w: float,
+) -> torch.Tensor:
+    """RLSD reweight: clip(exp(sign(A) · (logp_T - logp_S)), 1±ε_w)"""
+    delta = (teacher_log_probs - student_log_probs) * response_mask
+    sign_A = torch.sign(A_seq)
+    weight = torch.exp(sign_A * delta)
+    weight = weight.clamp(min=1.0 - eps_w, max=1.0 + eps_w)
+    return weight
+
+
+def _prior_shift_token_reweight(
+    teacher_prior_shift_surprise: torch.Tensor,  # (B, T) g_t
+    response_mask: torch.Tensor,                 # (B, T)
+    eps_norm: float,
+    max_ratio: float,
+    uniform_fallback: bool,
+    renormalize_after_clip: bool,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Prior-Shift reweight: ĝ_t = g_t / mean_t(g_t), clipped."""
+    mask = response_mask.to(dtype)
+    g = teacher_prior_shift_surprise.to(dtype) * mask
+    L = mask.sum(dim=-1).clamp(min=1.0)
+    g_mean = g.sum(dim=-1) / L
+    degenerate = g_mean < eps_norm
+
+    denom = g_mean.clamp(min=eps_norm).unsqueeze(-1)
+    g_hat = g / denom
+    g_hat = g_hat.clamp(max=max_ratio)
+
+    if renormalize_after_clip:
+        g_hat_mean = (g_hat * mask).sum(dim=-1, keepdim=True) / L.unsqueeze(-1).clamp(min=1.0)
+        g_hat = g_hat / g_hat_mean.clamp(min=eps_norm)
+        g_hat = g_hat * mask
+
+    if uniform_fallback and degenerate.any():
+        uniform = mask.clone()
+        g_hat = torch.where(degenerate.unsqueeze(-1), uniform, g_hat)
+
+    return g_hat * mask
+
+
 @register_adv_est("intervention_credit")
 def compute_intervention_credit_advantage(
-    token_level_rewards: torch.Tensor,                   # (B, T)
-    response_mask: torch.Tensor,                         # (B, T)
-    index,                                               # uid array, len B
-    teacher_prior_shift_surprise: Optional[torch.Tensor] = None,  # (B, T) g_t ≥ 0
-    intervention_delta_reward: Optional[torch.Tensor] = None,     # (B,) ΔR
-    intervention_used: Optional[torch.Tensor] = None,             # (B,) bool
+    token_level_rewards: torch.Tensor,                            # (B, T)
+    response_mask: torch.Tensor,                                  # (B, T)
+    index,                                                        # uid array, len B
+    teacher_log_probs: Optional[torch.Tensor] = None,             # (B, T)  for base=rlsd
+    student_log_probs: Optional[torch.Tensor] = None,             # (B, T)  for base=rlsd (= old_log_probs)
+    teacher_prior_shift_surprise: Optional[torch.Tensor] = None,  # (B, T)  for base=prior_shift
+    intervention_delta_reward: Optional[torch.Tensor] = None,     # (B,)    ΔR; None → no causal injection
+    intervention_used: Optional[torch.Tensor] = None,             # (B,)    bool/float
     config: Optional[dict] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Intervention-Credit advantage.
+    """Intervention-Credit (base-agnostic causal layer)。
+
+    流程:
+      1. base seq advantage A_seq_base = base_estimator_seq_advantage(R, group)
+      2. ΔR 注入: A_seq = A_seq_base + λ·ΔR · 𝟙[intervention sample]
+      3. base token reweight: weight_t = ...    (依 base_estimator 不同)
+      4. 最终: A_t = A_seq · weight_t · length_scale(L)
 
     Args:
-        token_level_rewards: (B, T) rule-based reward (only seq-sum used → R_i).
-        response_mask: (B, T) bool/0-1 mask.
-        index: list[str|int]，长度 B，相同 uid = 同一 prompt 的 group。
-        teacher_prior_shift_surprise: (B, T) g_t = KL(D_t‖D_{t-1})。
-            若为 None，则 g_t reweight 被关闭，token-level advantage 走平摊。
-        intervention_delta_reward: (B,) ΔR = R(y') - R(y_s)。
-            非 intervention 样本应为 0；若为 None 则整体 ΔR 通道关闭（退化为 prior_shift）。
-        intervention_used: (B,) bool/0-1，标识哪些样本是 composite rollout。
-        config: AlgoConfig dict-like. 读取 algorithm.intervention_credit.{...}。
+        token_level_rewards: (B, T) rule-based reward。
+        response_mask: (B, T) bool/0-1 mask。
+        index: list[str|int]，长度 B，uid 标识同 prompt 组。
+        teacher_log_probs: (B, T) base=rlsd 必需（teacher forward 算出）。
+        student_log_probs: (B, T) base=rlsd 必需（= old_log_probs）。
+        teacher_prior_shift_surprise: (B, T) base=prior_shift 必需。
+        intervention_delta_reward: (B,) ΔR；非 intervention 样本应为 0。None 等价无因果注入。
+        intervention_used: (B,) bool/float，标识 composite rollout 样本。
+        config: AlgoConfig dict-like，读取 algorithm.intervention_credit.{...}。
 
     Returns:
         advantages: (B, T) per-token advantage
@@ -69,18 +160,21 @@ def compute_intervention_credit_advantage(
     ic_cfg: dict = {}
     if config is not None:
         ic_cfg = config.get("intervention_credit", {}) or {}
-    g_t_cfg: dict = ic_cfg.get("g_t", {}) or {}
 
-    eps_norm: float = float(g_t_cfg.get("eps_norm", 1e-6))
-    max_ratio: float = float(g_t_cfg.get("max_ratio", 3.0))
-    uniform_fallback: bool = bool(g_t_cfg.get("uniform_fallback", True))
-    renormalize_after_clip: bool = bool(g_t_cfg.get("renormalize_after_clip", True))
-
+    base_estimator: str = str(ic_cfg.get("base_estimator", "grpo")).lower()
     lambda_delta_r: float = float(ic_cfg.get("lambda_delta_r", 1.0))
     norm_adv_by_std: bool = bool(ic_cfg.get("norm_adv_by_std_in_grpo", False))
 
     min_response_length: int = int(ic_cfg.get("min_response_length", 50))
     length_penalty_type: str = str(ic_cfg.get("length_penalty_type", "linear"))
+
+    # base-specific configs
+    rlsd_eps_w: float = float(ic_cfg.get("rlsd_eps_w", 0.2))
+    g_t_cfg: dict = ic_cfg.get("g_t", {}) or {}
+    eps_norm: float = float(g_t_cfg.get("eps_norm", 1e-6))
+    max_ratio: float = float(g_t_cfg.get("max_ratio", 3.0))
+    uniform_fallback: bool = bool(g_t_cfg.get("uniform_fallback", True))
+    renormalize_after_clip: bool = bool(g_t_cfg.get("renormalize_after_clip", True))
 
     B, T = token_level_rewards.shape
     device = token_level_rewards.device
@@ -89,68 +183,61 @@ def compute_intervention_credit_advantage(
     with torch.no_grad():
         mask = response_mask.to(dtype)
 
-        # ── Step 1: GRPO baseline seq-level advantage ─────────────────────
-        # 注意: append 后 group_size 可变，uid_to_indices 天然支持
-        seq_reward = token_level_rewards.sum(dim=-1)  # (B,)
-        uid_to_indices: dict = defaultdict(list)
-        for i in range(B):
-            uid_to_indices[index[i]].append(i)
+        # ── Step 1: base seq-level advantage ─────────────────────────────
+        seq_advantage = _grpo_baseline_seq_advantage(token_level_rewards, index, norm_adv_by_std)
 
-        seq_advantage = torch.zeros(B, device=device, dtype=dtype)
-        for uid, idxs in uid_to_indices.items():
-            group_r = seq_reward[idxs]
-            mu = group_r.mean()
-            if norm_adv_by_std and group_r.numel() > 1:
-                sigma = group_r.std(unbiased=False).clamp(min=1e-8)
-                seq_advantage[idxs] = (group_r - mu) / sigma
-            else:
-                seq_advantage[idxs] = group_r - mu
-
-        # ── Step 2: ΔR causal credit injection (仅 intervention 样本) ──────
+        # ── Step 2: ΔR causal injection ──────────────────────────────────
         if intervention_delta_reward is not None:
             delta_r = intervention_delta_reward.to(device=device, dtype=dtype)  # (B,)
             if intervention_used is not None:
-                used = intervention_used.to(device=device, dtype=dtype)         # (B,)
+                used = intervention_used.to(device=device, dtype=dtype)
             else:
-                # 没传 used → 用 delta_r != 0 兜底
                 used = (delta_r.abs() > 1e-12).to(dtype)
             seq_advantage = seq_advantage + lambda_delta_r * delta_r * used
 
         A_seq = seq_advantage.unsqueeze(1).expand_as(token_level_rewards)  # (B, T)
 
-        # ── Step 3: per-sequence normalize surprise → ĝ_t ──────────────────
-        if teacher_prior_shift_surprise is not None:
-            g = teacher_prior_shift_surprise.to(dtype) * mask                  # (B, T)
-            L_eff = mask.sum(dim=-1).clamp(min=1.0)                            # (B,)
-            g_sum = g.sum(dim=-1)
-            g_mean = g_sum / L_eff
-            degenerate = g_mean < eps_norm
-
-            denom = g_mean.clamp(min=eps_norm).unsqueeze(-1)                   # (B, 1)
-            g_hat = g / denom                                                  # (B, T)
-            g_hat = g_hat.clamp(max=max_ratio)
-
-            if renormalize_after_clip:
-                g_hat_mean = (g_hat * mask).sum(dim=-1, keepdim=True) / L_eff.unsqueeze(-1).clamp(min=1.0)
-                g_hat = g_hat / g_hat_mean.clamp(min=eps_norm)
-                g_hat = g_hat * mask
-
-            if uniform_fallback and degenerate.any():
-                uniform = mask.clone()
-                g_hat = torch.where(degenerate.unsqueeze(-1), uniform, g_hat)
-
-            g_hat = g_hat * mask
+        # ── Step 3: base token reweight ──────────────────────────────────
+        if base_estimator == "grpo":
+            # uniform: no extra reweight, just response_mask
+            weight = mask
+        elif base_estimator == "rlsd":
+            if teacher_log_probs is None or student_log_probs is None:
+                raise ValueError(
+                    "intervention_credit with base_estimator=rlsd requires teacher_log_probs "
+                    "and student_log_probs in batch (set bc_teacher_log_probs and old_log_probs)."
+                )
+            weight = _rlsd_token_reweight(
+                A_seq=A_seq,
+                teacher_log_probs=teacher_log_probs.to(dtype),
+                student_log_probs=student_log_probs.to(dtype),
+                response_mask=mask,
+                eps_w=rlsd_eps_w,
+            )
+            weight = weight * mask
+        elif base_estimator == "prior_shift":
+            if teacher_prior_shift_surprise is None:
+                # 退化：当 g_t 缺失时，behave like grpo
+                weight = mask
+            else:
+                weight = _prior_shift_token_reweight(
+                    teacher_prior_shift_surprise=teacher_prior_shift_surprise,
+                    response_mask=response_mask,
+                    eps_norm=eps_norm,
+                    max_ratio=max_ratio,
+                    uniform_fallback=uniform_fallback,
+                    renormalize_after_clip=renormalize_after_clip,
+                    dtype=dtype,
+                )
         else:
-            # 没有 g_t (例如 intervention_credit 第一次跑还没接通 teacher fwd)
-            # 退化为均匀分配
-            g_hat = mask.clone()
-            L_eff = mask.sum(dim=-1).clamp(min=1.0)
+            raise ValueError(f"Unknown base_estimator: {base_estimator}. Choose grpo|rlsd|prior_shift.")
 
-        # ── Step 4: 合成 token-level advantage ─────────────────────────────
-        advantages = A_seq * g_hat * mask
+        # ── Step 4: 合成 token-level advantage ────────────────────────────
+        advantages = A_seq * weight * mask
 
         # ── Step 5: length floor penalty (复用 prior_shift v2 防护) ─────────
         if min_response_length > 0:
+            L_eff = mask.sum(dim=-1).clamp(min=1.0)
             length_ratio = (L_eff / float(min_response_length)).clamp(max=1.0)
             if length_penalty_type == "zero":
                 length_scale = (L_eff >= min_response_length).to(dtype)

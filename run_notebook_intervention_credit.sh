@@ -90,6 +90,8 @@ export TEACHER_UPDATE_RATE="${TEACHER_UPDATE_RATE:-0.05}"
 
 # ── intervention_credit 专属 (单 t* 模式默认) ─────────────────────────
 export IC_ENABLE_INTERVENTION="${IC_ENABLE_INTERVENTION:-False}"
+export IC_BASE_ESTIMATOR="${IC_BASE_ESTIMATOR:-grpo}"            # grpo | rlsd | prior_shift
+export IC_RLSD_EPS_W="${IC_RLSD_EPS_W:-0.2}"
 export IC_DIVERGENCE_METRIC="${IC_DIVERGENCE_METRIC:-argmax_excl_eos}"
 export IC_EXCLUDE_TAIL_TOKENS="${IC_EXCLUDE_TAIL_TOKENS:-8}"
 export IC_K="${IC_K:-2}"
@@ -157,7 +159,12 @@ run_single_strategy() {
     esac
 
     SUFFIX="${SUFFIX:-${MODE}}"
-    export JOB_NAME="${JOB_NAME:-LOCAL-TGDI-v3p1-${SUBJECT}-${strategy_short}-bs${TRAIN_BATCH_SIZE}-n${ROLLOUT_N}-step${TOTAL_STEPS}-${SUFFIX}}"
+    if [ "$IC_ENABLE_INTERVENTION" = "True" ]; then
+        VERSION_TAG="v3"
+    else
+        VERSION_TAG="v3p1"
+    fi
+    export JOB_NAME="${JOB_NAME:-LOCAL-TGDI-${VERSION_TAG}-${IC_BASE_ESTIMATOR}-${SUBJECT}-${strategy_short}-bs${TRAIN_BATCH_SIZE}-n${ROLLOUT_N}-step${TOTAL_STEPS}-${SUFFIX}}"
 
     echo "========================================================================"
     echo "Local TGDI launch (notebook, ${N_GPUS_PER_NODE}×GPU) — MODE=${MODE}"
@@ -167,6 +174,7 @@ run_single_strategy() {
     echo "  TOTAL_STEPS    : ${TOTAL_STEPS}"
     echo "  TRAIN_BS / N   : ${TRAIN_BATCH_SIZE} / ${ROLLOUT_N}    LR=${LR}"
     echo "  TEACHER        : ${TEACHER_REGULARIZATION} (rate=${TEACHER_UPDATE_RATE})"
+    echo "  BASE_ESTIMATOR : ${IC_BASE_ESTIMATOR}    rlsd_eps_w=${IC_RLSD_EPS_W} (used iff base=rlsd)"
     echo "  INTERVENTION   : enable=${IC_ENABLE_INTERVENTION} divergence=${IC_DIVERGENCE_METRIC} k=${IC_K} λ=${IC_LAMBDA_DR}"
     echo "  G_T            : max_ratio=${IC_GT_MAX_RATIO} renorm=${IC_GT_RENORMALIZE_AFTER_CLIP}"
     echo "  LENGTH         : min_resp=${IC_MIN_RESPONSE_LENGTH} penalty=${IC_LENGTH_PENALTY_TYPE}"

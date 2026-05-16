@@ -407,14 +407,19 @@ def compute_advantage(
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
     elif adv_estimator == "intervention_credit":
-        # Intervention-Credit (ours, Tier 3): A_seq += λ·ΔR; A_t = A_seq · ĝ_t · length_scale
+        # Intervention-Credit (ours, base-agnostic causal layer):
+        #   A_seq = base_estimator_seq_advantage + λ·ΔR · 𝟙[intervention sample]
+        #   A_t   = A_seq · base_token_reweight · length_scale
         # ΔR = R(y_intervened) - R(y_original), 由 intervention_rollout block 写入 batch
+        # base_estimator ∈ {grpo, rlsd, prior_shift} 由 algorithm.intervention_credit.base_estimator 切换
         adv_estimator_fn = core_algos.get_adv_estimator_fn("intervention_credit")
         advantages, returns = adv_estimator_fn(
             token_level_rewards=data.batch["token_level_rewards"],
             response_mask=data.batch["response_mask"],
             index=data.non_tensor_batch["uid"],
-            teacher_prior_shift_surprise=data.batch.get("bc_teacher_prior_shift_surprise"),
+            teacher_log_probs=data.batch.get("bc_teacher_log_probs"),         # base=rlsd
+            student_log_probs=data.batch.get("old_log_probs"),                # base=rlsd
+            teacher_prior_shift_surprise=data.batch.get("bc_teacher_prior_shift_surprise"),  # base=prior_shift
             intervention_delta_reward=data.batch.get("intervention_delta_reward"),
             intervention_used=data.batch.get("intervention_used"),
             config=config,
@@ -2174,8 +2179,16 @@ class RayPPOTrainer:
                         if is_rlsd_like and "teacher_input_ids" in batch.batch:
                             _bc_temperature = self.config.actor_rollout_ref.rollout.temperature
                             _bc_micro_batch_size = self.config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu
-                            # prior_shift / intervention_credit 都需要 g_t (KL Bayes surprise)
-                            _bc_needs_g_t = self.config.algorithm.adv_estimator in ("prior_shift", "intervention_credit")
+                            # 何时计算 g_t (KL Bayes surprise)?
+                            #   - adv_estimator=prior_shift          : 必需
+                            #   - adv_estimator=intervention_credit + base_estimator=prior_shift : 必需
+                            #   - 其他                                : 不需要 (节省 forward 开销)
+                            _ic_cfg = self.config.algorithm.get("intervention_credit", {}) or {}
+                            _ic_base = str(_ic_cfg.get("base_estimator", "grpo")).lower()
+                            _bc_needs_g_t = (
+                                self.config.algorithm.adv_estimator == "prior_shift"
+                                or (self.config.algorithm.adv_estimator == "intervention_credit" and _ic_base == "prior_shift")
+                            )
                             _bc_is_prior_shift = _bc_needs_g_t
                             bc_fwd_batch = DataProto.from_dict(
                                 tensors={
