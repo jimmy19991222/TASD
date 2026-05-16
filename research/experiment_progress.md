@@ -55,220 +55,29 @@
 
 ---
 
-## 1. 论文叙事（**2026-05-16 19:00 升级：TGDI → TCCA**）
+## 1. 方法概要（详见 [paper_idea.md](paper_idea.md)）
 
-### 1.0 关键认知：旧 TGDI 不是 credit assignment 创新
+**论文核心创新**：**TCCA (Token-level Causal Credit Assignment)**——把"token 的 credit 应该多少"用 teacher 真实改写 + reward 复算的因果反事实方式回答。这是 OPD 综述中 token 信号演化路径的下一步：
+`distribution matching` → `启发式 entropy×divergence` → `统计学 log-ratio` → **真因果 ΔR_t**
 
-回顾 TGDI 改动层次：
-- ❌ Reward function: 没动
-- ❌ Loss function: 没动
-- ❌ **Token-level credit: 没动**（A_t = A_seq · base_reweight，沿用 GRPO/RLSD）
-- ⚠️ Seq-level advantage: 加了 λ·ΔR (sample 级 scalar)
-- ✅ Sampling/data: Mode B append 创新
+**论文 framing**：
+- 🎯 **主推**：TCCA = top-K interventions per failed sample + per-token causal credit c_t (base-agnostic causal layer)
+- 🔬 **Ablation**：Prior-Shift (相关性归因) 反衬 causal 价值
 
-**审稿人会问**："你不就加了几个 teacher-corrected sample 喂给 GRPO 嘛？"
-论文必须在 **token-level credit assignment** 这一层做真创新，才能写 8 页。
-
-### 1.0.1 升级方案：TCCA (Token-level Causal Credit Assignment)
-
+**TCCA 公式 (简版)**：
 ```
-旧 TGDI Phase 2 V1:
-  失败 sample y → 单点 t* → teacher 改 k token → 单个 ΔR (sample 标量)
-  → A_seq += λ · ΔR  (seq 级注入, 不是 token 级 credit)
-
-新 TCCA:
-  失败 sample y → top-K positions {t_1, ..., t_K} → 各做独立 intervention
-  → K 个独立 ΔR_{t_k}: "如果我在 t_k 听 teacher 会怎样" 的因果证据
-  → c_t = +ΔR_{t_k} 在 composite 的 teacher token 上, -ΔR_{t_k} 在原 sample 同位置, 0 elsewhere
-  → A_t = A_seq · base_reweight · (1 + λ · c_t)  ← 真 token-level causal credit
+对失败 sample y, top-K positions {t_1, ..., t_K}, 每个 t_k 做 1 次 intervention → ΔR_k
+c_t[原 y] = -ΔR_k at intervention 位置 (惩罚错误 token)
+c_t[composite y'_k] = +ΔR_k at同位置 (奖励 teacher 正确选择)
+A_t = A_seq · base_reweight · (1 + λ_token · clip(c_t, ±clip)) · length_scale
 ```
 
-**TCCA 与其他 token-level credit 方法对比**：
-
-| 方法 | token weight | 信号类型 |
-|---|---|---|
-| GRPO baseline | 1 (uniform) | uniform |
-| RLSD | clip(exp(sign(A)·(logp_T - logp_S))) | 统计学 log-ratio (相关性) |
-| Prior-Shift (ablation) | g_t / mean_t(g_t) | teacher 自反思 (相关性) |
-| TIP | (1-H_S) · KL_TS | 启发式 entropy×divergence (相关性) |
-| **TCCA (ours)** | **±ΔR_{t_k} (sparse, K positions)** | **真因果 counterfactual** |
-
-
-
-### 1.1 修正后的论文定位
-
-**论文主 claim**：
-
-> **ΔR (causal counterfactual credit) 是 base-agnostic 因果层，可叠加在任意 RL baseline (GRPO/RLSD/SDPO) 之上，验证因果归因优于相关性归因。**
-
-**核心结构（2 个 idea，主 + ablation）**：
-
-```
-Main contribution: TGDI = Intervention-Credit (公式) + Intervention Rollout (机制)
-                   ──────────────────────────────────────────────────────────────
-                   A_seq = base_seq_advantage + λ · ΔR · 𝟙[intervention sample]
-                   A_t   = A_seq · base_token_reweight · length_scale
-                   base ∈ {grpo, rlsd, sdpo}, 论文主表跑全部 3 个 base
-
-Ablation:          Prior-Shift (相关性归因，证明 causal > correlational)
-                   ──────────────────────────────────────────────────────────────
-                   A_t = A_seq · g_t / mean_t(g_t)
-                   实验展示: PS v2b best 0.55 < GRPO baseline 0.66
-                   → "correlational credit 不够，必须做 causal intervention"
-
-Future / 暂缓:     Posterior-Shift Tier 2 (reward-conditioned hindsight)
-```
-
-### 1.2 弃用旧"三 Tier Bayesian 框架"的理由
-
-之前定位"Bayesian Credit Assignment Tier 1/2/3"有学术包装嫌疑：
-- ❌ ΔR 与 Bayesian 推理无关（是 counterfactual experiment）
-- ❌ Prior-Shift 实证拉胯（< GRPO baseline）拖累整篇论文
-- ❌ 审稿人会问"Tier 1 已经失败，为什么放论文主体"
-
-**修正后**：单一 claim 清晰、有 5 篇 paper 理论支撑、Prior-Shift 作为 ablation 反而强化"我们试过相关性，发现因果更优"的叙事。
-
-### 1.3 与既有 baseline 的差异
-
-| Method | Direction signal | Magnitude signal | Leakage | 是否 base-agnostic |
-|---|---|---|---|---|
-| GRPO | env reward (sparse) | uniform | 无 | — |
-| SDPO | distribution match | distribution match | **严重** | — |
-| OPSD | privileged info | privileged info | **严重** | — |
-| RLSD | env reward (sparse) | teacher-student log-ratio | 无 | 否 |
-| **TGDI (ours)** | env reward (sparse) | **真实 ΔR** (counterfactual) | 无 | **是** |
-
-ΔR 是比 RLSD 的 evidence ratio 更直接的因果 magnitude 信号——直接做 counterfactual experiment，不是统计学推断。
-
-### 1.4 论文 figure 设计（草案）
-
-**Main figure (base-agnostic claim)**：
-
-| Method | biology | chemistry | physics |
-|---|---|---|---|
-| GRPO baseline | 0.66 | 0.78 | 0.78 |
-| **GRPO + ΔR** | 0.6X (期 +1-3%) | — | — |
-| RLSD baseline | 0.58 (待补) | ? | ? |
-| **RLSD + ΔR (headline)** | 0.6X (期 +1-5%) | — | — |
-| SDPO baseline | 0.59 | 0.74 | 0.65 |
-| **SDPO + ΔR** | 0.6X (期 +1-3%) | — | — |
-| Prior-Shift (our ablation) | 0.55 | — | — |
-
-**Ablation figure**: t\* 策略 / λ_ΔR 敏感性 / k 敏感性 / Prior-Shift vs TGDI 对比
+完整 pipeline (Step 1-9)、与既有方法对比、术语词典、why 论证 → [paper_idea.md](paper_idea.md)
+设计演化历史 (Prior-Shift Tier 1 → TGDI → TCCA) → [design_history.md](design_history.md)
+代码 → `verl/trainer/ppo/bayesian_credit/{intervention_credit, intervention_rollout, prior_shift}.py`
 
 ---
 
-## 2. 术语词典（先看这里！）
-
-### 2.1 g_t — Forward Bayesian Surprise（teacher 自反思惊讶度）
-
-```
-g_t = KL( P_T(·|x, y_≤t)  ‖  P_T(·|x, y_<t) )
-```
-
-**含义**：teacher 看到 token y_t 之后，对"下一个 token"的预测分布**变化了多少**。
-**直觉**：teacher 在看一本悬疑小说，平淡段落 g_t 低，剧情反转段落 g_t 高。
-**用法**：把 sequence 级 reward 按 g_t 在 token 间重新分配（Prior-Shift 公式）。
-**失败模式**：g_t 高 ≠ student 错了。高 g_t 常落在新推理步骤开头（"Therefore"），upweight 后 → 模型多写推理步骤 → length explosion（v3p1-gtarg 1686 token）。
-
-### 2.2 t* — Divergence Position（teacher-student 分歧最大位置）
-
-```
-t* = argmax_t |log P_T(y_t) - log P_S(y_t)| · response_mask
-```
-
-**含义**：teacher 和 student 在 y_t 上"意见不合度"最高的位置。是 TGDI intervention 的下手点。
-**3 种策略**（已实证）：
-- **`argmax_excl_eos`** （推荐）：排除尾部 8 token 后取 argmax → **val 0.5737** 🥇
-- `argmax_raw`：纯 argmax → val 0.4238
-- `g_t_argmax`：用 g_t 取 argmax → KILLED (length 爆 1686)
-
-### 2.3 ΔR — Causal Counterfactual Reward Delta
-
-```
-1. student rollout y_s, 算 R(y_s)
-2. teacher 在 [t*, t*+k] 位置接管生成 k 个 token (我们用 k=2)
-3. 拼接 composite y' = y_<t* + teacher_intervention + y_tail
-4. 重新打分 R(y')
-5. ΔR = R(y') - R(y_s)
-```
-
-**含义**：teacher 介入后 reward 真的涨了多少。**这是真实因果证据，不是统计学相关性**。
-**用法**：把 ΔR 注入 GRPO 的 seq-level advantage：
-```
-A_seq[i] = (R_i - mean_group(R)) + λ · ΔR_i · 𝟙[i is intervention sample]
-```
-
-### 2.4 Mode B Append（变长 group）
-
-```
-原 group: y₁, y₂, y₃, y₄, y₅, y₆, y₇        (n=7 student rollouts, 同 uid)
-y₃ 失败 → teacher 改写 → y₃' (composite)
-新 group: y₁, y₂, y₃, y₃', y₄, y₅, y₆, y₇   (n=8, 同 uid)
-```
-
-**y₃ 和 y₃' 同 uid，GRPO group-relative advantage 天然支持变长 group**（无需改 group reduction 代码）。
-
-### 2.5 Base Estimator（base-agnostic 设计）
-
-| `base_estimator` | A_t 公式 | 用途 |
-|---|---|---|
-| `grpo` | A_seq · response_mask | 最简 baseline + ΔR |
-| `rlsd` | A_seq · clip(exp(sign(A) · (logp_T-logp_S)), 1±ε) | RLSD baseline + ΔR (论文 main) |
-| `prior_shift` | A_seq · ĝ_t · length_scale | legacy（不及 GRPO baseline）|
-
----
-
-## 3. 方法实现
-
-### 3.1 Prior-Shift (Tier 1) — `prior_shift.py`
-
-```python
-A_seq[i] = R_i - mean_{j ∈ group(i)} R_j           # GRPO outcome
-g_t      = KL( P_T(·|x, y_≤t) ‖ P_T(·|x, y_<t) )  # forward Bayesian surprise
-ĝ_t      = g_t / mean_t(g_t)                       # per-sequence normalize
-ĝ_t      = clip(ĝ_t, max=max_ratio)                # v2: 防爆 (10→3)
-ĝ_t      = ĝ_t / mean_t(ĝ_t)                       # v2: clip 后再归一化
-A_t      = A_seq · ĝ_t · length_scale(L)           # v2: length floor penalty
-```
-
-### 3.2 Intervention-Credit (Tier 3, base-agnostic) — `intervention_credit.py`
-
-```python
-# Step 1: base seq advantage
-A_seq_base = base_seq_advantage(R, group, ...)
-
-# Step 2: ΔR causal injection
-A_seq = A_seq_base + λ · ΔR · 𝟙[intervention sample]
-
-# Step 3: base token reweight
-if base == "grpo":          weight = response_mask
-elif base == "rlsd":        weight = clip(exp(sign(A) · (logp_T - logp_S)), 1±ε)
-elif base == "prior_shift": weight = ĝ_t (Prior-Shift formula)
-
-# Step 4: 最终 token-level advantage
-A_t = A_seq · weight · length_scale(L)
-```
-
-### 3.3 Intervention Rollout (Phase 2) — `intervention_rollout.py`
-
-```
-1. failed = R(y_s) < threshold (默认 0.5)
-2. cap by max_intervention_per_group (默认 7)
-3. compute t* per failed sample
-4. teacher_generate_at_positions(prefixes, k=2) → intervention_tokens
-5. 构造 composite responses (替换 [t*..t*+k] 位置的 token)
-6. reward_fn(composite_batch) → R(y')
-7. ΔR = R(y') - R(y_s)
-8. DataProto.concat([batch, composite_batch])
-9. 写入 13 个 intervention/* SwanLab 指标
-```
-
-**Phase 2 V1 简化**（V2 待跟进）：
-- 保留 student 原 tail（不真做 teacher 接管后的 student 续写）
-- composite 复制原样本 old_log_probs（k=2 个 teacher 位置上 PPO ratio 略不准，clip 兜底）
-
----
 
 ## 4. 实验结果矩阵
 

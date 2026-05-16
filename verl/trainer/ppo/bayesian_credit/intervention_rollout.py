@@ -8,7 +8,7 @@
 """
 Teacher-Guided Dynamic Intervention rollout helper (Tier 3, ours).
 
-设计文档: /Users/awesome_jimmy/lazada/SDPO/Teacher-Guided_Dynamic_Intervention_Rollout.md
+设计文档: research/paper_idea.md (TCCA 当前方法) + research/design_history.md (TGDI→TCCA 演化)
 
 工作流 (Mode B append):
 
