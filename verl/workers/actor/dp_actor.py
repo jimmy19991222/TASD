@@ -885,6 +885,84 @@ class DataParallelPPOActor(BasePPOActor):
         return result
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
+    def teacher_generate_at_positions(self, data: DataProto) -> dict[str, torch.Tensor]:
+        """
+        Teacher 在每个样本的指定位置 t_star_abs 开始生成 k 个 token (greedy / sampled).
+
+        用于 TGDI Tier 3 真实 intervention 路径：在 student rollout 的 divergence 位置
+        让 teacher 接管 k 个 token，构造 composite rollout 用于计算 ΔR。
+
+        实现：k 步串行 forward + argmax/采样。每步把生成的 token 写回 input_ids，
+        让下一步的 forward 看到新的 context。
+
+        Input data:
+            teacher_input_ids:      (B, P+T)  prompt + student response（已 padded）
+            teacher_attention_mask: (B, P+T)
+            teacher_position_ids:   (B, P+T)
+            t_star_abs:             (B,)      绝对位置（input_ids 坐标），teacher 从此开始
+            meta_info["k"]:         int       生成长度
+            meta_info["temperature"]: float   0.0=greedy, >0=multinomial
+            meta_info["pad_token_id"]: int
+
+        Returns:
+            intervention_tokens: (B, k) teacher 在 [t_star_abs, t_star_abs+k-1] 生成的 token
+        """
+        self.actor_module.eval()
+
+        k: int = int(data.meta_info["k"])
+        temperature: float = float(data.meta_info.get("temperature", 0.0))
+        pad_token_id: int = int(data.meta_info.get("pad_token_id", 0))
+
+        teacher_model = self.teacher_module or self.actor_module
+
+        input_ids = data.batch["teacher_input_ids"].clone().to(get_device_id())
+        attention_mask = data.batch["teacher_attention_mask"].to(get_device_id())
+        position_ids = data.batch["teacher_position_ids"].to(get_device_id())
+        t_star_abs = data.batch["t_star_abs"].to(get_device_id()).long()  # (B,)
+
+        B, L = input_ids.shape
+        device = input_ids.device
+
+        intervention_tokens = torch.full(
+            (B, k), pad_token_id, dtype=torch.long, device=device
+        )
+        batch_idx = torch.arange(B, device=device)
+
+        with torch.no_grad():
+            for step in range(k):
+                # 当前 step 要查询的 logit 位置：predicting token at (t_star_abs + step)
+                # autoregressive logits[:, p, :] 预测 token at p+1，所以查询位置是 (t_star_abs - 1 + step)
+                # clamp 到 [0, L-1] 防越界
+                positions_to_query = (t_star_abs + step - 1).clamp(min=0, max=L - 1)
+
+                outputs = teacher_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    use_cache=False,
+                )
+                logits = outputs.logits  # (B, L, V)
+                # gather logits at positions_to_query
+                next_token_logits = logits[batch_idx, positions_to_query]  # (B, V)
+                del outputs, logits  # free large tensor
+
+                if temperature <= 0.0:
+                    new_tokens = next_token_logits.argmax(dim=-1)  # (B,)
+                else:
+                    probs = (next_token_logits / temperature).softmax(dim=-1)
+                    new_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)  # (B,)
+
+                intervention_tokens[:, step] = new_tokens
+
+                # 把生成的 token 写回 input_ids 对应位置（供下一步 forward 使用）
+                # 写入位置：t_star_abs + step（即下一个待生成位置的前一格）
+                target_positions = (t_star_abs + step).clamp(min=0, max=L - 1)
+                # 仅在 target_positions < L 的情况下安全写入；clamp 保证不越界
+                input_ids[batch_idx, target_positions] = new_tokens
+
+        return {"intervention_tokens": intervention_tokens.cpu()}
+
+    @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
         self.actor_module.train()

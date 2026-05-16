@@ -239,28 +239,242 @@ def _do_real_intervention(
     tokenizer,
     ic_cfg: dict,
 ) -> InterventionResult:
-    """完整 v3-full 路径（Phase 2 实现）。
+    """Phase 2 V1: 真实 teacher 介入 + Mode B append.
 
-    需要的工程改动:
-      1. dp_actor 增加 `teacher_generate_at_positions(prefixes, k)` 接口
-         - 在 teacher_module 上做 k 步 forward + argmax/采样（k=2 串行可接受）
-         - prefixes 是 per-sample 的 prompt + y_<t* 拼接
-      2. 调用 async_rollout_manager.generate_sequences(prefix_batch) 续 tail
-         - prefix_batch 是 DataProto，input_ids = prompt + y_<t* + intervention
-      3. 拼接 composite responses，pad 到原 max_response_length
-      4. 构造与 batch 同 schema 的 augmented_batch (含 uid 复用，data_source/extra_info 等 copy)
-      5. self.reward_fn(augmented_batch) 得 R(y')
-      6. ΔR = R(y') - R(y_s)，写入 augmented_batch.batch["intervention_delta_reward"]
-      7. DataProto.concat([batch, augmented_batch])
-      8. 标记 intervention_used: 原样本=False，新样本=True
+    流程:
+      1. failed = R < threshold；t* = compute_divergence_position(batch)
+      2. 调用 actor_rollout_wg.teacher_generate_at_positions 在 [t*..t*+k-1] 生成 k 个 token
+      3. 构造 composite responses = y_<t* + intervention + y_{t*+k:T}（保留学生原 tail）
+      4. reward_fn(composite_batch) → R(y')；ΔR = R(y') - R(y_s)
+      5. composite 复制原样本的 old_log_probs / ref_log_prob / bc_teacher_*（V1 简化；
+         k 个 teacher 位置上 PPO ratio 略不准，但占比 k/T ≈ 0.5%，clip 兜底）
+      6. DataProto.concat([batch, composite_batch]) 同 uid 加权
+      7. 写入 intervention_delta_reward / intervention_used 到 augmented batch
 
-    工程量预估: 单文件 +250 行 + dp_actor +30 行 + worker dispatch +20 行
+    V1 限制 (留 Phase 2.1 follow-up):
+      - 不真做 student tail 续写（保留学生原 tail 接 teacher intervention）
+      - 不重算 old_log_prob 在 composite 上（复制原样本，仅 k 位置不准）
+      - 不重算 bc_teacher_fwd 在 composite 上（uniform_fallback 兜底）
     """
-    raise NotImplementedError(
-        "Real intervention rollout is not yet implemented (Phase 2 follow-up). "
-        "Set algorithm.intervention_credit.enable_intervention=False to run "
-        "in plumbing-validation mode (degenerates to prior_shift-equivalent)."
+    from verl.protocol import DataProto
+    import numpy as np
+    import torch
+
+    failed_threshold: float = float(ic_cfg.get("failed_threshold", 0.5))
+    k: int = int(ic_cfg.get("intervention_length_k", 2))
+    teacher_temp: float = float(ic_cfg.get("teacher_decode_temperature", 0.0))
+    max_per_group: int = int(ic_cfg.get("max_intervention_per_group", 7))
+
+    B = batch.batch.batch_size[0]
+    device = batch.batch["responses"].device
+
+    # ── Step 1: 失败样本检测 ──────────────────────────────────────────
+    seq_reward = batch.batch["token_level_rewards"].sum(dim=-1)  # (B,)
+    failed_mask = seq_reward < failed_threshold                  # (B,) bool
+    n_failed_total = int(failed_mask.sum().item())
+
+    metrics = {
+        "intervention/failed_sample_rate": failed_mask.float().mean().item(),
+        "intervention/seq_reward_mean": seq_reward.float().mean().item(),
+        "intervention/seq_reward_std": (
+            seq_reward.float().std().item() if seq_reward.numel() > 1 else 0.0
+        ),
+    }
+
+    if n_failed_total == 0:
+        # 没有失败样本 → 不 intervention，写零通道
+        batch.batch["intervention_delta_reward"] = torch.zeros(B, device=device, dtype=torch.float32)
+        batch.batch["intervention_used"] = torch.zeros(B, device=device, dtype=torch.float32)
+        metrics.update({
+            "intervention/applied_rate": 0.0,
+            "intervention/delta_reward_mean": 0.0,
+        })
+        return InterventionResult(batch=batch, metrics=metrics)
+
+    # 按 uid 限制每组最多 max_per_group 个 intervention（避免组膨胀）
+    uid = batch.non_tensor_batch["uid"]
+    failed_indices_all = failed_mask.nonzero(as_tuple=True)[0].cpu().numpy()
+    selected_indices = []
+    per_group_count: dict = {}
+    for idx in failed_indices_all:
+        u = uid[idx]
+        if per_group_count.get(u, 0) < max_per_group:
+            selected_indices.append(int(idx))
+            per_group_count[u] = per_group_count.get(u, 0) + 1
+    failed_idx = torch.tensor(selected_indices, device=device, dtype=torch.long)
+    n_failed = len(failed_idx)
+
+    if n_failed == 0:
+        batch.batch["intervention_delta_reward"] = torch.zeros(B, device=device, dtype=torch.float32)
+        batch.batch["intervention_used"] = torch.zeros(B, device=device, dtype=torch.float32)
+        return InterventionResult(batch=batch, metrics=metrics)
+
+    # ── Step 2: 计算 t_star (失败样本) ─────────────────────────────────
+    t_star_all = compute_divergence_position(batch, ic_cfg)  # (B,) long
+    if t_star_all is None:
+        # 没有 teacher logp / g_t 通道 → 退化
+        batch.batch["intervention_delta_reward"] = torch.zeros(B, device=device, dtype=torch.float32)
+        batch.batch["intervention_used"] = torch.zeros(B, device=device, dtype=torch.float32)
+        metrics["intervention/applied_rate"] = 0.0
+        return InterventionResult(batch=batch, metrics=metrics)
+
+    t_star_failed = t_star_all[failed_idx]  # (n_failed,) — relative to response
+
+    # 推导 prompt_length: input_ids = (B, P+T), responses = (B, T) → P = (P+T) - T
+    T = batch.batch["responses"].shape[1]
+    L = batch.batch["input_ids"].shape[1]
+    P = L - T  # 假定 batch 内固定 prompt_length（左 pad 到 max_prompt_len）
+
+    t_star_abs_failed = (P + t_star_failed).long()  # 在 input_ids / teacher_input_ids 坐标系
+
+    # ── Step 3: 调用 worker 让 teacher 生成 k 个 token ──────────────
+    # 仅传 failed 子集
+    teacher_input_ids_f = batch.batch["teacher_input_ids"][failed_idx]
+    teacher_attn_f = batch.batch["teacher_attention_mask"][failed_idx]
+    teacher_pos_f = batch.batch["teacher_position_ids"][failed_idx]
+
+    sub_proto = DataProto.from_dict(
+        tensors={
+            "teacher_input_ids": teacher_input_ids_f,
+            "teacher_attention_mask": teacher_attn_f,
+            "teacher_position_ids": teacher_pos_f,
+            "t_star_abs": t_star_abs_failed,
+        },
+        meta_info={
+            "k": k,
+            "temperature": teacher_temp,
+        },
     )
+    teacher_gen_out = actor_rollout_wg.teacher_generate_at_positions(sub_proto)
+    intervention_tokens = teacher_gen_out.batch["intervention_tokens"].to(device)  # (n_failed, k)
+
+    # ── Step 4: 构造 composite responses (替换 [t*, t*+k]) ─────────────
+    # 复制 failed 子集的 batch 字段，原地替换 token
+    composite_responses = batch.batch["responses"][failed_idx].clone()       # (n_failed, T)
+    composite_input_ids = batch.batch["input_ids"][failed_idx].clone()       # (n_failed, L)
+    composite_attention = batch.batch["attention_mask"][failed_idx].clone()  # (n_failed, L)
+    composite_position = batch.batch["position_ids"][failed_idx].clone()     # (n_failed, L)
+    composite_response_mask = batch.batch["response_mask"][failed_idx].clone()  # (n_failed, T)
+
+    bidx = torch.arange(n_failed, device=device)
+    for step in range(k):
+        pos_rel = (t_star_failed + step).long()  # (n_failed,)
+        pos_abs = (t_star_abs_failed + step).long()
+        valid_rel = (pos_rel < T)
+        valid_abs = (pos_abs < L)
+        if valid_rel.any():
+            v_idx = bidx[valid_rel]
+            composite_responses[v_idx, pos_rel[valid_rel]] = intervention_tokens[v_idx, step].long()
+            composite_response_mask[v_idx, pos_rel[valid_rel]] = 1
+        if valid_abs.any():
+            v_idx = bidx[valid_abs]
+            composite_input_ids[v_idx, pos_abs[valid_abs]] = intervention_tokens[v_idx, step].long()
+            composite_attention[v_idx, pos_abs[valid_abs]] = 1
+
+    # ── Step 5: 构造 composite DataProto，re-score reward ─────────────
+    # 复制全部 batch / non_tensor_batch / meta_info 字段，仅替换被改动的 tensor
+    composite_tensors = {}
+    for key, val in batch.batch.items():
+        if not torch.is_tensor(val):
+            continue
+        if val.shape[0] != B:
+            # 不是 batch 维度的 tensor，跳过（不应发生但保险）
+            continue
+        composite_tensors[key] = val[failed_idx].clone()
+    # 替换被改动的几项
+    composite_tensors["responses"] = composite_responses
+    composite_tensors["input_ids"] = composite_input_ids
+    composite_tensors["attention_mask"] = composite_attention
+    composite_tensors["position_ids"] = composite_position
+    composite_tensors["response_mask"] = composite_response_mask
+
+    # non_tensor: copy 所有 numpy array 字段对应的子集
+    composite_non_tensor = {}
+    for key, arr in batch.non_tensor_batch.items():
+        if isinstance(arr, np.ndarray) and len(arr) == B:
+            composite_non_tensor[key] = arr[failed_idx.cpu().numpy()].copy()
+
+    composite_batch = DataProto(
+        batch=DataProto.from_dict(tensors=composite_tensors).batch,
+        non_tensor_batch=composite_non_tensor,
+        meta_info=dict(batch.meta_info or {}),
+    )
+
+    # 删除会让 reward_fn 短路的字段（rm_scores 若存在会跳过重算）
+    if "rm_scores" in composite_batch.batch.keys():
+        composite_batch.batch.pop("rm_scores")
+    # 同样删除 token_level_scores / token_level_rewards 让 reward_fn 重新计算
+    for k_pop in ["token_level_scores", "token_level_rewards", "advantages", "returns"]:
+        if k_pop in composite_batch.batch.keys():
+            composite_batch.batch.pop(k_pop)
+
+    # 调用 reward_fn 重新打分
+    try:
+        rew_result = reward_fn(composite_batch, return_dict=True)
+        new_reward_tensor = rew_result["reward_tensor"].to(device)  # (n_failed, T)
+    except TypeError:
+        # 兼容只返回 tensor 的 manager
+        new_reward_tensor = reward_fn(composite_batch).to(device)
+
+    # ── Step 6: ΔR 计算 ──────────────────────────────────────────────
+    composite_seq_reward = new_reward_tensor.sum(dim=-1)             # (n_failed,)
+    original_seq_reward = seq_reward[failed_idx]                     # (n_failed,)
+    delta_r = composite_seq_reward - original_seq_reward             # (n_failed,)
+
+    # 在 composite_batch 上写入新 reward 字段（让后续 advantage 计算能用）
+    composite_batch.batch["token_level_scores"] = new_reward_tensor
+    composite_batch.batch["token_level_rewards"] = new_reward_tensor
+
+    # composite 上的 intervention_delta_reward / intervention_used
+    composite_batch.batch["intervention_delta_reward"] = delta_r.float()
+    composite_batch.batch["intervention_used"] = torch.ones(n_failed, device=device, dtype=torch.float32)
+
+    # ── Step 7: 原 batch 上写入零通道 ──────────────────────────────────
+    batch.batch["intervention_delta_reward"] = torch.zeros(B, device=device, dtype=torch.float32)
+    batch.batch["intervention_used"] = torch.zeros(B, device=device, dtype=torch.float32)
+
+    # ── Step 8: concat ────────────────────────────────────────────────
+    augmented_batch = DataProto.concat([batch, composite_batch])
+
+    # ── Phase 2 metrics（7 个新指标）─────────────────────────────────
+    composite_resp_mask_sum = composite_response_mask.float().sum(dim=-1)  # (n_failed,)
+    metrics.update({
+        "intervention/applied_rate": n_failed / max(B, 1),
+        "intervention/delta_reward_mean": float(delta_r.mean().item()),
+        "intervention/delta_reward_std": float(delta_r.std().item()) if delta_r.numel() > 1 else 0.0,
+        "intervention/delta_reward_min": float(delta_r.min().item()),
+        "intervention/delta_reward_max": float(delta_r.max().item()),
+        "intervention/delta_reward_pos_rate": float((delta_r > 0).float().mean().item()),
+        "intervention/composite_response_length_mean": float(composite_resp_mask_sum.mean().item()),
+        "intervention/n_appended_per_group_mean": (
+            float(np.mean(list(per_group_count.values()))) if per_group_count else 0.0
+        ),
+        "intervention/group_size_post_append_mean": float(B + n_failed) / float(len(set(uid))),
+        "intervention/group_size_post_append_max": (
+            float(max(per_group_count.values()) + max_per_group) if per_group_count else float(max_per_group)
+        ),
+        "intervention/n_failed_total": float(n_failed_total),
+        "intervention/n_intervention_applied": float(n_failed),
+    })
+
+    # 还要补上 divergence position 度量（与 _diagnose_only 同款，保证两条路径指标一致）
+    diag_metrics = _diagnose_only(batch, ic_cfg)
+    # diag_metrics 里有些已被覆盖，仅补 divergence_position_*
+    for key in [
+        "intervention/divergence_position_mean",
+        "intervention/divergence_position_std",
+        "intervention/divergence_position_p25",
+        "intervention/divergence_position_p50",
+        "intervention/divergence_position_p75",
+        "intervention/divergence_position_normalized_mean",
+        "intervention/divergence_in_first_quarter_rate",
+        "intervention/divergence_in_last_quarter_rate",
+        "intervention/seq_reward_failed_mean",
+    ]:
+        if key in diag_metrics:
+            metrics[key] = diag_metrics[key]
+
+    return InterventionResult(batch=augmented_batch, metrics=metrics)
 
 
 # ──────────────────────────────────────────────────────────────────────

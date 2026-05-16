@@ -51,8 +51,9 @@ algorithm:
   intervention_credit:
     # ── 工作模式 ─────────────────────────────────────────────────────
     # false: ΔR 通道留空 (=0), 估计器退化为 prior_shift（plumbing 验证 / 对照）
-    # true : 真实 intervention rollout, ΔR = R(y') - R(y_s)
-    enable_intervention: true
+    # true : 真实 intervention rollout, ΔR = R(y') - R(y_s) [Phase 2 已实现]
+    # 默认 false 是为了让用户显式 opt-in 真路径；smoke 通过后再开 true
+    enable_intervention: false
 
     # ── divergence 位置选择策略 (t* 消融维度) ──────────────────────────
     # argmax_excl_eos: argmax |logp_T - logp_S|，但排除尾部 N 个 token + punctuation token
