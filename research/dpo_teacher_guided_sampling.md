@@ -1,9 +1,12 @@
 # On-Policy DPO + Teacher-Guided Sampling (DPO-TGS)
 
-> **状态**：设计文档（待 user 审）
-> **日期**：2026-05-16 23:00
-> **作者**：与你对话整理
-> **动机**：TCCA-Lite 的 GRPO + ΔR modulation 需要 λ_div tuning，advantage 层面复杂。DPO-TGS 换一条路——同一条 rollout 链路，用 pairwise preference 直接训，不需要超参。
+> **状态**：v1 已实现 + V2.5 已实现 (见末尾"V2.5 Update")
+> **日期**：原稿 2026-05-16 23:00 / V2.5 update 2026-05-17 11:50
+> **代码位置**：`verl/trainer/ppo/dpo_tgs/`,`verl/trainer/config/dpo_tgs.yaml`,`nebula_scripts/dpo_tgs/`
+> **理论锚点**：5 篇论文 (OAIF + OFS-DPO + Samplers-in-DPO + RPO + Meta Bridging Offline-Online),详见 `papers/raw/opd_papers/OPD_Deep_Analysis.html` 的"Online DPO 理论锚点"章节
+> **动机**：TCCA-Lite 的 GRPO + ΔR modulation 需要 λ_div tuning,advantage 层面复杂。DPO-TGS 换一条路——同一条 rollout 链路,用 pairwise preference 直接训。
+
+> **下方 §1-§10 是原 v1 spec (作历史保留)。实际实施版本见末尾"V2.5 Update"。**
 
 ---
 
@@ -420,3 +423,151 @@ Online DPO 每步用当前 policy 生成 pair 然后更新。DPO-TGS 类似但 p
 - [ ] §5 ref model：初始 checkpoint (简单) vs EMA teacher (动态)？
 - [ ] §6 chain_length=4 默认 OK？还是先 2 smoke？
 - [ ] §7 实验设计优先级：先跟 GRPO baseline 对比，还是先跟 TCCA-Lite 对比？
+
+---
+
+# V2.5 Update — 实际实施记录 (2026-05-17)
+
+本节记录从原 v1 spec 到当前实现的所有偏离/扩展。**当前代码状态对应这一节,而非上面的 v1 spec**。
+
+## A. 5 篇论文支撑 (理论锚点)
+
+新增"Online DPO 理论锚点"章节于 `OPD_Deep_Analysis.html`,精读 5 篇论文并提炼为 7 条设计原则:
+
+| # | Paper | 核心 insight | 对 DPO-TGS 影响 |
+|---|---|---|---|
+| A | **OAIF** (Guo+ 2024) | offline DPO 有两层 distribution shift | 命脉级实证依据;chain rollout 全程 on-policy |
+| B | **OFS-DPO** (Qi+ 2024) | Prop 3.3.1: DPO 训练后期梯度消失 | v1: α-mix GRPO fallback;v2: EMA chase 预留 |
+| C | **Samplers-in-DPO** (Shi+ ICLR-25) | reward-aware sampler ⇒ quadratic 收敛 | OPSD teacher = privileged-info-aware sampler,接 ICLR-25 理论 |
+| D | **RPO** (Zhao+Li 2025) | self-evolution DPO E[Δℓ]→0 缺陷;hint-guided 解 | 最相近先前工作,差异化:token-level vs sequence-level |
+| E | **Meta Bridging** (Lanchantin+ 2025) | semi-online ≈ online ≈ GRPO,远 > offline | 论文 framing 调:核心卖点是 token intervention 而非"完全 on-policy" |
+
+详见 `papers/raw/opd_papers/OPD_Deep_Analysis.html` "Online DPO 理论锚点" 章节。
+
+## B. V2 Adaptive Rollout (实际实施)
+
+替换原 v1 spec §2 的"链式 chain_length 个 sample"。改为 **GRPO baseline + selective intervention**:
+
+```
+Phase 1: 标准 rollout n_init per prompt (默认 2,小批 baseline)
+         → y_init (B × n_init samples)
+
+Phase 2: per-prompt 构造 SDPO teacher ctx
+   - 同 prompt 中 R≥correct_threshold (默认 1.0) 的 sibling rollout 作 ref
+   - 若全 failed: 默认 skip (ablation 可 gt_fallback)
+   - SDPO ref template: "Refer to this correct answer: {r}\n"
+
+Phase 3: 对每个 failed sample (R < threshold) 迭代干预
+   For attempt 1..n_attempts (默认 2):
+     a. teacher fwd under SDPO ctx → divergence
+     b. argmax divergence,排尾 8 + 排 used_positions
+     c. teacher decode 1 token z_T at t*
+        ★ if z_T == y_S[t*]: reselect t* (max 3 次,然后跳过该样本)
+     d. student async continue
+     e. y_attempt = chain[i-1][:t*] + z_T + continuation
+     f. used_positions.add(t*)
+
+Phase 4: concat y_init + 所有 chain attempts
+         tag dpo_lineage_id (init 索引或 derive from) + dpo_attempt_idx (0/1/...)
+         + dpo_t_star (t_i for attempts, -1 for init)
+
+Phase 4b (optional, 当 use_teacher_anchored_ref=True):
+   1 次 post-hoc OPSD teacher fwd over augmented batch
+   → batch.batch['teacher_log_prob_opsd']
+```
+
+**关键改动 vs v1 spec**:
+1. **n_init 取代 chain_length**:不再硬性所有 prompt 都 chain 跑完
+2. **SDPO ctx 替代 GT ctx**:不依赖数据集 ground_truth,用 sibling correct rollout
+3. **Token mismatch reselect**:强制 z_T ≠ y_S[t*],避免 degenerate intervention
+4. **Lineage tagging**:支持 chain_consecutive 在 lineage 内分组,而非线性 uid order
+
+代码:`verl/trainer/ppo/dpo_tgs/adaptive_rollout.py`
+
+## C. V1 Loss: 线性化 DPO (已实施)
+
+为避免 actor surgery (proper DPO 需 pair-aware micro-batching),v1 把 DPO 梯度方向**编码为 per-token advantage**,复用 PPO clipped surrogate:
+
+```
+margin = β · Σ_t mask · (logπ_old − logπ_ref) for (chosen, rejected)
+g = β · σ(−margin)
+A_t[chosen]   = +g / L_chosen   * mask
+A_t[rejected] = −g / L_rejected * mask
+```
+
+Pair-free 样本 fallback 到 GRPO group-relative,α-mix 控制 DPO/GRPO 权重 (1.0=纯 DPO, 0.5=half mix)。
+
+代码:`verl/trainer/ppo/dpo_tgs/dpo_loss.py:compute_dpo_tgs_advantage`
+
+## D. V2.5 Loss Innovations (3 个独立 toggle,默认 OFF)
+
+针对 teacher-guided pair 的 4 个独特结构 (共享 prefix / 因果定位 / OPSD teacher 完整分布 / 连续 ΔR),vanilla DPO 没用上。我们设计 3 个 loss 创新:
+
+### ① Causal-Localized DPO (`causal_localize: true`)
+**Idea**: log-ratio 在共享 prefix 上严格 = 0,真正差异在 t* (1 token) + 之后的 continuation。把 margin 解耦:
+
+$$\text{margin} = \beta_{\text{tok}} \cdot \Delta\text{logp}_{t^*} + \beta_{\text{cont}} \cdot \Delta\text{logp}_{>t^*}$$
+
+**Plumbing**: `dpo_t_star` per sample (adaptive_rollout 写入) → `_build_token_localize_masks` 拆分 mask → 双路 β。
+**论文卖点**: 首次问"DPO 信号在 t* 还是 continuation 上"。
+**Config**: `beta_token` (默认 null = 用 beta), `beta_continuation` (默认 null = 用 beta * 0.5)
+
+### ② Teacher-Anchored DPO (`use_teacher_anchored_ref: true`)
+**Idea**: 用 OPSD teacher (含 ref answer 的 privileged-context teacher) 替换 π_ref:
+
+$$\mathcal{L} = -\log \sigma\left(\beta \log \frac{\pi_\theta(y^+) \cdot \pi_T^{\text{OPSD}}(y^-)}{\pi_\theta(y^-) \cdot \pi_T^{\text{OPSD}}(y^+)}\right)$$
+
+**Plumbing**: Phase 4b post-hoc OPSD teacher fwd → `teacher_log_prob_opsd` (NaN 时 fallback 到 π_ref)。
+**理论支撑**: Samplers-DPO ICLR-25 Theorem 4 — reward-aware ref ⇒ quadratic 收敛。
+**论文卖点**: 首次用 privileged-context teacher 作 DPO ref。
+**额外开销**: +1 teacher fwd per chain rollout (~5%)
+
+### ③ ΔR-Weighted DPO (`delta_r_weight_mode: linear|sqrt|squared|sigmoid`)
+**Idea**: 用 verifiable env reward 的真实差值 ΔR 给 pair 加权:
+
+$$\mathcal{L} = -W(\Delta R) \cdot \log \sigma(\beta \cdot \text{margin}),\ W \in \{|\Delta R|, \sqrt{|\Delta R|}, \Delta R^2, \sigma(\Delta R/\tau)\}$$
+
+**Plumbing**: scatter_add R(chosen)/R(rejected) per pair → `_delta_r_weight()` → 乘到 g。
+**论文卖点**: RPO 用 W_hal 启发式权重;我们用 verifiable env reward 严格化。
+
+代码:`verl/trainer/ppo/dpo_tgs/dpo_loss.py:_delta_r_weight, _build_token_localize_masks`
+
+## E. 实施完成度 (2026-05-17)
+
+| 组件 | 状态 | 文件 |
+|---|---|---|
+| V2 adaptive rollout | ✅ | `dpo_tgs/adaptive_rollout.py` |
+| V1 线性化 DPO loss | ✅ | `dpo_tgs/dpo_loss.py` |
+| 3 loss innovations | ✅ | `dpo_tgs/dpo_loss.py` (default OFF) |
+| Pair collector (chain_consecutive + hybrid_init_chain) | ✅ | `dpo_tgs/pair_collector.py` |
+| 16 SwanLab metric (10 P0+P1 base + 6 innovation diagnostic) | ✅ | `dpo_tgs/pair_collector.py:compute_dpo_metrics` |
+| DPO val mode (val-core/dpo_implicit_reward_accuracy) | ✅ | `ray_trainer.py:_compute_dpo_val_implicit_accuracy` |
+| ray_trainer dispatch | ✅ | `ray_trainer.py` |
+| Hydra config (`dpo_tgs.yaml`) | ✅ | 全部 knob 默认 OFF |
+| Nebula 提交脚本 | ✅ | `nebula_scripts/dpo_tgs/`, `submit_dpo_tgs_sweep.sh` |
+| Notebook local 测试 | ✅ | `run_notebook_dpo_tgs.sh` (smoke/pair/full) |
+
+## F. 已知 Bugs & Fix
+
+| 时间 | Bug | Fix commit |
+|---|---|---|
+| 2026-05-17 | Hydra grammar `{r}` 解析失败 (parametric.sh 把 sdpo_ref_template 传 cli) | `5d5bfdf` 移除 cli 传值,默认 yaml |
+
+## G. Submitted Nebula Tasks (2026-05-17)
+
+第一批 4 task (commit `5d5bfdf`,纯 v1 baseline,无 innovations):
+
+| Task | Config | task_id |
+|---|---|---|
+| Baseline V2 | cc, α=1.0, na=2 | a28b1ae2c6dd4c9c98fbcc36478a1019 |
+| hybrid_init_chain | hybrid, α=1.0, na=2 | e8d779d4b6154337bce9c89cc56484c3 |
+| n_attempts=4 | cc, α=1.0, na=4 | 841acda959cf4810b5535829383185b2 |
+| α=0.5 mix | cc, α=0.5, na=2 | 5f8b3915c62846b0a50adea2d4a557f6 |
+
+V2.5 ablations (commit `7afa10f`,3 innovations 可 toggle) 待用户决定何时启动。
+
+## H. 下一步
+
+- [ ] 等第一批 4 task 出初步 trajectory (1-2h),验证 plumbing 通畅
+- [ ] 启动 V2.5 innovation ablation (建议 4 jobs: 仅 ①, 仅 ②, 仅 ③, 全开)
+- [ ] 跑完 main result 后,补 paper draft section
