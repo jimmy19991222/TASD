@@ -2174,8 +2174,13 @@ class RayPPOTrainer:
                     with marked_timer("gen", timing_raw, color="red"):
                         if _dpo_tgs_chain_rollout:
                             from verl.trainer.ppo.dpo_tgs import dpo_tgs_adaptive_rollout
+                            # adaptive_rollout needs full batch (reward_model + raw_prompt + uid for OPSD ctx + reward_fn).
+                            # _get_gen_batch had popped reward keys into `batch` away from `gen_batch`;
+                            # restore by merging here for self-contained rollout + reward scoring.
+                            full_prompt_batch = batch.union(gen_batch)
+                            full_prompt_batch.meta_info["global_steps"] = self.global_steps
                             gen_batch_output = dpo_tgs_adaptive_rollout(
-                                prompt_batch=gen_batch,
+                                prompt_batch=full_prompt_batch,
                                 actor_rollout_wg=self.actor_rollout_wg,
                                 async_rollout_manager=getattr(self, "async_rollout_manager", None),
                                 reward_fn=self.reward_fn,
@@ -2226,8 +2231,16 @@ class RayPPOTrainer:
 
                             del rm_scores, gen_baseline_batch, gen_baseline_output
                     # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    batch = batch.union(gen_batch_output)
+                    if _dpo_tgs_chain_rollout:
+                        # DPO-TGS adaptive_rollout already produced a self-contained augmented
+                        # batch (variable-size: B*n_init + chain_attempts samples, each carrying
+                        # reward_model/raw_prompt/uid/dpo_lineage_id/...). Use it directly; the
+                        # standard `batch.repeat + union` would conflict on already-present keys
+                        # AND fail on size mismatch (batch=B vs augmented=variable).
+                        batch = gen_batch_output
+                    else:
+                        batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                        batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)

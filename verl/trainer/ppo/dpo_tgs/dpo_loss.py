@@ -112,7 +112,10 @@ def _vectorized_pair_advantage(
     """
     B, T = mask.shape
     device = seq_logp_diff.device
-    dtype = mask.dtype
+    # Force float32 for the advantage tensor regardless of mask dtype: response_mask is
+    # often torch.long (set in tcca_chain._build_y_i_batch) and integer division would
+    # silently truncate the per-token advantage to 0.
+    dtype = torch.float32
     A_dpo = torch.zeros(B, T, device=device, dtype=dtype)
 
     pair_mask_present = pair_id >= 0

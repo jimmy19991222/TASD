@@ -13,21 +13,28 @@
 #   Phase 3: failed sample 上 n_attempts 次干预 (z_T != y_S[t*] reselect_t)
 #   Phase 4: concat + lineage tag → DPO pair → linearized DPO advantage
 #
-# 三种模式:
-#   smoke   (默认): 10 step bs=4 n_init=2 n_attempts=2 ~15 min → plumbing 验证
-#   pair    :       30 step bs=8 chain_consecutive vs hybrid_init_chain 串行   ~45 min
-#   full    :       100 step bs=32 n_init=2 n_attempts=2 ~4h → 与 Nebula 一致
+# 4 种模式:
+#   smoke         (默认): 10 step bs=4 n_init=2 n_attempts=2 ~15 min → plumbing 验证
+#   innov         :        10 step + 全 3 innovations 开 (①+②+③) → 验证新代码 plumbing
+#   pair          :        30 step chain_consecutive vs hybrid_init_chain 串行 ~45 min
+#   full          :        100 step bs=32 n_init=2 n_attempts=2 ~4h → 与 Nebula 一致
 #
 # 用法:
-#   ./run_notebook_dpo_tgs.sh                    # smoke (默认)
-#   ./run_notebook_dpo_tgs.sh smoke
-#   ./run_notebook_dpo_tgs.sh pair               # 2 策略 ablation
+#   ./run_notebook_dpo_tgs.sh                    # smoke (默认 v1 baseline)
+#   ./run_notebook_dpo_tgs.sh smoke              # 同上
+#   ./run_notebook_dpo_tgs.sh innov              # 全 3 innovations 开,验证 V2.5 plumbing
+#   ./run_notebook_dpo_tgs.sh pair               # pair_strategy 2 路 ablation
 #   ./run_notebook_dpo_tgs.sh full               # 完整 100 step
 #
-#   # 自定义:
+#   # 单独 toggle innovations:
+#   DPO_USE_TEACHER_ANCHORED_REF=True ./run_notebook_dpo_tgs.sh smoke   # 仅 ②
+#   DPO_DELTA_R_WEIGHT_MODE=linear ./run_notebook_dpo_tgs.sh smoke      # 仅 ③
+#   DPO_CAUSAL_LOCALIZE=True DPO_BETA_TOKEN=0.2 DPO_BETA_CONTINUATION=0.05 \
+#     ./run_notebook_dpo_tgs.sh smoke                                    # 仅 ①
+#
+#   # 自定义其他超参:
 #   DPO_BETA=0.5 ./run_notebook_dpo_tgs.sh smoke
 #   DPO_N_INIT=4 DPO_N_ATTEMPTS=4 ./run_notebook_dpo_tgs.sh smoke
-#   DPO_PAIR_STRATEGY=hybrid_init_chain ./run_notebook_dpo_tgs.sh smoke
 #   TOTAL_STEPS=20 TRAIN_BATCH_SIZE=8 ./run_notebook_dpo_tgs.sh smoke
 #
 # 后端调用 nebula_scripts/dpo_tgs/dpo_tgs_sciknoweval_parametric.sh
@@ -42,7 +49,7 @@ MODE="${1:-smoke}"
 
 case "${MODE}" in
     smoke)
-        # Plumbing 验证: ~15 min, 只验证 plumbing + 关注 dpo/* 指标出现
+        # Plumbing 验证: ~15 min, 只验证 plumbing + 关注 dpo/* 指标出现 (v1 baseline)
         DEFAULT_TOTAL_STEPS=10
         DEFAULT_TRAIN_BATCH_SIZE=4
         DEFAULT_MINI_BATCH_SIZE=4
@@ -51,6 +58,26 @@ case "${MODE}" in
         DEFAULT_VAL_N=4
         DEFAULT_VAL_BEFORE_TRAIN=False
         DEFAULT_PAIR_STRATEGY="chain_consecutive"
+        DEFAULT_CAUSAL_LOCALIZE=False
+        DEFAULT_USE_TEACHER_ANCHORED_REF=False
+        DEFAULT_DELTA_R_WEIGHT_MODE=none
+        ;;
+    innov)
+        # V2.5 plumbing 验证: ~15 min, 全 3 innovations 一起开
+        DEFAULT_TOTAL_STEPS=10
+        DEFAULT_TRAIN_BATCH_SIZE=4
+        DEFAULT_MINI_BATCH_SIZE=4
+        DEFAULT_N_INIT=2
+        DEFAULT_N_ATTEMPTS=2
+        DEFAULT_VAL_N=4
+        DEFAULT_VAL_BEFORE_TRAIN=False
+        DEFAULT_PAIR_STRATEGY="chain_consecutive"
+        DEFAULT_CAUSAL_LOCALIZE=True
+        DEFAULT_USE_TEACHER_ANCHORED_REF=True
+        DEFAULT_DELTA_R_WEIGHT_MODE=linear
+        # 推荐 default β_token = 2β, β_continuation = 0.5β (decisive token weighted higher)
+        export DPO_BETA_TOKEN="${DPO_BETA_TOKEN:-0.2}"
+        export DPO_BETA_CONTINUATION="${DPO_BETA_CONTINUATION:-0.05}"
         ;;
     pair)
         # pair_strategy ablation: chain_consecutive vs hybrid_init_chain, 各 30 step
@@ -62,6 +89,9 @@ case "${MODE}" in
         DEFAULT_VAL_N=8
         DEFAULT_VAL_BEFORE_TRAIN=False
         DEFAULT_PAIR_STRATEGY="chain_consecutive"   # overridden in loop
+        DEFAULT_CAUSAL_LOCALIZE=False
+        DEFAULT_USE_TEACHER_ANCHORED_REF=False
+        DEFAULT_DELTA_R_WEIGHT_MODE=none
         ;;
     full)
         # 与 Nebula 等价配置
@@ -73,9 +103,12 @@ case "${MODE}" in
         DEFAULT_VAL_N=16
         DEFAULT_VAL_BEFORE_TRAIN=False
         DEFAULT_PAIR_STRATEGY="chain_consecutive"
+        DEFAULT_CAUSAL_LOCALIZE=False
+        DEFAULT_USE_TEACHER_ANCHORED_REF=False
+        DEFAULT_DELTA_R_WEIGHT_MODE=none
         ;;
     *)
-        echo "ERROR: unknown mode '${MODE}'. Use: smoke | pair | full"
+        echo "ERROR: unknown mode '${MODE}'. Use: smoke | innov | pair | full"
         exit 1
         ;;
 esac
@@ -116,6 +149,15 @@ export DPO_PAIR_STRATEGY="${DPO_PAIR_STRATEGY:-${DEFAULT_PAIR_STRATEGY}}"  # cha
 export DPO_PAIR_MARGIN="${DPO_PAIR_MARGIN:-0.0}"
 export DPO_MIN_RESP_LEN="${DPO_MIN_RESP_LEN:-50}"
 export DPO_LEN_PENALTY="${DPO_LEN_PENALTY:-linear}"
+
+# ── 3 V2.5 innovations (mode 默认值在 case 块,这里 env 覆盖优先) ────────
+export DPO_CAUSAL_LOCALIZE="${DPO_CAUSAL_LOCALIZE:-${DEFAULT_CAUSAL_LOCALIZE}}"
+export DPO_USE_TEACHER_ANCHORED_REF="${DPO_USE_TEACHER_ANCHORED_REF:-${DEFAULT_USE_TEACHER_ANCHORED_REF}}"
+export DPO_DELTA_R_WEIGHT_MODE="${DPO_DELTA_R_WEIGHT_MODE:-${DEFAULT_DELTA_R_WEIGHT_MODE}}"
+export DPO_DELTA_R_WEIGHT_TAU="${DPO_DELTA_R_WEIGHT_TAU:-1.0}"
+# beta_token / beta_continuation: empty = use beta default (yaml null)
+export DPO_BETA_TOKEN="${DPO_BETA_TOKEN:-}"
+export DPO_BETA_CONTINUATION="${DPO_BETA_CONTINUATION:-}"
 
 # rollout.n MUST equal n_init (Phase 1 baseline count). parametric.sh handles default.
 export ROLLOUT_N="${ROLLOUT_N:-${DPO_N_INIT}}"
@@ -195,6 +237,10 @@ run_single_strategy() {
     echo "  BETA              : ${DPO_BETA}    ALPHA=${DPO_ALPHA} (1.0=pure DPO, 0.0=pure GRPO)"
     echo "  PAIR_STRATEGY     : ${DPO_PAIR_STRATEGY}    margin=${DPO_PAIR_MARGIN}"
     echo "  LENGTH FLOOR      : min=${DPO_MIN_RESP_LEN} penalty=${DPO_LEN_PENALTY}"
+    echo "  ── INNOVATIONS (V2.5) ────────────────────────────"
+    echo "  ① CAUSAL_LOCALIZE : ${DPO_CAUSAL_LOCALIZE}  beta_token=${DPO_BETA_TOKEN:-(beta)} beta_cont=${DPO_BETA_CONTINUATION:-(0.5*beta)}"
+    echo "  ② TEACHER_ANCHORED: ${DPO_USE_TEACHER_ANCHORED_REF}"
+    echo "  ③ DELTA_R_WEIGHT  : ${DPO_DELTA_R_WEIGHT_MODE}  tau=${DPO_DELTA_R_WEIGHT_TAU}"
     echo "  ──────────────────────────────────────────────────"
     echo "  GIT               : ${GIT_BRANCH} @ ${GIT_COMMIT}"
     echo "  JOB_NAME          : ${JOB_NAME}"
@@ -208,7 +254,7 @@ run_single_strategy() {
 # 调度
 # ─────────────────────────────────────────────────────────────────────
 case "${MODE}" in
-    smoke|full)
+    smoke|innov|full)
         run_single_strategy "${DPO_PAIR_STRATEGY}"
         ;;
     pair)

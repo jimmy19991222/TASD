@@ -367,7 +367,7 @@ def compute_dpo_metrics(
         # Mean of (logπ_old - logπ_T_opsd) on chosen samples = "how much further teacher
         # would push than ref" (informally: the divergence the teacher-anchored loss closes)
         if has_logp and chosen_mask.any() and valid.any():
-            teacher_diff = (logp_actor.float() - tlp.float()) * mask
+            teacher_diff = (logp_old.float() - tlp.float()) * mask
             row_diff = teacher_diff.sum(dim=-1)
             ch_valid = chosen_mask & valid
             if ch_valid.any():

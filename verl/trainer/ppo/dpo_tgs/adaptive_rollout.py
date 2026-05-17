@@ -175,7 +175,10 @@ def dpo_tgs_adaptive_rollout(
             len(failed_indices_arr), attempt_k, dtype=np.int64
         )
         # ① Causal-Localized: persist the divergence position used to produce this attempt
-        y_attempt.non_tensor_batch["dpo_t_star"] = t_i.detach().cpu().numpy().astype(np.int64)
+        # atleast_1d guards the B=1 edge case where _select_t_i could return a 0-d tensor.
+        y_attempt.non_tensor_batch["dpo_t_star"] = np.atleast_1d(
+            t_i.detach().cpu().numpy().astype(np.int64)
+        )
 
         chain_batches.append(y_attempt)
 
