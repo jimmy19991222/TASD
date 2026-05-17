@@ -95,6 +95,8 @@ def dpo_tgs_adaptive_rollout(
     attempt_idx_init = np.zeros(B_init, dtype=np.int64)
     y_init.non_tensor_batch["dpo_lineage_id"] = lineage_id_init
     y_init.non_tensor_batch["dpo_attempt_idx"] = attempt_idx_init
+    # ① Causal-Localized: t_star tag (-1 = init sample, no intervention point)
+    y_init.non_tensor_batch["dpo_t_star"] = np.full(B_init, -1, dtype=np.int64)
 
     # ── Phase 2: per-prompt SDPO contexts ─────────────────────────────────
     R_init = y_init.batch["token_level_rewards"].sum(dim=-1).cpu().numpy()
@@ -172,6 +174,8 @@ def dpo_tgs_adaptive_rollout(
         y_attempt.non_tensor_batch["dpo_attempt_idx"] = np.full(
             len(failed_indices_arr), attempt_k, dtype=np.int64
         )
+        # ① Causal-Localized: persist the divergence position used to produce this attempt
+        y_attempt.non_tensor_batch["dpo_t_star"] = t_i.detach().cpu().numpy().astype(np.int64)
 
         chain_batches.append(y_attempt)
 
@@ -184,7 +188,83 @@ def dpo_tgs_adaptive_rollout(
 
     # ── Phase 4: concat y_init + chain attempts ──────────────────────────
     augmented = DataProto.concat([y_init] + chain_batches)
+
+    # ── Phase 4b (optional): post-hoc OPSD teacher fwd for Teacher-Anchored DPO ──
+    # ② Teacher-Anchored: compute logp under OPSD ctx for every sample in augmented batch.
+    # Adds 1 teacher fwd per chain rollout; only runs when use_teacher_anchored_ref=True.
+    if bool(dpo_cfg.get("use_teacher_anchored_ref", False)):
+        try:
+            tlp = _post_hoc_opsd_teacher_logp(
+                augmented=augmented,
+                sdpo_ctx_by_uid=sdpo_ctx_by_uid,
+                actor_rollout_wg=actor_rollout_wg,
+                config=config,
+                tokenizer=tokenizer,
+            )
+            # tlp: (B_aug, T) float, NaN where no SDPO ctx (uid not in sdpo_ctx_by_uid).
+            augmented.batch["teacher_log_prob_opsd"] = tlp
+        except Exception as e:
+            print(f"[DPO-TGS] post-hoc OPSD teacher fwd failed: {e}; "
+                  "Teacher-Anchored DPO will gracefully fall back to π_ref.")
+
     return augmented
+
+
+def _post_hoc_opsd_teacher_logp(
+    *,
+    augmented: DataProto,
+    sdpo_ctx_by_uid: dict,
+    actor_rollout_wg,
+    config,
+    tokenizer,
+) -> torch.Tensor:
+    """Compute logp_T under OPSD ctx for every sample in `augmented`.
+
+    Samples whose uid is not in sdpo_ctx_by_uid (e.g. all-failed prompts where SDPO
+    ctx couldn't be built) get NaN — the dpo_loss layer will treat NaN as missing
+    and fall back to π_ref for those rows.
+    """
+    B = augmented.batch.batch_size[0]
+    T = augmented.batch["responses"].shape[1]
+    device = augmented.batch["responses"].device
+    out = torch.full((B, T), float("nan"), dtype=torch.float32, device=device)
+
+    # Filter to rows that have a valid SDPO ctx
+    uids = augmented.non_tensor_batch["uid"]
+    valid_idx = [j for j in range(B) if uids[j] in sdpo_ctx_by_uid]
+    if not valid_idx:
+        return out
+
+    valid_arr = np.array(valid_idx, dtype=np.int64)
+    sub = augmented[valid_arr]
+    # Gather per-row OPSD ctx
+    sub_ctx = _gather_sdpo_ctx_for_sub_batch(sub, sdpo_ctx_by_uid)
+
+    # One teacher fwd over the whole sub (re-uses same machinery as divergence step)
+    teacher_input_ids = torch.cat([sub_ctx["input_ids"], sub.batch["responses"]], dim=1)
+    teacher_attn = torch.cat([sub_ctx["attention_mask"], sub.batch["response_mask"]], dim=1)
+    teacher_pos = compute_position_id_with_mask(teacher_attn)
+    teacher_fwd_batch = DataProto.from_dict(tensors={
+        "teacher_input_ids": teacher_input_ids,
+        "teacher_attention_mask": teacher_attn,
+        "teacher_position_ids": teacher_pos,
+        "responses": sub.batch["responses"],
+        "input_ids": sub.batch["input_ids"],
+        "attention_mask": sub.batch["attention_mask"],
+        "position_ids": sub.batch["position_ids"],
+    })
+    teacher_fwd_batch.meta_info = {
+        "temperature": float(config.actor_rollout_ref.rollout.temperature),
+        "micro_batch_size": int(config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu),
+        "pad_token_id": tokenizer.pad_token_id,
+        "distill_topk": None,
+        "compute_prior_shift_surprise": False,
+    }
+    teacher_result = actor_rollout_wg.compute_teacher_log_probs(teacher_fwd_batch)
+    sub_logp_T = teacher_result.batch["teacher_log_probs_on_response"].float()  # (n_valid, T)
+
+    out[valid_arr] = sub_logp_T.to(device)
+    return out
 
 
 # ──────────────────────────────────────────────────────────────────────

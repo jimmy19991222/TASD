@@ -434,6 +434,12 @@ def compute_advantage(
         #   g = β · σ(−margin), A_t[chosen]=+g/L, A_t[rejected]=−g/L
         #   Non-pair samples fall back to GRPO group-relative (mixed via α).
         adv_estimator_fn = core_algos.get_adv_estimator_fn("dpo_teacher_guided")
+        # ① Causal-Localized: dpo_t_star comes from non_tensor_batch (np.int64), convert to tensor
+        _t_star_np = data.non_tensor_batch.get("dpo_t_star")
+        _t_star_tensor = None
+        if _t_star_np is not None:
+            _t_star_tensor = torch.as_tensor(np.array(_t_star_np, dtype=np.int64),
+                                             device=data.batch["response_mask"].device)
         advantages, returns = adv_estimator_fn(
             token_level_rewards=data.batch["token_level_rewards"],
             response_mask=data.batch["response_mask"],
@@ -442,6 +448,8 @@ def compute_advantage(
             ref_log_prob=data.batch.get("ref_log_prob"),
             dpo_pair_id=data.batch.get("dpo_pair_id"),
             dpo_pair_role=data.batch.get("dpo_pair_role"),
+            teacher_log_prob_opsd=data.batch.get("teacher_log_prob_opsd"),  # ② Teacher-Anchored
+            dpo_t_star=_t_star_tensor,                                      # ① Causal-Localized
             config=config,
         )
         data.batch["advantages"] = advantages

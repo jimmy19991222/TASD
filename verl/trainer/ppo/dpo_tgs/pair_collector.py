@@ -358,6 +358,61 @@ def compute_dpo_metrics(
 
     out["dpo/grpo_fallback_rate"] = float((pair_id < 0).float().mean().item())
 
+    # ── Innovation diagnostic metrics ────────────────────────────────────
+    # ② Teacher-Anchored: how many samples got valid OPSD teacher logp
+    if "teacher_log_prob_opsd" in batch.batch:
+        tlp = batch.batch["teacher_log_prob_opsd"]
+        valid = (~torch.isnan(tlp)).any(dim=-1)
+        out["dpo/teacher_anchored_coverage"] = float(valid.float().mean().item())
+        # Mean of (logπ_old - logπ_T_opsd) on chosen samples = "how much further teacher
+        # would push than ref" (informally: the divergence the teacher-anchored loss closes)
+        if has_logp and chosen_mask.any() and valid.any():
+            teacher_diff = (logp_actor.float() - tlp.float()) * mask
+            row_diff = teacher_diff.sum(dim=-1)
+            ch_valid = chosen_mask & valid
+            if ch_valid.any():
+                out["dpo/teacher_anchored_kl_chosen_mean"] = float(row_diff[ch_valid].mean().item())
+
+    # ③ ΔR-Weighted: per-pair ΔR distribution (independent of weight mode being on)
+    if "dpo_pair_id" in batch.batch and chosen_mask.any() and rejected_mask.any():
+        # Already exposed as reward_gap_mean above; expose also the std + max for shape
+        # of the gap distribution (relevant when picking weight mode).
+        rew_chosen_mean = rewards[chosen_mask]
+        rew_rejected_mean = rewards[rejected_mask]
+        if rew_chosen_mean.numel() > 0 and rew_rejected_mean.numel() > 0:
+            # Pair-level ΔR using pair_id matching
+            import numpy as _np
+            pair_id_np = pair_id.detach().cpu().numpy()
+            rewards_np = rewards.detach().cpu().numpy()
+            role_np = pair_role.detach().cpu().numpy()
+            dr_list = []
+            seen_pids = set()
+            for j in range(len(pair_id_np)):
+                pid = int(pair_id_np[j])
+                if pid < 0 or pid in seen_pids:
+                    continue
+                ch_idx = [i for i in range(len(pair_id_np))
+                          if pair_id_np[i] == pid and role_np[i] == +1]
+                rj_idx = [i for i in range(len(pair_id_np))
+                          if pair_id_np[i] == pid and role_np[i] == -1]
+                if ch_idx and rj_idx:
+                    dr_list.append(float(rewards_np[ch_idx[0]] - rewards_np[rj_idx[0]]))
+                seen_pids.add(pid)
+            if dr_list:
+                arr = _np.array(dr_list, dtype=_np.float64)
+                out["dpo/delta_r_max"] = float(arr.max())
+                out["dpo/delta_r_std"] = float(arr.std())
+
+    # ① Causal-Localized: t* coverage + position distribution
+    t_star_arr = batch.non_tensor_batch.get("dpo_t_star")
+    if t_star_arr is not None:
+        if not isinstance(t_star_arr, np.ndarray):
+            t_star_arr = np.array(t_star_arr, dtype=np.int64)
+        valid_ts = t_star_arr[t_star_arr >= 0]
+        if valid_ts.size > 0:
+            out["dpo/t_star_mean_position"] = float(valid_ts.mean())
+            out["dpo/t_star_std_position"] = float(valid_ts.std())
+
     # ── P1: chain rollout health (DPO-TGS V2 only) ────────────────────────
     lineage = batch.non_tensor_batch.get("dpo_lineage_id")
     attempt = batch.non_tensor_batch.get("dpo_attempt_idx")

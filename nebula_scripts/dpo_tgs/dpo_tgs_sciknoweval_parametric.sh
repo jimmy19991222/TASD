@@ -49,6 +49,18 @@ ROLLOUT_N="${ROLLOUT_N:-${DPO_N_INIT}}"
 
 DPO_BETA="${DPO_BETA:-0.1}"
 DPO_ALPHA="${DPO_ALPHA:-1.0}"
+
+# ── 3 teacher-guided DPO innovations (default OFF for v1 backwards compat) ──
+# ① Causal-Localized DPO
+DPO_CAUSAL_LOCALIZE="${DPO_CAUSAL_LOCALIZE:-False}"
+DPO_BETA_TOKEN="${DPO_BETA_TOKEN:-}"           # empty = use beta (yaml default null)
+DPO_BETA_CONTINUATION="${DPO_BETA_CONTINUATION:-}"
+# ② Teacher-Anchored ref (replace π_ref with π_T^OPSD)
+DPO_USE_TEACHER_ANCHORED_REF="${DPO_USE_TEACHER_ANCHORED_REF:-False}"
+# ③ ΔR-Weighted (none | linear | sqrt | squared | sigmoid)
+DPO_DELTA_R_WEIGHT_MODE="${DPO_DELTA_R_WEIGHT_MODE:-none}"
+DPO_DELTA_R_WEIGHT_TAU="${DPO_DELTA_R_WEIGHT_TAU:-1.0}"
+
 DPO_PAIR_STRATEGY="${DPO_PAIR_STRATEGY:-chain_consecutive}"   # chain_consecutive | hybrid_init_chain
 DPO_PAIR_MARGIN="${DPO_PAIR_MARGIN:-0.0}"
 DPO_MIN_RESP_LEN="${DPO_MIN_RESP_LEN:-50}"
@@ -136,6 +148,12 @@ python -m verl.trainer.main_ppo \
     algorithm.dpo.exclude_tail_tokens=${DPO_EXCLUDE_TAIL} \
     algorithm.dpo.beta=${DPO_BETA} \
     algorithm.dpo.alpha=${DPO_ALPHA} \
+    algorithm.dpo.causal_localize=${DPO_CAUSAL_LOCALIZE} \
+    ${DPO_BETA_TOKEN:+algorithm.dpo.beta_token=${DPO_BETA_TOKEN}} \
+    ${DPO_BETA_CONTINUATION:+algorithm.dpo.beta_continuation=${DPO_BETA_CONTINUATION}} \
+    algorithm.dpo.use_teacher_anchored_ref=${DPO_USE_TEACHER_ANCHORED_REF} \
+    algorithm.dpo.delta_r_weight_mode=${DPO_DELTA_R_WEIGHT_MODE} \
+    algorithm.dpo.delta_r_weight_tau=${DPO_DELTA_R_WEIGHT_TAU} \
     algorithm.dpo.pair_strategy=${DPO_PAIR_STRATEGY} \
     algorithm.dpo.pair_margin=${DPO_PAIR_MARGIN} \
     algorithm.dpo.min_response_length=${DPO_MIN_RESP_LEN} \

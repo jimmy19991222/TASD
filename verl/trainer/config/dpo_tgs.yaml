@@ -79,6 +79,29 @@ algorithm:
     beta: 0.1                        # DPO temperature
     alpha: 1.0                       # mix weight: 1.0 = pure DPO, 0.0 = pure GRPO
 
+    # ── ① Causal-Localized DPO (split β by token vs continuation) ──
+    # When True, splits the DPO margin into a token-level component (only at t*)
+    # and a continuation-level component (t*+1..end), each with its own β.
+    # Studies "where does the DPO signal actually live in teacher-guided pairs?"
+    causal_localize: false
+    beta_token: null                 # null = use beta; recommended: beta * 2 (decisive)
+    beta_continuation: null          # null = use beta * 0.5
+
+    # ── ② Teacher-Anchored ref (replace π_ref with π_T^OPSD in margin) ──
+    # When True, post-hoc OPSD teacher fwd over augmented batch produces
+    # teacher_log_prob_opsd; margin uses (logπ_old − logπ_T^OPSD) instead of (− logπ_ref).
+    # Per Samplers-DPO ICLR-25 Theorem 4: reward-aware ref ⇒ quadratic convergence.
+    use_teacher_anchored_ref: false
+
+    # ── ③ ΔR-Weighted DPO (per-pair weight from R-gap magnitude) ──
+    # 'none': all pairs equal weight (vanilla)
+    # 'linear': W = ΔR
+    # 'sqrt':   W = sqrt(ΔR)
+    # 'squared':W = ΔR^2
+    # 'sigmoid':W = sigmoid(ΔR / tau)
+    delta_r_weight_mode: none
+    delta_r_weight_tau: 1.0          # only used when mode='sigmoid'
+
     # ── Pair collection ────────────────────────────────────────────
     # 'chain_consecutive': lineage-aware (chain[i] vs chain[i-1])
     # 'hybrid_init_chain': chain pairs + (best_correct, worst_failed) from init pool
