@@ -1,8 +1,9 @@
 # Research Documentation — DPO-TGS
 
 > **当前主推方法**: **DPO-TGS V2.5** (On-Policy DPO + Teacher-Guided Sampling)
-> **最新代码**: [`teacher-guided-intervention`](https://github.com/jimmy19991222/TASD/tree/teacher-guided-intervention) @ `299eec7`
-> **最近 commit**: `feat(dpo_tgs): 3 teacher-guided DPO loss innovations`
+> **V2.5 spec freeze**: `299eec7` (2026-05-17) — 3 loss innovations + 16 metrics 完工
+> **最新代码**: [`teacher-guided-intervention`](https://github.com/jimmy19991222/TASD/tree/teacher-guided-intervention) @ `560c761` (2026-05-18) — 含 FSDP chunk padding + ray/NCCL 鲁棒化 8 个 fix
+> **最近 commit**: `fix(dpo_tgs): notebook NCCL bootstrap loopback + ray IP detection fallback`
 
 ---
 
@@ -16,7 +17,7 @@
 | 4 | [03_theory_anchor.md](03_theory_anchor.md) | 10 min | **5 篇理论锚点**摘要 + 7 设计原则 (OAIF + OFS-DPO + Samplers + RPO + Meta) |
 | 5 | [04_experiments.md](04_experiments.md) | 10 min | **实验状态**: 已提交 4 nebula tasks + 待跑 + baseline 数据 + 风险 |
 | ref | [submission_guide.md](submission_guide.md) | 5 min | nebula 提交流程 |
-| ref | [`OPD_Deep_Analysis.html`](file:///Users/awesome_jimmy/lazada/papers/raw/opd_papers/OPD_Deep_Analysis.html) | 30 min | OPD 综述 + 5 篇 Online DPO 论文深度分析 (本地 obsidian wiki) |
+| ref | [`OPD_Deep_Analysis.html`](file:///Users/ljm/lazada/papers/raw/opd_papers/OPD_Deep_Analysis.html) | 30 min | OPD 综述 + 5 篇 Online DPO 论文深度分析 (本地 obsidian wiki) |
 
 ---
 
@@ -33,13 +34,13 @@
 
 ---
 
-## 🧭 当前状态速览 (2026-05-17)
+## 🧭 当前状态速览 (2026-05-18)
 
 | 维度 | 状态 |
 |---|---|
-| **代码** | ✅ V2.5 完整实现 (`299eec7`),含 V2 adaptive rollout + 3 loss innovations + 16 metrics + DPO val mode |
-| **本地测试** | ⏳ 待 4-GPU notebook 跑 `./run_notebook_dpo_tgs.sh smoke + innov` 验证 |
-| **Nebula 任务** | 🔄 第 3 批 4 task 已排队 (commit `299eec7`,见 [04_experiments.md](04_experiments.md) §2) |
+| **代码** | ✅ V2.5 完整实现 (`560c761`),含 V2 adaptive rollout + 3 loss innovations + 16 metrics + DPO val mode + FSDP chunk padding |
+| **本地测试** | ⏳ tiny / smoke / innov 三模式可选 (1-GPU/4-GPU);见 `run_notebook_dpo_tgs.sh` |
+| **Nebula 任务** | 🔄 第 4 批 3 task 已排队 (commit `560c761`,FSDP padding bug 修后重交,见 [04_experiments.md](04_experiments.md) §2) |
 | **Baseline 数据** | ⚠️ 单 seed 方差 7.5% 是论文级风险;biology GRPO best=0.660 (length=17 蒙对) vs 0.585 (健康) |
 | **5 papers 理论锚点** | ✅ 已在 HTML 摘要 + [03_theory_anchor.md](03_theory_anchor.md) 本地版 |
 | **风险** | 见 [04_experiments.md §6 论文级风险](04_experiments.md) |
@@ -64,7 +65,7 @@ set -a; source .env; set +a
 | **ray_trainer dispatch + DPO val mode** | [`verl/trainer/ppo/ray_trainer.py`](../verl/trainer/ppo/ray_trainer.py) |
 | **Hydra config** (16 个 knob,默认 v1 backwards compat) | [`verl/trainer/config/dpo_tgs.yaml`](../verl/trainer/config/dpo_tgs.yaml) |
 | **nebula 提交** | [`nebula_scripts/dpo_tgs/`](../nebula_scripts/dpo_tgs/), [`nebula_scripts/submit_dpo_tgs_sweep.sh`](../nebula_scripts/submit_dpo_tgs_sweep.sh) |
-| **本地 4-GPU smoke** | [`run_notebook_dpo_tgs.sh`](../run_notebook_dpo_tgs.sh) (smoke / innov / pair / full 四模式) |
+| **本地 smoke (1-GPU tiny / 4-GPU)** | [`run_notebook_dpo_tgs.sh`](../run_notebook_dpo_tgs.sh) (tiny / smoke / innov / pair / full 五模式) |
 
 ## 🗄️ Archive (历史/弃用方案)
 

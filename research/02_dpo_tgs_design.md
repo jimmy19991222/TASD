@@ -316,7 +316,7 @@ DPO_CAUSAL_LOCALIZE=True DPO_BETA_TOKEN=0.2 DPO_BETA_CONTINUATION=0.05 \
   ./run_notebook_dpo_tgs.sh smoke                                    # 仅 ①
 ```
 
-## §10 实施完成度 (commit `299eec7`)
+## §10 实施完成度 (V2.5 spec freeze: `299eec7` · 现役 HEAD: `560c761`)
 
 | 组件 | 状态 | 文件 |
 |---|---|---|
@@ -344,4 +344,4 @@ DPO_CAUSAL_LOCALIZE=True DPO_BETA_TOKEN=0.2 DPO_BETA_CONTINUATION=0.05 \
 | **TCCA-Lite** (我们之前的方法) | pairwise preference 替代 advantage modulation,消除 λ_div tuning |
 | **AlignDistil** | pair 来自因果反事实而非启发式 |
 
-详见 [03_theory_anchor.md](03_theory_anchor.md) 和 [`OPD_Deep_Analysis.html`](file:///Users/awesome_jimmy/lazada/papers/raw/opd_papers/OPD_Deep_Analysis.html)。
+详见 [03_theory_anchor.md](03_theory_anchor.md) 和 [`OPD_Deep_Analysis.html`](file:///Users/ljm/lazada/papers/raw/opd_papers/OPD_Deep_Analysis.html)。

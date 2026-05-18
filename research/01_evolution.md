@@ -234,12 +234,29 @@ RPO 的 $W_{\text{hal}}$ 启发式权重的 verifiable-reward 严格化。
 ### 当前状态
 - ✅ 全部实现 (commit `7afa10f`)
 - ✅ 3 个独立 toggle,8 种组合 (2³),默认 v1 backwards compat
-- 🔄 4 个 nebula tasks 排队中 (commit `299eec7` bug fix 后):
-  - Job 1: V2 baseline (all OFF) — 对照
-  - Job 2: V2.5 main (① + ② + ③ all ON) — 论文 main result
-  - Job 3: hybrid_init_chain pair strategy (Meta 启发)
-  - Job 4: n_attempts=4 (chain depth, Samplers-DPO)
+- ✅ V2.5 spec freeze: `299eec7`
 - 📋 完整 spec → [02_dpo_tgs_design.md](02_dpo_tgs_design.md)
+
+---
+
+## §8.5 阶段 8: 稳定化 (2026-05-18) — 工程鲁棒化,无方法变更
+
+V2.5 spec freeze 后,进入 Nebula + 本地 notebook 实跑。第 3 批跑起来命中**新的 FSDP chunk divisibility bug** (teacher forward 时 batch size 不能被 fsdp world size 整除直接 crash),`8512de9` 修了 chunk padding。本地 notebook 启动又踩到一连串 ray init / NCCL bootstrap 坑。整个稳定化 9 个 commit (`0891353` → `560c761`),**没有任何方法学改动**,只是让代码在真实部署环境跑得起来。
+
+| Commit | 修复 |
+|---|---|
+| `0891353` | non_tensor merge 替换 batch.union(gen_batch) |
+| `b06634d` | 加 tiny 模式 (1-GPU 极简 smoke,3 step bs=2) |
+| `c4b7f46` | re-attach prompt_batch non_tensor to y_init after _standard_rollout |
+| `a35d580` → `b3b4d65` | ray init 鲁棒化 (timeout / log buffering / loopback IP / 后台启动) |
+| `8512de9` | **FSDP chunk divisibility padding** (Nebula main blocker) |
+| `560c761` | NCCL bootstrap 走 lo + ray IP detection 容错 (notebook 单机) |
+
+第 4 批 nebula 重交 (commit `560c761`) 见 [04_experiments.md §2 第 4 批](04_experiments.md#§2-已提交-nebula-任务时间线)。
+
+### 当前状态 (2026-05-18 23:12)
+- 🔄 第 4 批 3 nebula tasks 排队中 (commit `560c761`)
+- ⏳ 本地 notebook tiny 模式待用户验证 NCCL fix (commit `560c761` 是首次端到端跑通的版本)
 
 ---
 
@@ -255,6 +272,10 @@ RPO 的 $W_{\text{hal}}$ 启发式权重的 verifiable-reward 严格化。
 | 同上 | `logp_actor` undefined (NameError) | bug 审计 | commit `299eec7` 改 `logp_old` |
 | 同上 | B=1 edge case `t_i.numpy()` 0-d | bug 审计 | commit `299eec7` `np.atleast_1d` |
 | 同上 | `_vectorized_pair_advantage` 用 `mask.dtype` (long),integer 截断 | bug 审计 | commit `299eec7` 强制 `torch.float32` |
+| DPO-TGS V2.5 (commit `299eec7`) | teacher forward batch 不能被 FSDP world_size 整除 → crash | 第 3 批 nebula log | commit `8512de9` 加 chunk padding |
+| 同上 (本地 notebook) | ray.init() in-process 5 min timeout,/tmp/ray_start.log 空 | 用户首次跑 tiny | commit `ada178b` shell `ray start --head` 后 attach |
+| 同上 | NCCL bootstrap 卡 `connect to eth1:port` 30s × 34 retry | 用户日志 | commit `560c761` 强制 `NCCL_SOCKET_IFNAME=lo` |
+| 同上 | 脚本静默 exit (无 cluster up 行) | 用户日志 | commit `560c761` ray IP detection grep `\|\| true` |
 
 ---
 

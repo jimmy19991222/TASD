@@ -1,7 +1,7 @@
 # 04 — 实验状态 (DPO-TGS V2.5)
 
-> **最近更新**: 2026-05-17 21:04 (Phase B 4 nebula tasks 提交完成)
-> **当前 commit**: `299eec7` on `teacher-guided-intervention`
+> **最近更新**: 2026-05-18 23:12 (Phase B re-submit 3 jobs after FSDP chunk padding fix)
+> **当前 commit**: `560c761` on `teacher-guided-intervention` (V2.5 spec freeze: `299eec7`)
 > **SwanLab project**: `DPO-TGS`
 
 ---
@@ -11,8 +11,9 @@
 ### 当前优先级
 | 槽位 | 任务 | 状态 | 优先级 |
 |---|---|---|---|
-| **Notebook 4-GPU** | smoke + innov 双阶段验证 (commit `299eec7`) | ⏳ 待用户跑 | 🔴 P0 (验证 4 个 bugs 都修好) |
-| **Nebula** | Phase B 4 tasks 排队中 | 🔄 RUNNING | 🟡 P0 (论文 main result + 3 ablation) |
+| **Notebook 1-GPU tiny** | 验证 ray/NCCL/FSDP 补丁 plumbing 不崩 (commit `560c761`) | ⏳ 待用户跑 | 🔴 P0 |
+| **Notebook 4-GPU** | smoke + innov 双阶段验证 | ⏳ 待 tiny 通过后跑 | 🟡 P0 |
+| **Nebula** | Phase B re-submit 3 tasks (FSDP padding fix 后) | 🔄 RUNNING | 🟡 P0 (论文 main result + 2 ablation) |
 | **下一步** | 等 nebula 第一波结果 | 待 ~1.5h 后看 trajectory | — |
 
 ### 论文 5 大风险 (持续监控)
@@ -66,20 +67,38 @@
 
 Submission log: `logs/dpo_tgs_phaseB_20260517_210253.log`
 
+### 第 4 批 (2026-05-18 23:12) — commit `560c761` ⭐ 重交,FSDP chunk padding fix 后
+
+第 3 批跑起来后命中新的 FSDP-chunk divisibility bug (teacher forward 时 batch 不能被 fsdp world size 整除直接 crash),`8512de9` 修了 chunk padding。今天本地 notebook 启动又踩到 ray init / NCCL bootstrap 多个坑,`a35d580 → 560c761` 共 9 个 fix commit。重交去重后的 3 个 unique config:
+
+| # | Job | 关键参数 | Task ID | Logview |
+|---|---|---|---|---|
+| A | **V2 baseline (默认)** | ni=2 na=2 α=1.0 cc, all OFF | `da59b6e7b2fa42c2843a260a695ab5c2` | [view](https://nebula2.alibaba-inc.com/log/logview/xdl/view?task_id=da59b6e7b2fa42c2843a260a695ab5c2) |
+| B | **hybrid pair** | ni=2 na=2 α=1.0, **hybrid_init_chain** | `6fd136ca97da44499c2e5109a9a3798b` | [view](https://nebula2.alibaba-inc.com/log/logview/xdl/view?task_id=6fd136ca97da44499c2e5109a9a3798b) |
+| C | **n_attempts=4** | **na=4**, α=1.0, cc | `95d2a7ed70384f4d9f2b87d6c9b0b1a9` | [view](https://nebula2.alibaba-inc.com/log/logview/xdl/view?task_id=95d2a7ed70384f4d9f2b87d6c9b0b1a9) |
+
+> **Note**: 2026-05-18 期间 10:56 / 18:15-18:17 / 22:57 还各有 1-4 个中间提交,均因 FSDP chunk padding bug 立即 crash,已弃用,task ID 不在此处记录。重交以本批为准。
+> **不同**: V2.5 main (3 innovations 全开) 这次没单独交,留待 baseline 通过后 Phase C ablation 一起跑。
+
 ---
 
-## §3 Phase A: Notebook Smoke (4-GPU,本地,~30 min)
+## §3 Phase A: Notebook Smoke (本地)
 
 ```bash
-cd /Users/awesome_jimmy/lazada/SDPO
-git pull origin teacher-guided-intervention   # 拉 299eec7
+cd /Users/ljm/lazada/code/TASD     # 或开发机 /home/loujieming.ljm/TASD
+git pull origin teacher-guided-intervention   # 拉 560c761
 
-# A1: V1 baseline plumbing (~15 min)
+# A0 (新): tiny 1-GPU 极简 plumbing (~5 min, 队列紧张时用)
+./run_notebook_dpo_tgs.sh tiny 2>&1 | tee logs/tiny_ray.log
+
+# A1: V1 baseline plumbing (4-GPU, ~15 min)
 ./run_notebook_dpo_tgs.sh smoke 2>&1 | tee logs/dpo_tgs_smoke_v1_fixed.log
 
-# A2: V2.5 全 innovations (~15 min)
+# A2: V2.5 全 innovations (4-GPU, ~15 min)
 ./run_notebook_dpo_tgs.sh innov 2>&1 | tee logs/dpo_tgs_innov_v1.log
 ```
+
+> tiny 模式由 `b06634d` 引入,1 卡 3 step bs=2,只验证 dispatch/rollout/reward_fn/pair_collector/dpo_loss 不崩。是 Nebula 提交前最便宜的 plumbing 检查。
 
 ### 通过标志
 
@@ -256,6 +275,18 @@ material (0.79) > physics (0.78) > chemistry (0.78) > tooluse (0.71) > **biology
 ## §10 Commit 链 (DPO-TGS V2.5)
 
 ```
+# V2.5 spec freeze 之后的稳定化 (2026-05-18, 9 commits)
+560c761  fix(dpo_tgs): notebook NCCL bootstrap loopback + ray IP detection fallback
+8512de9  fix: add FSDP chunk divisibility padding for teacher forward in DPO-TGS
+b3b4d65  fix(dpo_tgs): ray start log buffering + loopback IP optional + better diag
+20c1761  fix(dpo_tgs): force loopback IP + bg ray start for A100 notebook
+ada144f  fix(dpo_tgs): pre-start ray cluster via shell to bypass in-process timeout
+a35d580  fix(dpo_tgs): ray init robustness for tiny mode (1-GPU notebook)
+c4b7f46  fix(dpo_tgs): re-attach prompt_batch non_tensor to y_init after _standard_rollout
+b06634d  feat(dpo_tgs): add 'tiny' mode (1-GPU smoke) to run_notebook_dpo_tgs.sh
+0891353  fix(dpo_tgs): use non_tensor merge instead of batch.union(gen_batch)
+
+# V2.5 spec freeze
 299eec7  fix(dpo_tgs): 4 bugs blocking smoke + extend notebook script for V2.5
 30ac745  docs(dpo_tgs): append V2.5 update section to design doc
 2ea25d9  feat(dpo_tgs): add run_notebook_dpo_tgs.sh
@@ -266,6 +297,30 @@ ce3db1a  feat(dpo_tgs): On-Policy DPO + Teacher-Guided Sampling V2 (adaptive rol
 ```
 
 历史 commit 见 `git log teacher-guided-intervention`。
+
+---
+
+## §12 Troubleshooting (notebook smoke / Nebula 启动踩过的坑)
+
+记录 V2.5 之后稳定化阶段非平凡的工程坑,避免下次重复。
+
+### Notebook smoke (run_notebook_dpo_tgs.sh)
+
+| 现象 | 根因 | Commit |
+|---|---|---|
+| `ray.init()` 在 in-process 模式下卡 5 min 后 SIGKILL,/tmp/ray_start.log 空 | NFS /tmp + dashboard 启动慢 | `ada178b` 改 shell 显式 `ray start --head` 然后 attach |
+| ray 启动 5 min timeout,log 空 | Python stdout buffering | `b3b4d65` 加 `PYTHONUNBUFFERED=1` + `stdbuf -oL -eL` |
+| ray 启动后 NCCL 卡 30s × 34 retry 在 `socketPollConnect 202.x:port` | 容器 eth1 不允许自连接 (notebook 网卡隔离) | `560c761` 强制 `NCCL_SOCKET_IFNAME=lo` / `GLOO_SOCKET_IFNAME=lo` |
+| 脚本静默 exit,输出 `[ray] runtime up ✓` 后无后续 | `grep -oP "Local node IP:" /tmp/ray_start.log` 没匹配 → pipefail+set -e 杀脚本 | `560c761` 加 `\|\| true` 容错 |
+| OSS 直读 Qwen3-8B checkpoint 加载 31 min | OSS 挂载 IO 慢 | workaround: `cp -r ${OSS_ROOT}/base_models/Qwen3-8B /dev/shm/Qwen3-8B && export MODEL_PATH=/dev/shm/Qwen3-8B` (需 16GB shm) |
+
+### Nebula
+
+| 现象 | 根因 | Commit |
+|---|---|---|
+| Teacher forward 时 batch 不能被 FSDP world_size 整除 → crash | 没有 chunk padding | `8512de9` 加 padding |
+| 第 3 批后台立即 crash | 上述 FSDP 问题 + non_tensor merge | `0891353` + `8512de9` |
+| `nebulactl` 报 "uncommitted files, commit id incorrect" | 工作区有 unstaged 修改 | 提交前 `git status` 确认 clean |
 
 ---
 
