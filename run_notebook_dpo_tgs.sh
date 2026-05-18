@@ -262,6 +262,13 @@ else
 fi
 export RAY_object_store_memory="${_RAY_OBJ_MEM}"
 
+# ── NCCL / GLOO bootstrap 接口 (notebook eth1 不允许自连接, 必须走 lo) ─
+# 现象: NCCL 默认选 eth1 = 202.x 内网, listen 后自 connect-back timeout 30s × 34 retry.
+# 单节点 (含 4-GPU) bootstrap 走 loopback 安全;实际 GPU 间通信走 NVLink/PCIe 不受影响.
+export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-lo}"
+export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-lo}"
+export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
+
 # ── 预启动 Ray cluster (绕开 ray.init() in-process slow startup) ──
 echo "[ray] stopping any existing cluster..."
 ray stop --force >/dev/null 2>&1 || true
@@ -317,8 +324,13 @@ fi
 if [ -n "${RAY_NODE_IP_ADDRESS}" ]; then
     export RAY_ADDRESS="${RAY_NODE_IP_ADDRESS}:6379"
 else
-    # ray start 自动选 IP,从 log 里抓
-    _DETECTED_IP=$(grep -oP "Local node IP: \K[^ ]+" /tmp/ray_start.log | head -1)
+    # ray start 自动选 IP,从 log 里抓 (不同 ray 版本 log 格式不同, grep 必须容错)
+    # 不加 || true 时, grep 没匹配 → pipefail+set -e 会让脚本静默 exit
+    _DETECTED_IP=$(grep -oP "Local node IP: \K[^ ]+" /tmp/ray_start.log 2>/dev/null | head -1 || true)
+    if [ -z "${_DETECTED_IP}" ]; then
+        # fallback: 从 "ray start" 命令输出的 "Started a local Ray instance" 段抓
+        _DETECTED_IP=$(grep -oE "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:6379" /tmp/ray_start.log 2>/dev/null | head -1 | cut -d: -f1 || true)
+    fi
     export RAY_ADDRESS="${_DETECTED_IP:-127.0.0.1}:6379"
 fi
 echo "[ray] cluster up. RAY_ADDRESS=${RAY_ADDRESS}, RAY_TMPDIR=${RAY_TMPDIR}"
