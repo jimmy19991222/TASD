@@ -239,13 +239,20 @@ export RAY_TMPDIR="${RAY_TMPDIR:-/dev/shm/ray_tmp_${USER}}"
 mkdir -p "${RAY_TMPDIR}" 2>/dev/null
 export RAY_DEDUP_LOGS="${RAY_DEDUP_LOGS:-0}"
 
-# A100 / 多网卡容器: GCS 在内网 IP 上找不到 raylet → RPC timeout。强制 loopback。
-export RAY_NODE_IP_ADDRESS="${RAY_NODE_IP_ADDRESS:-127.0.0.1}"
+# RAY_NODE_IP_ADDRESS env 用户可显式设;默认空 = 让 ray 自动检测 (强制 127.0.0.1
+# 会让某些 A100 容器内 ray 启动后无输出,反而更难诊断)。
+# 用真实内网 IP: RAY_NODE_IP_ADDRESS=$(hostname -I | awk '{print $1}')
+# 用 loopback: RAY_NODE_IP_ADDRESS=127.0.0.1
+RAY_NODE_IP_ADDRESS="${RAY_NODE_IP_ADDRESS:-}"
+
 # 大幅放宽 raylet 启动等待 (默认 10s 在容器里不够)
 export RAY_raylet_start_wait_time_s="${RAY_raylet_start_wait_time_s:-300}"
 export RAY_gcs_rpc_server_reconnect_timeout_s="${RAY_gcs_rpc_server_reconnect_timeout_s:-120}"
 export RAY_gcs_server_request_timeout_seconds="${RAY_gcs_server_request_timeout_seconds:-300}"
 export RAY_DISABLE_USAGE_STATS=1
+# 关键: 强制 Python 不 buffer stdout/stderr,否则 ray hang 5 min 后被 SIGKILL,
+# 所有 buffer 在内存里的 log 全丢,导致 /tmp/ray_start.log 是空的。
+export PYTHONUNBUFFERED=1
 
 # tiny mode 进一步限制 ray object store 大小 (1 GPU 机器内存紧张)
 if [ "${MODE}" = "tiny" ]; then
@@ -263,17 +270,18 @@ pkill -9 -f gcs_server 2>/dev/null || true
 sleep 1
 rm -rf "${RAY_TMPDIR}"/* 2>/dev/null || true
 
-echo "[ray] starting head node (no dashboard, ${N_GPUS_PER_NODE} GPU, $(nproc) CPU, ${_RAY_OBJ_MEM} bytes obj store, ip=${RAY_NODE_IP_ADDRESS})..."
+echo "[ray] starting head node (no dashboard, ${N_GPUS_PER_NODE} GPU, $(nproc) CPU, ${_RAY_OBJ_MEM} bytes obj store, ip=${RAY_NODE_IP_ADDRESS:-auto})..."
 # Don't pass --num-gpus to `ray start` — CUDA init can stall raylet registration.
 # Resources are still discoverable in workers via CUDA_VISIBLE_DEVICES + ray.get_runtime_context().
-ray start --head \
-    --node-ip-address="${RAY_NODE_IP_ADDRESS}" \
-    --include-dashboard=false \
-    --disable-usage-stats \
-    --num-cpus=$(nproc) \
-    --temp-dir="${RAY_TMPDIR}" \
-    --object-store-memory=${_RAY_OBJ_MEM} \
-    >/tmp/ray_start.log 2>&1 &
+# Build ray start args (omit --node-ip-address when empty so ray auto-detects)
+_RAY_ARGS=(--head --include-dashboard=false --disable-usage-stats
+    --num-cpus=$(nproc) --temp-dir="${RAY_TMPDIR}"
+    --object-store-memory=${_RAY_OBJ_MEM})
+if [ -n "${RAY_NODE_IP_ADDRESS}" ]; then
+    _RAY_ARGS+=(--node-ip-address="${RAY_NODE_IP_ADDRESS}")
+fi
+# stdbuf -oL -eL 强制 line-buffering;PYTHONUNBUFFERED 已 export 在前面
+stdbuf -oL -eL ray start "${_RAY_ARGS[@]}" >/tmp/ray_start.log 2>&1 &
 _RAY_START_PID=$!
 
 # 等 ray runtime 就绪 (通过 grep "Ray runtime started" 判定),最多 5 min
@@ -295,13 +303,24 @@ done
 
 if ! grep -q "Ray runtime started" /tmp/ray_start.log 2>/dev/null; then
     echo ""
-    echo "❌ ray start timed out after 5 min. Last 40 lines of /tmp/ray_start.log:"
-    tail -40 /tmp/ray_start.log
+    echo "❌ ray start timed out after 5 min."
+    echo "  /tmp/ray_start.log size: $(wc -c < /tmp/ray_start.log 2>/dev/null || echo 0) bytes"
+    echo "  Last 40 lines:"
+    tail -40 /tmp/ray_start.log 2>/dev/null
+    echo ""
+    echo "  Active ray processes (likely hung):"
+    ps -ef | grep -E "ray|raylet|gcs" | grep -v grep | head -20
     kill -9 $_RAY_START_PID 2>/dev/null
     exit 1
 fi
 
-export RAY_ADDRESS="${RAY_NODE_IP_ADDRESS}:6379"  # explicit attach via loopback
+if [ -n "${RAY_NODE_IP_ADDRESS}" ]; then
+    export RAY_ADDRESS="${RAY_NODE_IP_ADDRESS}:6379"
+else
+    # ray start 自动选 IP,从 log 里抓
+    _DETECTED_IP=$(grep -oP "Local node IP: \K[^ ]+" /tmp/ray_start.log | head -1)
+    export RAY_ADDRESS="${_DETECTED_IP:-127.0.0.1}:6379"
+fi
 echo "[ray] cluster up. RAY_ADDRESS=${RAY_ADDRESS}, RAY_TMPDIR=${RAY_TMPDIR}"
 
 # 在脚本退出时清理 ray (避免下次有残留进程)
