@@ -131,6 +131,8 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     actor_rollout_ref.actor.ppo_mini_batch_size=${MINI_BATCH_SIZE} \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=${FSDP_OPTIMIZER_OFFLOAD:-False} \
+    actor_rollout_ref.actor.fsdp_config.param_offload=${FSDP_PARAM_OFFLOAD:-False} \
     actor_rollout_ref.actor.self_distillation.teacher_regularization=${TEACHER_REGULARIZATION} \
     actor_rollout_ref.actor.self_distillation.teacher_update_rate=${TEACHER_UPDATE_RATE} \
     actor_rollout_ref.actor.self_distillation.include_environment_feedback=False \
