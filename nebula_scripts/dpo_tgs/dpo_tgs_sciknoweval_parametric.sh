@@ -140,6 +140,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.n=${VAL_N} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.gpu_memory_utilization=${GPU_MEMORY_UTILIZATION} \
+    actor_rollout_ref.rollout.agent.num_workers=${ROLLOUT_AGENT_NUM_WORKERS:-8} \
     algorithm.adv_estimator=dpo_teacher_guided \
     algorithm.dpo.n_init=${DPO_N_INIT} \
     algorithm.dpo.n_attempts=${DPO_N_ATTEMPTS} \

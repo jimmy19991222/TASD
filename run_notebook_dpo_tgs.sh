@@ -78,6 +78,10 @@ case "${MODE}" in
         # CPU,GPU 给 vLLM 留更多空间。Nebula / smoke 4-GPU 不需要,只 tiny 模式打开。
         export FSDP_OPTIMIZER_OFFLOAD="${FSDP_OPTIMIZER_OFFLOAD:-True}"
         export FSDP_PARAM_OFFLOAD="${FSDP_PARAM_OFFLOAD:-False}"
+        # async rollout 默认 num_workers=8; tiny 的 effective batch = bs(2) * n_init(2) = 4
+        # 个 prompt, 要 chunk 给 8 个 worker 会触发 "size 4 % 8 != 0" assert. 单卡只用 1 个
+        # worker 即可。smoke / innov / full (bs ≥ 4) 用默认 8 不会卡。
+        export ROLLOUT_AGENT_NUM_WORKERS="${ROLLOUT_AGENT_NUM_WORKERS:-1}"
         ;;
     smoke)
         # Plumbing 验证: ~15 min, 只验证 plumbing + 关注 dpo/* 指标出现 (v1 baseline, 4-GPU)
