@@ -409,28 +409,30 @@ def _student_continue_async(y_prev_batch, t_i, teacher_tokens, async_rollout_man
         prefixes.append(prefix)
         budgets.append(T - t_j - 1)
 
-    # asyncio.gather
+    # asyncio.gather. Wrap in an async function so gather() is called *inside*
+    # a running loop (uvloop's get_event_loop raises if called from sync code
+    # before a loop is started, so `asyncio.run(asyncio.gather(...))` does NOT
+    # work — gather eagerly tries to schedule coroutines via _ensure_future).
     coros = [
         _student_continue_one(p, b, server_manager, sampling)
         for p, b in zip(prefixes, budgets)
     ]
+
+    async def _gather_all():
+        return await asyncio.gather(*coros)
+
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # Already in async context; create a new loop in a fresh thread
-            import concurrent.futures
-            def _run():
-                inner_loop = asyncio.new_event_loop()
-                try:
-                    return inner_loop.run_until_complete(asyncio.gather(*coros))
-                finally:
-                    inner_loop.close()
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                continuations = ex.submit(_run).result()
-        else:
-            continuations = loop.run_until_complete(asyncio.gather(*coros))
+        # If a loop is already running (e.g. we're being called from an async
+        # ray actor body), asyncio.run() refuses; offload to a dedicated thread.
+        asyncio.get_running_loop()
+        import concurrent.futures
+        def _run():
+            return asyncio.run(_gather_all())
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            continuations = ex.submit(_run).result()
     except RuntimeError:
-        continuations = asyncio.run(asyncio.gather(*coros))
+        # No running loop — safe to start one here.
+        continuations = asyncio.run(_gather_all())
     return continuations
 
 
