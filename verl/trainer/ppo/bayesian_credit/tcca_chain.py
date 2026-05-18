@@ -367,6 +367,23 @@ async def _student_continue_one(prefix_ids: list, max_tokens: int, server_manage
         return list(out)
 
 
+def _get_chain_server_manager(async_rollout_manager):
+    """Get an AsyncLLMServerManager from the AgentLoopManager.
+
+    New verl renamed the wrapper to AgentLoopManager; the actual
+    AsyncLLMServerManager (with .generate) now lives inside per-worker scope.
+    The wrapper exposes server_handles, so we lazy-construct one manager and
+    cache it on the wrapper to avoid re-shuffling handles on every call.
+    """
+    cached = getattr(async_rollout_manager, "_chain_server_manager", None)
+    if cached is not None:
+        return cached
+    from verl.experimental.agent_loop.agent_loop import AsyncLLMServerManager
+    sm = AsyncLLMServerManager(async_rollout_manager.config, list(async_rollout_manager.server_handles))
+    async_rollout_manager._chain_server_manager = sm
+    return sm
+
+
 def _student_continue_async(y_prev_batch, t_i, teacher_tokens, async_rollout_manager, config, tokenizer) -> list:
     """asyncio.gather over B samples, each with different prefix."""
     B = len(t_i)
@@ -377,7 +394,7 @@ def _student_continue_async(y_prev_batch, t_i, teacher_tokens, async_rollout_man
         "temperature": float(rollout_cfg.temperature),
         "top_p": float(getattr(rollout_cfg, "top_p", 1.0)),
     }
-    server_manager = async_rollout_manager.server_manager
+    server_manager = _get_chain_server_manager(async_rollout_manager)
 
     # Build per-sample prefixes (strip left padding from orig prompt + append y_<t_i + teacher_token)
     prefixes = []
