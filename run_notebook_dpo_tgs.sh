@@ -239,6 +239,14 @@ export RAY_TMPDIR="${RAY_TMPDIR:-/dev/shm/ray_tmp_${USER}}"
 mkdir -p "${RAY_TMPDIR}" 2>/dev/null
 export RAY_DEDUP_LOGS="${RAY_DEDUP_LOGS:-0}"
 
+# A100 / 多网卡容器: GCS 在内网 IP 上找不到 raylet → RPC timeout。强制 loopback。
+export RAY_NODE_IP_ADDRESS="${RAY_NODE_IP_ADDRESS:-127.0.0.1}"
+# 大幅放宽 raylet 启动等待 (默认 10s 在容器里不够)
+export RAY_raylet_start_wait_time_s="${RAY_raylet_start_wait_time_s:-300}"
+export RAY_gcs_rpc_server_reconnect_timeout_s="${RAY_gcs_rpc_server_reconnect_timeout_s:-120}"
+export RAY_gcs_server_request_timeout_seconds="${RAY_gcs_server_request_timeout_seconds:-300}"
+export RAY_DISABLE_USAGE_STATS=1
+
 # tiny mode 进一步限制 ray object store 大小 (1 GPU 机器内存紧张)
 if [ "${MODE}" = "tiny" ]; then
     _RAY_OBJ_MEM="${RAY_object_store_memory:-1000000000}"   # 1 GB
@@ -255,23 +263,46 @@ pkill -9 -f gcs_server 2>/dev/null || true
 sleep 1
 rm -rf "${RAY_TMPDIR}"/* 2>/dev/null || true
 
-echo "[ray] starting head node (no dashboard, ${N_GPUS_PER_NODE} GPU, $(nproc) CPU, ${_RAY_OBJ_MEM} bytes obj store)..."
+echo "[ray] starting head node (no dashboard, ${N_GPUS_PER_NODE} GPU, $(nproc) CPU, ${_RAY_OBJ_MEM} bytes obj store, ip=${RAY_NODE_IP_ADDRESS})..."
+# Don't pass --num-gpus to `ray start` — CUDA init can stall raylet registration.
+# Resources are still discoverable in workers via CUDA_VISIBLE_DEVICES + ray.get_runtime_context().
 ray start --head \
+    --node-ip-address="${RAY_NODE_IP_ADDRESS}" \
     --include-dashboard=false \
     --disable-usage-stats \
     --num-cpus=$(nproc) \
-    --num-gpus=${N_GPUS_PER_NODE} \
     --temp-dir="${RAY_TMPDIR}" \
     --object-store-memory=${_RAY_OBJ_MEM} \
-    >/tmp/ray_start.log 2>&1
-_RAY_START_RC=$?
-if [ ${_RAY_START_RC} -ne 0 ]; then
-    echo "❌ ray start failed (exit=${_RAY_START_RC}). Last 30 lines of /tmp/ray_start.log:"
-    tail -30 /tmp/ray_start.log
+    >/tmp/ray_start.log 2>&1 &
+_RAY_START_PID=$!
+
+# 等 ray runtime 就绪 (通过 grep "Ray runtime started" 判定),最多 5 min
+echo -n "[ray] waiting for runtime up ..."
+for _i in $(seq 1 60); do
+    if grep -q "Ray runtime started" /tmp/ray_start.log 2>/dev/null; then
+        echo " ✓ (${_i}×5s)"
+        break
+    fi
+    if ! kill -0 $_RAY_START_PID 2>/dev/null; then
+        echo ""
+        echo "❌ ray start exited unexpectedly. Last 40 lines of /tmp/ray_start.log:"
+        tail -40 /tmp/ray_start.log
+        exit 1
+    fi
+    sleep 5
+    echo -n "."
+done
+
+if ! grep -q "Ray runtime started" /tmp/ray_start.log 2>/dev/null; then
+    echo ""
+    echo "❌ ray start timed out after 5 min. Last 40 lines of /tmp/ray_start.log:"
+    tail -40 /tmp/ray_start.log
+    kill -9 $_RAY_START_PID 2>/dev/null
     exit 1
 fi
-export RAY_ADDRESS=auto    # ray.init() 会 detect 已起的 local cluster
-echo "[ray] cluster up. RAY_ADDRESS=auto, RAY_TMPDIR=${RAY_TMPDIR}"
+
+export RAY_ADDRESS="${RAY_NODE_IP_ADDRESS}:6379"  # explicit attach via loopback
+echo "[ray] cluster up. RAY_ADDRESS=${RAY_ADDRESS}, RAY_TMPDIR=${RAY_TMPDIR}"
 
 # 在脚本退出时清理 ray (避免下次有残留进程)
 trap 'echo "[ray] stopping..."; ray stop --force >/dev/null 2>&1 || true' EXIT
