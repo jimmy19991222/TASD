@@ -228,25 +228,53 @@ if [ -z "${TRAIN_DATA_PATH:-}" ]; then
 fi
 
 # ── GPU 数量 (mode 默认在 case 块,env 覆盖优先) ─────────────────────
-unset RAY_ADDRESS                # 旧 export RAY_ADDRESS="" 可能让 ray 误认为要连远程 cluster
 export N_GPUS_PER_NODE="${N_GPUS_PER_NODE:-${DEFAULT_N_GPUS_PER_NODE:-4}}"
 
 # ── Ray 启动健壮化 (tiny / 1-GPU 资源紧张时关键) ────────────────────
-# 默认 timeout 10s 在共享 /tmp / NFS 上经常不够;disable dashboard 加快 init
-export RAY_raylet_start_wait_time_s="${RAY_raylet_start_wait_time_s:-300}"
-export RAY_gcs_rpc_server_reconnect_timeout_s="${RAY_gcs_rpc_server_reconnect_timeout_s:-120}"
-export RAY_DISABLE_DASHBOARD="${RAY_DISABLE_DASHBOARD:-1}"
-export RAY_DISABLE_USAGE_STATS="${RAY_DISABLE_USAGE_STATS:-1}"
+# In-process ray.init() 在 notebook /tmp NFS + dashboard 启动慢的环境会 timeout。
+# 解决方案: 这里 shell 显式 ray start --head + disable dashboard,
+# 然后设 RAY_ADDRESS=auto 让 ray.init() attach 到 already-running cluster (秒级)。
+export RAY_TMPDIR="${RAY_TMPDIR:-/dev/shm/ray_tmp_${USER}}"
+[ ! -d /dev/shm ] && export RAY_TMPDIR="/tmp/ray_tmp_${USER}"
+mkdir -p "${RAY_TMPDIR}" 2>/dev/null
 export RAY_DEDUP_LOGS="${RAY_DEDUP_LOGS:-0}"
-# 把 ray tmp dir 挪到 /dev/shm (快内存盘);找不到就 fallback /tmp
-if [ -d /dev/shm ] && [ -w /dev/shm ]; then
-    export RAY_TMPDIR="${RAY_TMPDIR:-/dev/shm/ray_tmp_$USER}"
-    mkdir -p "${RAY_TMPDIR}" 2>/dev/null
-fi
+
 # tiny mode 进一步限制 ray object store 大小 (1 GPU 机器内存紧张)
 if [ "${MODE}" = "tiny" ]; then
-    export RAY_object_store_memory="${RAY_object_store_memory:-1000000000}"   # 1 GB
+    _RAY_OBJ_MEM="${RAY_object_store_memory:-1000000000}"   # 1 GB
+else
+    _RAY_OBJ_MEM="${RAY_object_store_memory:-4000000000}"   # 4 GB
 fi
+export RAY_object_store_memory="${_RAY_OBJ_MEM}"
+
+# ── 预启动 Ray cluster (绕开 ray.init() in-process slow startup) ──
+echo "[ray] stopping any existing cluster..."
+ray stop --force >/dev/null 2>&1 || true
+pkill -9 -f raylet 2>/dev/null || true
+pkill -9 -f gcs_server 2>/dev/null || true
+sleep 1
+rm -rf "${RAY_TMPDIR}"/* 2>/dev/null || true
+
+echo "[ray] starting head node (no dashboard, ${N_GPUS_PER_NODE} GPU, $(nproc) CPU, ${_RAY_OBJ_MEM} bytes obj store)..."
+ray start --head \
+    --include-dashboard=false \
+    --disable-usage-stats \
+    --num-cpus=$(nproc) \
+    --num-gpus=${N_GPUS_PER_NODE} \
+    --temp-dir="${RAY_TMPDIR}" \
+    --object-store-memory=${_RAY_OBJ_MEM} \
+    >/tmp/ray_start.log 2>&1
+_RAY_START_RC=$?
+if [ ${_RAY_START_RC} -ne 0 ]; then
+    echo "❌ ray start failed (exit=${_RAY_START_RC}). Last 30 lines of /tmp/ray_start.log:"
+    tail -30 /tmp/ray_start.log
+    exit 1
+fi
+export RAY_ADDRESS=auto    # ray.init() 会 detect 已起的 local cluster
+echo "[ray] cluster up. RAY_ADDRESS=auto, RAY_TMPDIR=${RAY_TMPDIR}"
+
+# 在脚本退出时清理 ray (避免下次有残留进程)
+trap 'echo "[ray] stopping..."; ray stop --force >/dev/null 2>&1 || true' EXIT
 
 # ── Git 信息 ───────────────────────────────────────────────────────
 export GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
