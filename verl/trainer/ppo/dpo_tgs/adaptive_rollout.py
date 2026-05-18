@@ -251,17 +251,44 @@ def _post_hoc_opsd_teacher_logp(
     sub_ctx = _gather_sdpo_ctx_for_sub_batch(sub, sdpo_ctx_by_uid)
 
     # One teacher fwd over the whole sub (re-uses same machinery as divergence step)
+    B_sub = sub.batch.batch_size[0]
     teacher_input_ids = torch.cat([sub_ctx["input_ids"], sub.batch["responses"]], dim=1)
     teacher_attn = torch.cat([sub_ctx["attention_mask"], sub.batch["response_mask"]], dim=1)
     teacher_pos = compute_position_id_with_mask(teacher_attn)
+
+    # FSDP chunk divisibility padding
+    try:
+        world_size = int(config.trainer.n_gpus_per_node)
+    except Exception:
+        world_size = 1
+    world_size = max(1, world_size)
+    pad_n = (world_size - B_sub % world_size) % world_size
+
+    if pad_n > 0:
+        teacher_input_ids_p = torch.cat([teacher_input_ids, teacher_input_ids[:pad_n]], dim=0)
+        teacher_attn_p = torch.cat([teacher_attn, teacher_attn[:pad_n]], dim=0)
+        teacher_pos_p = torch.cat([teacher_pos, teacher_pos[:pad_n]], dim=0)
+        responses_p = torch.cat([sub.batch["responses"], sub.batch["responses"][:pad_n]], dim=0)
+        input_ids_p = torch.cat([sub.batch["input_ids"], sub.batch["input_ids"][:pad_n]], dim=0)
+        attention_mask_p = torch.cat([sub.batch["attention_mask"], sub.batch["attention_mask"][:pad_n]], dim=0)
+        position_ids_p = torch.cat([sub.batch["position_ids"], sub.batch["position_ids"][:pad_n]], dim=0)
+    else:
+        teacher_input_ids_p = teacher_input_ids
+        teacher_attn_p = teacher_attn
+        teacher_pos_p = teacher_pos
+        responses_p = sub.batch["responses"]
+        input_ids_p = sub.batch["input_ids"]
+        attention_mask_p = sub.batch["attention_mask"]
+        position_ids_p = sub.batch["position_ids"]
+
     teacher_fwd_batch = DataProto.from_dict(tensors={
-        "teacher_input_ids": teacher_input_ids,
-        "teacher_attention_mask": teacher_attn,
-        "teacher_position_ids": teacher_pos,
-        "responses": sub.batch["responses"],
-        "input_ids": sub.batch["input_ids"],
-        "attention_mask": sub.batch["attention_mask"],
-        "position_ids": sub.batch["position_ids"],
+        "teacher_input_ids": teacher_input_ids_p,
+        "teacher_attention_mask": teacher_attn_p,
+        "teacher_position_ids": teacher_pos_p,
+        "responses": responses_p,
+        "input_ids": input_ids_p,
+        "attention_mask": attention_mask_p,
+        "position_ids": position_ids_p,
     })
     teacher_fwd_batch.meta_info = {
         "temperature": float(config.actor_rollout_ref.rollout.temperature),
@@ -271,7 +298,7 @@ def _post_hoc_opsd_teacher_logp(
         "compute_prior_shift_surprise": False,
     }
     teacher_result = actor_rollout_wg.compute_teacher_log_probs(teacher_fwd_batch)
-    sub_logp_T = teacher_result.batch["teacher_log_probs_on_response"].float()  # (n_valid, T)
+    sub_logp_T = teacher_result.batch["teacher_log_probs_on_response"][:B_sub].float()  # (n_valid, T) - strip padding
 
     out[valid_arr] = sub_logp_T.to(device)
     return out

@@ -219,18 +219,44 @@ def _build_opsd_teacher_context(prompt_batch: DataProto, tokenizer, config) -> d
 
 def _compute_divergence_opsd(y_prev_batch, opsd_ctx, actor_rollout_wg, config, tokenizer) -> torch.Tensor:
     """logp_T (OPSD ctx) - logp_S 绝对差, 已 mask response_mask 外."""
+    B = y_prev_batch.batch["responses"].shape[0]
     teacher_input_ids = torch.cat([opsd_ctx["input_ids"], y_prev_batch.batch["responses"]], dim=1)
     teacher_attn = torch.cat([opsd_ctx["attention_mask"], y_prev_batch.batch["response_mask"]], dim=1)
     teacher_pos = compute_position_id_with_mask(teacher_attn)
 
+    # FSDP chunk divisibility padding (same as _teacher_write_one_token)
+    try:
+        world_size = int(config.trainer.n_gpus_per_node)
+    except Exception:
+        world_size = 1
+    world_size = max(1, world_size)
+    pad_n = (world_size - B % world_size) % world_size
+
+    if pad_n > 0:
+        teacher_input_ids_p = torch.cat([teacher_input_ids, teacher_input_ids[:pad_n]], dim=0)
+        teacher_attn_p = torch.cat([teacher_attn, teacher_attn[:pad_n]], dim=0)
+        teacher_pos_p = torch.cat([teacher_pos, teacher_pos[:pad_n]], dim=0)
+        responses_p = torch.cat([y_prev_batch.batch["responses"], y_prev_batch.batch["responses"][:pad_n]], dim=0)
+        input_ids_p = torch.cat([y_prev_batch.batch["input_ids"], y_prev_batch.batch["input_ids"][:pad_n]], dim=0)
+        attention_mask_p = torch.cat([y_prev_batch.batch["attention_mask"], y_prev_batch.batch["attention_mask"][:pad_n]], dim=0)
+        position_ids_p = torch.cat([y_prev_batch.batch["position_ids"], y_prev_batch.batch["position_ids"][:pad_n]], dim=0)
+    else:
+        teacher_input_ids_p = teacher_input_ids
+        teacher_attn_p = teacher_attn
+        teacher_pos_p = teacher_pos
+        responses_p = y_prev_batch.batch["responses"]
+        input_ids_p = y_prev_batch.batch["input_ids"]
+        attention_mask_p = y_prev_batch.batch["attention_mask"]
+        position_ids_p = y_prev_batch.batch["position_ids"]
+
     teacher_fwd_batch = DataProto.from_dict(tensors={
-        "teacher_input_ids": teacher_input_ids,
-        "teacher_attention_mask": teacher_attn,
-        "teacher_position_ids": teacher_pos,
-        "responses": y_prev_batch.batch["responses"],
-        "input_ids": y_prev_batch.batch["input_ids"],
-        "attention_mask": y_prev_batch.batch["attention_mask"],
-        "position_ids": y_prev_batch.batch["position_ids"],
+        "teacher_input_ids": teacher_input_ids_p,
+        "teacher_attention_mask": teacher_attn_p,
+        "teacher_position_ids": teacher_pos_p,
+        "responses": responses_p,
+        "input_ids": input_ids_p,
+        "attention_mask": attention_mask_p,
+        "position_ids": position_ids_p,
     })
     teacher_fwd_batch.meta_info = {
         "temperature": float(config.actor_rollout_ref.rollout.temperature),
@@ -240,7 +266,7 @@ def _compute_divergence_opsd(y_prev_batch, opsd_ctx, actor_rollout_wg, config, t
         "compute_prior_shift_surprise": False,
     }
     teacher_result = actor_rollout_wg.compute_teacher_log_probs(teacher_fwd_batch)
-    logp_T = teacher_result.batch["teacher_log_probs_on_response"]  # (B, T)
+    logp_T = teacher_result.batch["teacher_log_probs_on_response"][:B]  # (B, T) - strip padding
 
     if "rollout_log_probs" in y_prev_batch.batch:
         logp_S = y_prev_batch.batch["rollout_log_probs"]
