@@ -124,6 +124,16 @@ self_distillation:
   # Requires include_environment_feedback=True to have any effect
   environment_feedback_only_without_solution: True
 
+  # Geodesic SDPO parameters (Fisher manifold constraint)
+  # Whether to enable Geodesic SDPO
+  use_geodesic: False
+
+  # Trust region threshold for Geodesic weight clipping
+  geodesic_trust_region: 5.0
+
+  # Scaling factor for Geodesic manifold weight
+  geodesic_beta_scale: 0.5
+
   # IS clip for loss; null disables IS weighting
   is_clip: 2
 

@@ -60,6 +60,9 @@ class SelfDistillationConfig(BaseConfig):
         environment_feedback_only_without_solution (bool): If True, only use feedback when no solution is available (ignore feedback when solution exists).
         reprompt_template_feedback (str): Template for reprompting with feedback but no solution.
         reprompt_template_feedback_solution (str): Template for reprompting with both feedback and solution.
+        use_geodesic (bool): Whether to enable Geodesic SDPO (Fisher manifold constraint).
+        geodesic_trust_region (float): Trust region threshold for Geodesic weight clipping.
+        geodesic_beta_scale (float): Scaling factor for Geodesic manifold weight.
     """
 
     full_logit_distillation: bool = True
@@ -90,6 +93,11 @@ class SelfDistillationConfig(BaseConfig):
     )
     include_environment_feedback: bool = False
     environment_feedback_only_without_solution: bool = False
+
+    # Geodesic SDPO parameters (Fisher manifold constraint)
+    use_geodesic: bool = False
+    geodesic_trust_region: float = 5.0
+    geodesic_beta_scale: float = 0.5
 
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:
