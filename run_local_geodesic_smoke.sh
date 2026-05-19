@@ -82,6 +82,8 @@ EXP_NAME="LOCAL-GEODESIC-SMOKE-train${TRAIN_BATCH_SIZE}-rollout${ROLLOUT_BATCH_S
 ARGS="data.train_files=['${TRAIN_FILE}'] \
 data.val_files=['${VAL_FILE}'] \
 data.train_batch_size=$TRAIN_BATCH_SIZE \
+trainer.n_gpus_per_node=$N_GPUS_PER_NODE \
+trainer.nnodes=1 \
 trainer.group_name=Geodesic-SmokeTest \
 trainer.total_training_steps=$MAX_STEPS \
 trainer.save_freq=-1 \
