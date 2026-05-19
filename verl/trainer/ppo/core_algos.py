@@ -1179,6 +1179,37 @@ def compute_self_distillation_loss(
     if rollout_is_weights is not None:
         per_token_loss = per_token_loss * rollout_is_weights
 
+    # ===== Geodesic SDPO: Fisher 度量加权 (流形约束) =====
+    # 理论依据：在概率流形上做 Natural Gradient 更新，
+    # Fisher 对角近似 F ≈ p(1-p)，外部缩放不改变 BT 最优点
+    use_geodesic = getattr(self_distillation_config, "use_geodesic", False)
+    if use_geodesic:
+        # 计算 Fisher 对角近似
+        if student_all_log_probs is not None:
+            # Full logit 模式：在 vocab 维度计算 Fisher
+            p_student = torch.exp(student_all_log_probs.detach())  # (B, T, V)
+            # F ≈ Σ_k p_k(1-p_k)，对 vocab 维度求和
+            fisher_metric = (p_student * (1.0 - p_student)).sum(-1)  # (B, T)
+        else:
+            # Token-level 模式：使用采样 token 的概率
+            p_student = torch.exp(student_log_probs.detach())  # (B, T)
+            fisher_metric = p_student * (1.0 - p_student)
+        
+        # 添加小常数防止除零
+        fisher_metric = fisher_metric + 1e-5
+        
+        # 流形权重：F^{-1} 的近似，带截断保护防止梯度爆炸
+        clip_max = getattr(self_distillation_config, "geodesic_clip_max", 10.0)
+        manifold_weight = torch.clamp(1.0 / fisher_metric, max=clip_max)
+        
+        # 外部缩放：重塑梯度流而不改变最优点
+        per_token_loss = per_token_loss * manifold_weight
+        
+        # 记录指标用于监控（SwanLab 自动采集）
+        metrics["actor/geodesic_mean_weight"] = manifold_weight.mean().detach().item()
+        metrics["actor/geodesic_max_weight"] = manifold_weight.max().detach().item()
+        metrics["actor/geodesic_min_weight"] = manifold_weight.min().detach().item()
+
     loss = agg_loss(
         loss_mat=per_token_loss,
         loss_mask=loss_mask,

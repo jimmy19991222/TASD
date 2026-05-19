@@ -19,6 +19,10 @@ check_env MODEL_NAME
 
 SEED="${SEED:-42}"
 
+# Geodesic SDPO 参数（可选）
+USE_GEODESIC="${USE_GEODESIC:-False}"
+GEODESIC_CLIP_MAX="${GEODESIC_CLIP_MAX:-10.0}"
+
 # 数据集路径
 train_data_path="${OSS_ROOT}/datasets/${DATASET}/train.parquet"
 val_data_path="${OSS_ROOT}/datasets/${DATASET}/test.parquet"
@@ -56,6 +60,8 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.self_distillation.alpha=${ALPHA} \
     actor_rollout_ref.actor.self_distillation.dont_reprompt_on_self_success=${DONT_REPROMPT_ON_SELF_SUCCESS} \
     actor_rollout_ref.actor.self_distillation.include_environment_feedback=False \
+    actor_rollout_ref.actor.self_distillation.use_geodesic=${USE_GEODESIC} \
+    actor_rollout_ref.actor.self_distillation.geodesic_clip_max=${GEODESIC_CLIP_MAX} \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.rollout.n=${ROLLOUT_N} \
     actor_rollout_ref.rollout.val_kwargs.n=16 \

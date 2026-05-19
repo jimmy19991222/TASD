@@ -20,6 +20,10 @@ actor_rollout_ref:
     self_distillation:
       max_reprompt_len: 10240
       is_clip: 2.0
+      # Geodesic SDPO: Fisher 度量加权（流形约束）
+      # 理论：在概率流形上做 Natural Gradient 更新，内生保护熵结构
+      use_geodesic: False  # 默认关闭，消融实验时开启
+      geodesic_clip_max: 10.0  # 流形权重截断阈值（防止低概率 token 梯度爆炸）
     optim:
       lr: 1e-5
   rollout:
