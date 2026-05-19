@@ -597,6 +597,10 @@ class AlgoConfig(BaseConfig):
 
             For backward compatibility, you can still pass a dict, which will be converted to
             RolloutCorrectionConfig automatically.
+        use_vce (bool): Whether to use V_CE baseline for advantage computation.
+        use_log_pi_s (bool): Whether to use log pi_s in advantage computation.
+        clip_value (float): Advantage clip threshold for V_CE.
+        adv_std_floor (float): Standard deviation floor for advantage normalization.
     """
 
     gamma: float = 1.0
@@ -612,3 +616,9 @@ class AlgoConfig(BaseConfig):
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None
+
+    # Self-Teacher Advantage configuration
+    use_vce: bool = False  # Whether to use V_CE baseline for advantage computation
+    use_log_pi_s: bool = False  # Whether to use log pi_s in advantage computation
+    clip_value: float = 3.0  # Advantage clip threshold for V_CE
+    adv_std_floor: float = 0.0  # Standard deviation floor for advantage normalization
