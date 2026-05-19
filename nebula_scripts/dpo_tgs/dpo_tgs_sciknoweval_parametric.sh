@@ -108,26 +108,17 @@ else
     export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
     echo "[PYTHONPATH] Using pwd: $(pwd)"
 fi
-# vLLM v1 + FLASH_ATTN 后端在 DPO-TGS chain rollout (per-sample async generate)
-# 工作负载下踩了已知 metadata buffer size 不匹配 bug:
-#   "CUDA error: invalid argument at flash_attn.py:498 self.scheduler_metadata[:n] = ..."
+# 关键认知 (经 14+ attempts 才定位真因):
+#   GRPO baseline 用 vLLM v1 + FLASH_ATTN 后端**完全跑通**(intervention_credit /
+#   prior_shift 历史已验证)。bug 不在 backend,而在 DPO-TGS chain rollout 的
+#   `_student_continue_async` 用 `server_manager.generate` per-sample asyncio.gather
+#   并发调用模式 —— 这触发了 v1 flash_attn 的 scheduler_metadata[:n] buffer bug。
 #
-# ⚠ 关键认知 (经过 14 次 attempt 后才发现):
-#   verl 的 vllm_async_server.py:42 **直接 import vllm.v1.engine.async_llm.AsyncLLM**,
-#   DPO-TGS chain rollout (server_manager.generate) 走这条路径,硬编码 v1,
-#   设 VLLM_USE_V1=0 没用 (verl 不看这个 env)。
-#
-# v1 支持的 attention backend 只有: FLASH_ATTN (bug)、FLASHINFER、MLA。
-# 修复路径: 用 FLASHINFER 替代 FLASH_ATTN —— 完全不同的代码路径,绕开 flash_attn.py:498。
-#
-# 注意: FLASHINFER 必须装在 sdpo_env 里 (pip install flashinfer-python)。如果没装,vLLM
-# 会 fallback 到 FLASH_ATTN 并继续踩 bug → 这种情况要么装 flashinfer 要么换方案。
-#
-# 用户 ablation: 强制 FLASH_ATTN: VLLM_ATTENTION_BACKEND=FLASH_ATTN
-unset VLLM_USE_V1                              # verl 强制 v1, 这个 env 没意义
-export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASHINFER}"
+# 真正的修法在 verl/trainer/ppo/bayesian_credit/tcca_chain.py:_student_continue_async,
+# 改成跟 GRPO 一样走 `generate_sequences` 批量 API。这里 backend 保持跟 GRPO 一致即可。
+unset VLLM_USE_V1                              # verl 强制 v1, 这个 env 无意义
+unset VLLM_ATTENTION_BACKEND                   # 跟 GRPO 一致 (默认 FLASH_ATTN)
 export VLLM_LOGGING_LEVEL=WARN
-echo "[env] VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND} (v1 硬编码 by verl async server)"
 export WANDB_MODE=offline
 export WANDB_ENTITY=oh-my-team
 export SWANLAB_MODE=cloud
