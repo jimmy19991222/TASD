@@ -1198,9 +1198,18 @@ def compute_self_distillation_loss(
         # 添加小常数防止除零
         fisher_metric = fisher_metric + 1e-5
         
-        # 流形权重：F^{-1} 的近似，带截断保护防止梯度爆炸
-        clip_max = getattr(self_distillation_config, "geodesic_clip_max", 10.0)
-        manifold_weight = torch.clamp(1.0 / fisher_metric, max=clip_max)
+        # 基础流形权重：F^{-1} 的近似
+        raw_manifold_weight = 1.0 / fisher_metric
+        
+        # Trust Region / Geometric Huber-style clipping
+        # 相比硬截断 (clamp)，对数缩放更平滑地处理极端权重
+        # 保留梯度方向向量，只缩放幅度（符合微分几何精神）
+        trust_region_scale = getattr(self_distillation_config, "geodesic_trust_region", 5.0)
+        manifold_weight = torch.where(
+            raw_manifold_weight > trust_region_scale,
+            trust_region_scale + torch.log(raw_manifold_weight - trust_region_scale + 1.0),
+            raw_manifold_weight
+        )
         
         # 外部缩放：重塑梯度流而不改变最优点
         per_token_loss = per_token_loss * manifold_weight
@@ -1209,6 +1218,7 @@ def compute_self_distillation_loss(
         metrics["actor/geodesic_mean_weight"] = manifold_weight.mean().detach().item()
         metrics["actor/geodesic_max_weight"] = manifold_weight.max().detach().item()
         metrics["actor/geodesic_min_weight"] = manifold_weight.min().detach().item()
+        metrics["actor/geodesic_trust_region_scale"] = trust_region_scale
 
     loss = agg_loss(
         loss_mat=per_token_loss,
