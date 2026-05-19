@@ -148,6 +148,26 @@ for dataset in "${DATASETS[@]}"; do
             --geodesic_beta_scale=${GEODESIC_BETA_SCALE} \
             --project_name=${PROJECT_NAME}"
         
+        # 构建 ENV_PARAMS（所有业务参数通过 --env 传递）
+        ENV_PARAMS="--env=PROJECT_NAME=${PROJECT_NAME} \
+            --env=JOB_NAME=${JOB_NAME} \
+            --env=DATASET=${dataset} \
+            --env=SEED=${SEED} \
+            --env=LOSS_MODE=${loss_mode} \
+            --env=USE_VCE=${use_vce} \
+            --env=USE_GEODESIC=${use_geodesic} \
+            --env=LR=${LR} \
+            --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} \
+            --env=ROLLOUT_N=${ROLLOUT_N} \
+            --env=MODEL_NAME=${MODEL_NAME} \
+            --env=ALPHA=${ALPHA} \
+            --env=DISTILL_TOPK=${DISTILL_TOPK} \
+            --env=DONT_REPROMPT_ON_SELF_SUCCESS=${DONT_REPROMPT_ON_SELF_SUCCESS} \
+            --env=CLIP_VALUE=${CLIP_VALUE} \
+            --env=ADV_STD_FLOOR=${ADV_STD_FLOOR} \
+            --env=GEODESIC_TRUST_REGION=${GEODESIC_TRUST_REGION} \
+            --env=GEODESIC_BETA_SCALE=${GEODESIC_BETA_SCALE}"
+        
         # 构建 nebulactl 命令（标准化格式）
         if [ "$DRY_RUN" = true ]; then
             echo "[DRY RUN] 将执行:"
@@ -159,7 +179,7 @@ for dataset in "${DATASETS[@]}"; do
                 --engine=xdl \
                 --queue=$QUEUE \
                 --entry=nebula_scripts/entry.py \
-                --user_params="--script_path=${SCRIPT_PATH} --world_size=${WORLD_SIZE} --job_name=${JOB_NAME} ${USER_PARAMS}" \
+                --user_params="--script_path=${SCRIPT_PATH} --world_size=${WORLD_SIZE} --job_name=${JOB_NAME} ${ENV_PARAMS}" \
                 --worker_count=$WORLD_SIZE \
                 --file.cluster_file=$CLUSTER_FILE \
                 --job_name=$JOB_NAME \
@@ -171,6 +191,10 @@ for dataset in "${DATASETS[@]}"; do
                 --env=SWANLAB_API_KEY=${SWANLAB_API_KEY:-M5oC00EEt8G1wC0XaHkal} \
                 --custom_docker_image=$CUSTOM_DOCKER_IMAGE \
                 --requirements_file_name=requirements_nebula.txt \
+                --oss_access_id=$OSS_ACCESS_ID \
+                --oss_access_key=$OSS_ACCESS_KEY \
+                --oss_bucket=$OSS_BUCKET \
+                --oss_endpoint=$OSS_ENDPOINT \
                 2>&1)
             SUBMIT_EXIT=$?
             echo "$SUBMIT_OUTPUT"

@@ -130,27 +130,28 @@ for dataset in "${DATASETS[@]}"; do
         echo "   模式: loss_mode=$loss_mode, full_logit=$full_logit, use_geodesic=$use_geodesic"
         echo "   Seed: $SEED"
         
-        # 构建 USER_PARAMS（所有训练超参）
-        USER_PARAMS="--dataset=${dataset} \
-            --seed=${SEED} \
-            --loss_mode=${loss_mode} \
-            --use_vce=${use_vce} \
-            --use_geodesic=${use_geodesic} \
-            --full_logit_distillation=${full_logit_distillation} \
-            --lr=${LR} \
-            --train_batch_size=${TRAIN_BATCH_SIZE} \
-            --rollout_n=${ROLLOUT_N} \
-            --model_name=${MODEL_NAME} \
-            --alpha=${ALPHA} \
-            --distill_topk=${DISTILL_TOPK} \
-            --dont_reprompt_on_self_success=${DONT_REPROMPT_ON_SELF_SUCCESS} \
-            --clip_value=${CLIP_VALUE} \
-            --adv_std_floor=${ADV_STD_FLOOR} \
-            --geodesic_trust_region=${GEODESIC_TRUST_REGION} \
-            --geodesic_beta_scale=${GEODESIC_BETA_SCALE} \
-            --project_name=${PROJECT_NAME}"
+        # 构建 ENV_PARAMS（所有业务参数通过 --env 传递，参考 reference_submit.sh）
+        ENV_PARAMS="--env=PROJECT_NAME=${PROJECT_NAME} \
+            --env=JOB_NAME=${JOB_NAME} \
+            --env=DATASET=${dataset} \
+            --env=SEED=${SEED} \
+            --env=LOSS_MODE=${loss_mode} \
+            --env=USE_VCE=${use_vce} \
+            --env=USE_GEODESIC=${use_geodesic} \
+            --env=FULL_LOGIT_DISTILLATION=${full_logit_distillation} \
+            --env=LR=${LR} \
+            --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} \
+            --env=ROLLOUT_N=${ROLLOUT_N} \
+            --env=MODEL_NAME=${MODEL_NAME} \
+            --env=ALPHA=${ALPHA} \
+            --env=DISTILL_TOPK=${DISTILL_TOPK} \
+            --env=DONT_REPROMPT_ON_SELF_SUCCESS=${DONT_REPROMPT_ON_SELF_SUCCESS} \
+            --env=CLIP_VALUE=${CLIP_VALUE} \
+            --env=ADV_STD_FLOOR=${ADV_STD_FLOOR} \
+            --env=GEODESIC_TRUST_REGION=${GEODESIC_TRUST_REGION} \
+            --env=GEODESIC_BETA_SCALE=${GEODESIC_BETA_SCALE}"
         
-        # 构建 nebulactl 命令（标准化格式）
+        # 构建 nebulactl 命令（标准化格式，参考 reference_submit.sh）
         if [ "$DRY_RUN" = true ]; then
             echo "[DRY RUN] 将执行:"
             echo "nebulactl run mdl --force --engine=xdl --queue=$QUEUE ..."
@@ -161,18 +162,18 @@ for dataset in "${DATASETS[@]}"; do
                 --engine=xdl \
                 --queue=$QUEUE \
                 --entry=nebula_scripts/entry.py \
-                --user_params="--script_path=${SCRIPT_PATH} --world_size=${WORLD_SIZE} --job_name=${JOB_NAME} ${USER_PARAMS}" \
+                --user_params="--script_path=${SCRIPT_PATH} --world_size=${WORLD_SIZE} --job_name=${JOB_NAME} ${ENV_PARAMS}" \
                 --worker_count=$WORLD_SIZE \
                 --file.cluster_file=$CLUSTER_FILE \
                 --job_name=$JOB_NAME \
                 --env=OPENLM_TOKEN=$OPENLM_TOKEN \
-                --env=OSS_ACCESS_ID=$OSS_ACCESS_ID \
-                --env=OSS_ACCESS_KEY=$OSS_ACCESS_KEY \
-                --env=OSS_ENDPOINT=$OSS_ENDPOINT \
-                --env=OSS_BUCKET=$OSS_BUCKET \
                 --env=SWANLAB_API_KEY=${SWANLAB_API_KEY:-M5oC00EEt8G1wC0XaHkal} \
                 --custom_docker_image=$CUSTOM_DOCKER_IMAGE \
                 --requirements_file_name=requirements_nebula.txt \
+                --oss_access_id=$OSS_ACCESS_ID \
+                --oss_access_key=$OSS_ACCESS_KEY \
+                --oss_bucket=$OSS_BUCKET \
+                --oss_endpoint=$OSS_ENDPOINT \
                 2>&1)
             SUBMIT_EXIT=$?
             echo "$SUBMIT_OUTPUT"
