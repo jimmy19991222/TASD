@@ -24,6 +24,10 @@ CONFIG_NAME="sdpo"
 OSS_ROOT="/data/oss_bucket_0/ad/loujieming.ljm"
 DATA_PATH="${OSS_ROOT}/datasets/sciknoweval/biology"
 
+# 直接指定 parquet 文件路径（避免 user.yaml 中的路径拼接问题）
+TRAIN_FILE="${DATA_PATH}/train.parquet"
+VAL_FILE="${DATA_PATH}/test.parquet"
+
 # Smoke Test 超参（极简配置，快速验证）
 TRAIN_BATCH_SIZE=8          # 减小 batch size 适配单卡
 ROLLOUT_BATCH_SIZE=2        # 减少 rollout 数量
@@ -75,7 +79,9 @@ MODEL_NAME=$(echo "$MODEL_PATH" | tr '/' '-')
 EXP_NAME="LOCAL-GEODESIC-SMOKE-train${TRAIN_BATCH_SIZE}-rollout${ROLLOUT_BATCH_SIZE}-steps${MAX_STEPS}-seed${SEED}-${MODEL_NAME}-${SUFFIX}"
 
 # 构建 Hydra 参数
-ARGS="data.train_batch_size=$TRAIN_BATCH_SIZE \
+ARGS="data.train_files=['${TRAIN_FILE}'] \
+data.val_files=['${VAL_FILE}'] \
+data.train_batch_size=$TRAIN_BATCH_SIZE \
 trainer.group_name=Geodesic-SmokeTest \
 trainer.total_training_steps=$MAX_STEPS \
 trainer.save_freq=-1 \
