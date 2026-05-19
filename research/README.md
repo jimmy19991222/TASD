@@ -17,7 +17,7 @@
 | 4 | [03_theory_anchor.md](03_theory_anchor.md) | 10 min | **5 篇理论锚点**摘要 + 7 设计原则 (OAIF + OFS-DPO + Samplers + RPO + Meta) |
 | 5 | [04_experiments.md](04_experiments.md) | 10 min | **实验状态**: 已提交 4 nebula tasks + 待跑 + baseline 数据 + 风险 |
 | ref | [submission_guide.md](submission_guide.md) | 5 min | nebula 提交流程 |
-| ref | [`OPD_Deep_Analysis.html`](file:///Users/ljm/lazada/papers/raw/opd_papers/OPD_Deep_Analysis.html) | 30 min | OPD 综述 + 5 篇 Online DPO 论文深度分析 (本地 obsidian wiki) |
+| ref | [`OPD_Deep_Analysis.html`](OPD_Deep_Analysis.html) | 30 min | OPD 综述 + 5 篇 Online DPO 论文深度分析 (随 repo 提供,在浏览器打开) |
 
 ---
 

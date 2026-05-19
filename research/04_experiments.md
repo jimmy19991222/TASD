@@ -337,4 +337,4 @@ ce3db1a  feat(dpo_tgs): On-Policy DPO + Teacher-Guided Sampling V2 (adaptive rol
 | **Nebula parametric** | `nebula_scripts/dpo_tgs/dpo_tgs_sciknoweval_parametric.sh` |
 | **Local 4-GPU smoke** | `run_notebook_dpo_tgs.sh` |
 | **设计文档 (本文档目录)** | `research/{README, 01_evolution, 02_dpo_tgs_design, 03_theory_anchor, 04_experiments}.md` |
-| **理论锚点完整版** | `papers/raw/opd_papers/OPD_Deep_Analysis.html` |
+| **理论锚点完整版** | `research/OPD_Deep_Analysis.html` |

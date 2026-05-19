@@ -1,6 +1,6 @@
 # 03 — 理论锚点: 5 篇 Online DPO 论文 + 7 设计原则
 
-> 完整深度分析见 [`OPD_Deep_Analysis.html`](file:///Users/ljm/lazada/papers/raw/opd_papers/OPD_Deep_Analysis.html) "Online DPO 理论锚点" 章节 (本地 obsidian wiki)。本文是**精简本**便于快速参考。
+> 完整深度分析见 [`OPD_Deep_Analysis.html`](OPD_Deep_Analysis.html) "Online DPO 理论锚点" 章节 (本 repo 内,2607 行)。本文是**精简本**便于快速参考。
 
 ---
 
