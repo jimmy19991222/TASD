@@ -107,6 +107,7 @@ class AdvantageEstimator(str, Enum):
     GRPO_VECTORIZED = "grpo_vectorized"
     OPTIMAL_TOKEN_BASELINE = "optimal_token_baseline"
     TIR_OPTIMAL_TOKEN_BASELINE = "tir_optimal_token_baseline"
+    SELF_TEACHER = "self_teacher"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -325,6 +326,96 @@ def compute_grpo_outcome_advantage(
                 scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
             else:
                 scores[i] = scores[i] - id2mean[index[i]]
+
+        scores = scores.unsqueeze(-1) * response_mask
+
+    return scores, scores
+
+
+@register_adv_est(AdvantageEstimator.SELF_TEACHER)  # or simply: @register_adv_est("self_teacher")
+def compute_self_teacher_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute advantage for Self-Teacher mode.
+    
+    This is a GRPO-based advantage estimator with optional V_CE baseline and
+    log_pi_s support for self-distillation scenarios.
+    
+    Args:
+        token_level_rewards: `(torch.Tensor)`
+            shape is (bs, response_length)
+        response_mask: `(torch.Tensor)`
+            shape is (bs, response_length)
+        index: `(np.ndarray)`
+            index array for grouping
+        epsilon: `(float)`
+            small value to avoid division by zero
+        norm_adv_by_std_in_grpo: `(bool)`
+            whether to scale the advantage by std
+        config: `(Optional[AlgoConfig])`
+            algorithm configuration object with optional self_teacher settings:
+            - use_vce: (bool) Whether to use V_CE baseline
+            - use_log_pi_s: (bool) Whether to use log pi_s
+            - clip_value: (float) Advantage clip threshold
+            - adv_std_floor: (float) Standard deviation floor
+    
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape is (bs, response_length)
+        returns: `(torch.Tensor)`
+            shape is (bs, response_length)
+    """
+    scores = token_level_rewards.sum(dim=-1)
+
+    id2score = defaultdict(list)
+    id2mean = {}
+    id2std = {}
+
+    # Parse self_teacher config
+    use_vce = False
+    use_log_pi_s = False
+    clip_value = None
+    adv_std_floor = 0.0
+    
+    if config is not None:
+        use_vce = config.get("use_vce", False)
+        use_log_pi_s = config.get("use_log_pi_s", False)
+        clip_value = config.get("clip_value", None)
+        adv_std_floor = config.get("adv_std_floor", 0.0)
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            id2score[index[i]].append(scores[i])
+        for idx in id2score:
+            if len(id2score[idx]) == 1:
+                id2mean[idx] = torch.tensor(0.0)
+                id2std[idx] = torch.tensor(1.0)
+            elif len(id2score[idx]) > 1:
+                scores_tensor = torch.stack(id2score[idx])
+                id2mean[idx] = torch.mean(scores_tensor)
+                id2std[idx] = torch.std(scores_tensor)
+            else:
+                raise ValueError(f"no score in prompt index: {idx}")
+        
+        for i in range(bsz):
+            # Compute raw advantage
+            if norm_adv_by_std_in_grpo:
+                std_with_floor = max(id2std[index[i]], adv_std_floor)
+                scores[i] = (scores[i] - id2mean[index[i]]) / (std_with_floor + epsilon)
+            else:
+                scores[i] = scores[i] - id2mean[index[i]]
+            
+            # Apply clipping if configured
+            if clip_value is not None:
+                scores[i] = torch.clamp(scores[i], -clip_value, clip_value)
 
         scores = scores.unsqueeze(-1) * response_mask
 
