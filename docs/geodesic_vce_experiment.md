@@ -191,8 +191,41 @@ geodesic_beta_scale: 0.5  # β 缩放因子
 | `actor/adv_std` | Advantage 标准差 | B: 趋近 0, C: 健康水平 |
 | `actor/geodesic_mean_weight` | 平均流形权重 | C, D: 动态变化 |
 | `actor/geodesic_max_weight` | 最大流形权重 | C, D: 反映极端 low-entropy token |
+| `actor/geodesic_std_weight` | 流形权重标准差 | C, D: 反映权重分布的多样性 |
 | `val/accuracy` | 验证集准确率 | 对比最终性能 |
 | `actor/loss` | 训练损失 | 对比收敛速度 |
+
+### Phase 2 诊断指标（为动态路由做准备）
+
+**这些指标用于验证 SRPO 和 Rethinking OPD 的发现，为 Phase 2 的动态路由设计提供数据支撑。**
+
+#### 1. 置信度分布分析（验证 SRPO 的 Optimization Ambiguity）
+
+| 指标 | 含义 | 科学问题 |
+|------|------|----------|
+| `actor/geodesic_high_conf_mean_weight` | 高置信度 token (p>0.9) 的平均权重 | 高置信度 token 是否应该降权？ |
+| `actor/geodesic_high_conf_ratio` | 高置信度 token 的比例 | 模型是否过度自信？ |
+| `actor/geodesic_low_conf_mean_weight` | 低置信度 token (p<0.1) 的平均权重 | 低置信度 token 是否获得更大更新？ |
+| `actor/geodesic_mid_conf_mean_weight` | 中等置信度 token 的平均权重 | 中等置信度 token 的权重分布 |
+
+**预期发现：**
+- 如果 `high_conf_mean_weight` 显著高于 `mid_conf_mean_weight`，说明高置信度 token 仍在被过度优化
+- 这验证了 SRPO 的发现："在已经正确的样本上蒸馏是有害的"
+- **Phase 2 行动：** 引入置信度门控，当 p > 0.9 时降低 manifold weight
+
+#### 2. 位置敏感性分析（验证 Rethinking OPD 的 Suffix 坍缩）
+
+| 指标 | 含义 | 科学问题 |
+|------|------|----------|
+| `actor/geodesic_prefix_weight` | Prefix (前 30%) 的平均权重 | 开头部分的流形约束强度 |
+| `actor/geodesic_middle_weight` | Middle (中间 40%) 的平均权重 | 中间部分的流形约束强度 |
+| `actor/geodesic_suffix_weight` | Suffix (后 30%) 的平均权重 | 结尾部分的流形约束强度 |
+| `actor/geodesic_suffix_prefix_ratio` | Suffix/Prefix 权重比 | 结尾是否比开头更容易坍缩？ |
+
+**预期发现：**
+- 如果 `suffix_weight` > `prefix_weight`（即 ratio > 1），说明 Suffix 区域的 Fisher 度量更小
+- 这验证了 Rethinking OPD 的发现："坍缩是从 Suffix 开始的"
+- **Phase 2 行动：** 引入位置敏感性，在 Suffix 区域增大 trust_region_scale
 
 ### 辅助诊断
 
@@ -430,10 +463,92 @@ w_clipped = τ + log(w - τ + 1)  if w > τ
 
 ## 📅 时间线
 
-- **2026-05-19:** 创建 `geodesic-sdpo` 分支，实现 Geodesic 约束
+- **2026-05-19:** 创建 `geodesic-sdpo-v2` 分支，实现 Geodesic 约束
 - **2026-05-19:** 设计 4 组消融实验，提交到 Nebula
+- **2026-05-19:** 添加详细统计日志（置信度分布、位置敏感性）
 - **2026-05-20:** 预期实验完成，开始分析结果
-- **2026-05-21:** 根据结果调整超参（trust_region, beta_scale）
+- **2026-05-21:** 根据 Phase 1 结果设计 Phase 2 动态路由实验
+
+---
+
+## 🔮 Phase 2 规划：动态路由与位置敏感性
+
+**基于 Phase 1 的实验结果和新论文（SRPO, Rethinking OPD）的洞察，Phase 2 将引入以下改进：**
+
+### 1. 置信度门控（Confidence Gating）
+
+**动机：** SRPO 发现"在已经正确的样本上蒸馏是有害的"（Optimization Ambiguity）
+
+**设计：**
+```python
+# Phase 1: 全局应用（当前）
+manifold_weight = 1.0 / fisher_metric
+
+# Phase 2: 条件应用（待实现）
+if p_student > 0.9:  # 高置信度且正确
+    manifold_weight = 0.0  # 跳过优化
+elif p_student < 0.1:  # 低置信度
+    manifold_weight = 1.0 / fisher_metric  # 强化更新
+else:
+    manifold_weight = 0.5 / fisher_metric  # 温和更新
+```
+
+**验证指标：**
+- `actor/geodesic_high_conf_mean_weight`（Phase 1 数据）
+- 如果该指标显著高于 mid_conf，说明需要引入门控
+
+---
+
+### 2. 位置敏感性（Position Sensitivity）
+
+**动机：** Rethinking OPD 发现"坍缩是从 Suffix 开始的"
+
+**设计：**
+```python
+# Phase 1: 全局 trust_region（当前）
+trust_region_scale = 5.0
+
+# Phase 2: 位置自适应 trust_region（待实现）
+seq_len = manifold_weight.shape[-1]
+position_ratio = torch.linspace(0, 1, seq_len, device=manifold_weight.device)
+# Suffix 区域（后 30%）增大 trust_region，约束更严格
+trust_region_scale = 5.0 * (1.0 + 2.0 * (position_ratio > 0.7).float())
+```
+
+**验证指标：**
+- `actor/geodesic_suffix_prefix_ratio`（Phase 1 数据）
+- 如果 ratio > 1，说明 Suffix 区域需要更强约束
+
+---
+
+### 3. 动态路由（Dynamic Routing: GRPO + Geodesic SDPO）
+
+**动机：** 结合 SRPO 的 Sample Routing 思想
+
+**设计：**
+```python
+# 高 Reward 样本：使用 GRPO advantage
+if reward > threshold:
+    loss = compute_grpo_loss(advantages, log_prob)
+# 低 Reward 样本：使用 Geodesic SDPO
+else:
+    loss = compute_geodesic_sdpo_loss(...)
+```
+
+**验证指标：**
+- 对比实验 D（SDPO+Geodesic）和新实验 E（Dynamic Routing）
+- 如果 E 的性能显著优于 D，说明动态路由有效
+
+---
+
+### Phase 2 实验矩阵（待设计）
+
+| 实验 | 新增特性 | 验证目标 |
+|------|----------|----------|
+| E | 置信度门控（p > 0.9 时降权） | SRPO 的 Optimization Ambiguity |
+| F | 位置敏感性（Suffix 区域增强约束） | Rethinking OPD 的 Suffix 坍缩 |
+| G | 动态路由（GRPO + Geodesic SDPO） | 混合优化策略 |
+| H | 全量融合（门控 + 位置 + 路由） | 统一框架 |
 
 ---
 
