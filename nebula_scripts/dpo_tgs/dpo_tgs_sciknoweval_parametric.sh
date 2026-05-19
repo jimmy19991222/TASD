@@ -108,25 +108,26 @@ else
     export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
     echo "[PYTHONPATH] Using pwd: $(pwd)"
 fi
-# vLLM v1 + flash_attn 后端在 DPO-TGS chain rollout (per-sample async generate)
+# vLLM v1 + FLASH_ATTN 后端在 DPO-TGS chain rollout (per-sample async generate)
 # 工作负载下踩了已知 metadata buffer size 不匹配 bug:
 #   "CUDA error: invalid argument at flash_attn.py:498 self.scheduler_metadata[:n] = ..."
 #
-# 关键: VLLM v1 不支持 XFORMERS 后端 (只支持 FLASH_ATTN / FLASHINFER / MLA)。所以
-# 即使设 VLLM_ATTENTION_BACKEND=XFORMERS,v1 会忽略并仍用 flash_attn → 同一个 bug。
-# 真正修复必须 VLLM_USE_V1=0 走 v0,v0 支持 XFORMERS 才能 bypass flash_attn 路径。
+# ⚠ 关键认知 (经过 14 次 attempt 后才发现):
+#   verl 的 vllm_async_server.py:42 **直接 import vllm.v1.engine.async_llm.AsyncLLM**,
+#   DPO-TGS chain rollout (server_manager.generate) 走这条路径,硬编码 v1,
+#   设 VLLM_USE_V1=0 没用 (verl 不看这个 env)。
 #
-# d748fc6 后 VLLM_USE_V1 已在 verl runtime_env propagate whitelist 里,这里设的会真
-# 到 ray worker。vLLM 在 envs.py 读 `bool(int(os.getenv("VLLM_USE_V1","1")))`,"0"
-# → bool(int("0")) → False,所以 "0" 是被正确识别为 disable v1。
+# v1 支持的 attention backend 只有: FLASH_ATTN (bug)、FLASHINFER、MLA。
+# 修复路径: 用 FLASHINFER 替代 FLASH_ATTN —— 完全不同的代码路径,绕开 flash_attn.py:498。
 #
-# 用户可通过 env 强制 v1 + flash_attn 做 ablation:
-#   VLLM_USE_V1=1 VLLM_ATTENTION_BACKEND=FLASH_ATTN ...
-export VLLM_USE_V1="${VLLM_USE_V1:-0}"
-export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-XFORMERS}"
+# 注意: FLASHINFER 必须装在 sdpo_env 里 (pip install flashinfer-python)。如果没装,vLLM
+# 会 fallback 到 FLASH_ATTN 并继续踩 bug → 这种情况要么装 flashinfer 要么换方案。
+#
+# 用户 ablation: 强制 FLASH_ATTN: VLLM_ATTENTION_BACKEND=FLASH_ATTN
+unset VLLM_USE_V1                              # verl 强制 v1, 这个 env 没意义
+export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASHINFER}"
 export VLLM_LOGGING_LEVEL=WARN
-# Verbose env confirmation (帮助诊断 env 是否真传到 worker)
-echo "[env] VLLM_USE_V1=${VLLM_USE_V1} VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND}"
+echo "[env] VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND} (v1 硬编码 by verl async server)"
 export WANDB_MODE=offline
 export WANDB_ENTITY=oh-my-team
 export SWANLAB_MODE=cloud
