@@ -70,14 +70,19 @@ case "${MODE}" in
         DEFAULT_USE_TEACHER_ANCHORED_REF=False
         DEFAULT_DELTA_R_WEIGHT_MODE=none
         DEFAULT_N_GPUS_PER_NODE=1
-        # 1-GPU 时 FSDP shard size = world (无分片), Qwen3-8B bf16 params (16GB) +
-        # AdamW fp32 optimizer state (32GB) ≈ 48GB,vLLM 只能拿剩下 ~30GB / 80GB ≈ 0.30。
-        # 0.65 是 4-GPU 假设 (actor 分 4 片) 的值,单卡必须降。
-        DEFAULT_GPU_MEM_UTIL=0.30
-        # tiny 是 plumbing 验证,不在乎吞吐。打开 optimizer_offload 把 32GB AdamW 推到
-        # CPU,GPU 给 vLLM 留更多空间。Nebula / smoke 4-GPU 不需要,只 tiny 模式打开。
+        # 1-GPU A100 80GB 内存预算 (实测 step 0 OOM at 78.77 GB used):
+        #   vLLM v1 reserve (mem_util=0.20 → 16 GB,带 KV cache 增长可到 ~24 GB)
+        # + Qwen3-8B bf16 params 16 GB (offload_param=True 推 CPU,但 forward 时仍 stream-in)
+        # + AdamW fp32 optimizer 32 GB (offload_optimizer=True 推 CPU,但 step 时上 GPU)
+        # + activations / grads (chain rollout + n_attempts=1, ~10-15 GB)
+        # 必须把 mem_util 压到 0.20,且 ENABLE param_offload + 用 expandable_segments
+        DEFAULT_GPU_MEM_UTIL=0.20
+        # FSDP offloads (1-GPU 必开,Nebula 4-GPU 不需要)
         export FSDP_OPTIMIZER_OFFLOAD="${FSDP_OPTIMIZER_OFFLOAD:-True}"
-        export FSDP_PARAM_OFFLOAD="${FSDP_PARAM_OFFLOAD:-False}"
+        export FSDP_PARAM_OFFLOAD="${FSDP_PARAM_OFFLOAD:-True}"      # 改 True (从 False)
+        # 关键: PyTorch 内存分配器 expandable_segments 减少 fragmentation,让 step 0 不 OOM
+        export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
+        export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
         # async rollout 默认 num_workers=8; tiny 的 effective batch = bs(2) * n_init(2) = 4
         # 个 prompt, 要 chunk 给 8 个 worker 会触发 "size 4 % 8 != 0" assert. 单卡只用 1 个
         # worker 即可。smoke / innov / full (bs ≥ 4) 用默认 8 不会卡。

@@ -34,6 +34,22 @@ PPO_RAY_RUNTIME_ENV = {
     },
 }
 
+# DPO-TGS chain rollout triggered a vLLM v1 + flash_attn metadata bug
+# ("CUDA error: invalid argument at flash_attn.py:498 self.scheduler_metadata[:n] = ...").
+# These env vars MUST be propagated to ray workers (vLLM/torch read them inside the worker
+# process), not just set in the launch shell. Listed here so they reach the worker via
+# ray runtime_env when set on the launcher side.
+_DPO_TGS_PROPAGATE_VARS = [
+    "VLLM_USE_V1",
+    "VLLM_ATTENTION_BACKEND",
+    "PYTORCH_ALLOC_CONF",
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "VLLM_FLASH_ATTN_VERSION",
+    "FSDP_OPTIMIZER_OFFLOAD",
+    "FSDP_PARAM_OFFLOAD",
+    "ROLLOUT_AGENT_NUM_WORKERS",
+]
+
 
 def get_ppo_ray_runtime_env():
     """
@@ -51,4 +67,12 @@ def get_ppo_ray_runtime_env():
     for key in list(runtime_env["env_vars"].keys()):
         if os.environ.get(key) is not None:
             runtime_env["env_vars"].pop(key, None)
+
+    # Propagate DPO-TGS-relevant env vars set on the launcher to ray workers.
+    # The defaults above only get added if the launcher hasn't set them; for these
+    # variables we want the opposite: only propagate if launcher HAS set them.
+    for key in _DPO_TGS_PROPAGATE_VARS:
+        val = os.environ.get(key)
+        if val is not None:
+            runtime_env["env_vars"][key] = val
     return runtime_env
