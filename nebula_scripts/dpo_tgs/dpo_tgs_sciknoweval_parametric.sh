@@ -108,8 +108,12 @@ else
     export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
     echo "[PYTHONPATH] Using pwd: $(pwd)"
 fi
+# vLLM v1 + flash_attn 后端在 DPO-TGS chain rollout (per-sample async generate)
+# 工作负载下踩了已知 metadata buffer size 不匹配 bug:
+#   "CUDA error: invalid argument at flash_attn.py:498 self.scheduler_metadata[:n] = ..."
+# DPO-TGS 默认 v0 (稳),用户可通过 env 强制 v1 做 ablation: VLLM_USE_V1=1
 unset VLLM_ATTENTION_BACKEND
-export VLLM_USE_V1=1
+export VLLM_USE_V1="${VLLM_USE_V1:-0}"
 export VLLM_LOGGING_LEVEL=WARN
 export WANDB_MODE=offline
 export WANDB_ENTITY=oh-my-team
