@@ -129,54 +129,57 @@ for dataset in "${DATASETS[@]}"; do
         echo "   模式: loss_mode=$loss_mode, use_vce=$use_vce, use_geodesic=$use_geodesic"
         echo "   Seed: $SEED"
         
-        # 构建 nebulactl 命令
-        CMD="nebulactl run mdl \
-            --engine=xdl \
-            --entry=nebula_scripts/entry.py \
-            --file.cluster_file=$CLUSTER_FILE \
-            --queue=$QUEUE \
-            --name=$TASK_NAME \
-            --world_size=$WORLD_SIZE \
-            --resource_type=GU20 \
-            --image=$CUSTOM_DOCKER_IMAGE \
-            --user_params \"
-                openlm_token=$OPENLM_TOKEN \
-                oss_access_id=$OSS_ACCESS_ID \
-                oss_access_key=$OSS_ACCESS_KEY \
-                oss_endpoint=$OSS_ENDPOINT \
-                oss_bucket=$OSS_BUCKET \
-                script_path=$SCRIPT_PATH \
-                dataset=$dataset \
-                seed=$SEED \
-                loss_mode=$loss_mode \
-                use_vce=$use_vce \
-                use_geodesic=$use_geodesic \
-                lr=$LR \
-                train_batch_size=$TRAIN_BATCH_SIZE \
-                rollout_n=$ROLLOUT_N \
-                model_name=$MODEL_NAME \
-                alpha=$ALPHA \
-                distill_topk=$DISTILL_TOPK \
-                dont_reprompt_on_self_success=$DONT_REPROMPT_ON_SELF_SUCCESS \
-                clip_value=$CLIP_VALUE \
-                adv_std_floor=$ADV_STD_FLOOR \
-                geodesic_trust_region=$GEODESIC_TRUST_REGION \
-                geodesic_beta_scale=$GEODESIC_BETA_SCALE \
-                job_name=$JOB_NAME \
-                project_name=$PROJECT_NAME
-            \""
+        # 构建 USER_PARAMS（所有训练超参）
+        USER_PARAMS="--dataset=${dataset} \
+            --seed=${SEED} \
+            --loss_mode=${loss_mode} \
+            --use_vce=${use_vce} \
+            --use_geodesic=${use_geodesic} \
+            --lr=${LR} \
+            --train_batch_size=${TRAIN_BATCH_SIZE} \
+            --rollout_n=${ROLLOUT_N} \
+            --model_name=${MODEL_NAME} \
+            --alpha=${ALPHA} \
+            --distill_topk=${DISTILL_TOPK} \
+            --dont_reprompt_on_self_success=${DONT_REPROMPT_ON_SELF_SUCCESS} \
+            --clip_value=${CLIP_VALUE} \
+            --adv_std_floor=${ADV_STD_FLOOR} \
+            --geodesic_trust_region=${GEODESIC_TRUST_REGION} \
+            --geodesic_beta_scale=${GEODESIC_BETA_SCALE} \
+            --project_name=${PROJECT_NAME}"
         
+        # 构建 nebulactl 命令（标准化格式）
         if [ "$DRY_RUN" = true ]; then
-            echo "🔍 [Dry-run] 命令:"
-            echo "$CMD"
-            echo ""
+            echo "[DRY RUN] 将执行:"
+            echo "nebulactl run mdl --force --engine=xdl --queue=$QUEUE ..."
         else
             echo "🚀 提交中..."
-            eval $CMD
-            echo "✅ 提交完成: $TASK_NAME"
-            echo ""
-            # 避免过快提交
-            sleep 3
+            SUBMIT_OUTPUT=$(nebulactl run mdl \
+                --force \
+                --engine=xdl \
+                --queue=$QUEUE \
+                --entry=nebula_scripts/entry.py \
+                --user_params="--script_path=${SCRIPT_PATH} --world_size=${WORLD_SIZE} --job_name=${JOB_NAME} ${USER_PARAMS}" \
+                --worker_count=$WORLD_SIZE \
+                --file.cluster_file=$CLUSTER_FILE \
+                --job_name=$JOB_NAME \
+                --env=OPENLM_TOKEN=$OPENLM_TOKEN \
+                --env=OSS_ACCESS_ID=$OSS_ACCESS_ID \
+                --env=OSS_ACCESS_KEY=$OSS_ACCESS_KEY \
+                --env=OSS_ENDPOINT=$OSS_ENDPOINT \
+                --env=OSS_BUCKET=$OSS_BUCKET \
+                --env=SWANLAB_API_KEY=${SWANLAB_API_KEY:-M5oC00EEt8G1wC0XaHkal} \
+                --custom_docker_image=$CUSTOM_DOCKER_IMAGE \
+                --requirements_file_name=requirements_nebula.txt \
+                2>&1)
+            SUBMIT_EXIT=$?
+            echo "$SUBMIT_OUTPUT"
+            if [ $SUBMIT_EXIT -ne 0 ]; then
+                echo "❌ 提交失败 (exit code: $SUBMIT_EXIT)"
+            else
+                echo "✅ 提交完成: $TASK_NAME"
+            fi
+            sleep 2
         fi
     done
 done
