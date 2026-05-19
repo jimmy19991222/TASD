@@ -112,16 +112,21 @@ fi
 # 工作负载下踩了已知 metadata buffer size 不匹配 bug:
 #   "CUDA error: invalid argument at flash_attn.py:498 self.scheduler_metadata[:n] = ..."
 #
-# 注意: VLLM_USE_V1=0 在新版 vLLM 下不生效 (os.environ.get(...)="0" 仍 truthy)。
-# 解决: (1) unset VLLM_USE_V1 让 vLLM 走默认;
-#       (2) 强制 attention backend = XFORMERS,彻底绕开 flash_attn.py 的 bug。
+# 关键: VLLM v1 不支持 XFORMERS 后端 (只支持 FLASH_ATTN / FLASHINFER / MLA)。所以
+# 即使设 VLLM_ATTENTION_BACKEND=XFORMERS,v1 会忽略并仍用 flash_attn → 同一个 bug。
+# 真正修复必须 VLLM_USE_V1=0 走 v0,v0 支持 XFORMERS 才能 bypass flash_attn 路径。
+#
+# d748fc6 后 VLLM_USE_V1 已在 verl runtime_env propagate whitelist 里,这里设的会真
+# 到 ray worker。vLLM 在 envs.py 读 `bool(int(os.getenv("VLLM_USE_V1","1")))`,"0"
+# → bool(int("0")) → False,所以 "0" 是被正确识别为 disable v1。
+#
 # 用户可通过 env 强制 v1 + flash_attn 做 ablation:
 #   VLLM_USE_V1=1 VLLM_ATTENTION_BACKEND=FLASH_ATTN ...
-if [ -z "${VLLM_USE_V1:-}" ]; then
-    unset VLLM_USE_V1
-fi
+export VLLM_USE_V1="${VLLM_USE_V1:-0}"
 export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-XFORMERS}"
 export VLLM_LOGGING_LEVEL=WARN
+# Verbose env confirmation (帮助诊断 env 是否真传到 worker)
+echo "[env] VLLM_USE_V1=${VLLM_USE_V1} VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND}"
 export WANDB_MODE=offline
 export WANDB_ENTITY=oh-my-team
 export SWANLAB_MODE=cloud
