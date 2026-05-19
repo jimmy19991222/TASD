@@ -34,6 +34,9 @@ USE_GEODESIC="${USE_GEODESIC:-False}"
 GEODESIC_TRUST_REGION="${GEODESIC_TRUST_REGION:-5.0}"
 GEODESIC_BETA_SCALE="${GEODESIC_BETA_SCALE:-0.5}"
 
+# 粒度控制参数
+FULL_LOGIT_DISTILLATION="${FULL_LOGIT_DISTILLATION:-True}"  # True=vocab粒度, False=token粒度
+
 # 数据集路径
 train_data_path="${OSS_ROOT}/datasets/${DATASET}/train.parquet"
 val_data_path="${OSS_ROOT}/datasets/${DATASET}/test.parquet"
@@ -92,6 +95,7 @@ if [ "$LOSS_MODE" = "sdpo" ]; then
     # SDPO 模式：使用 self_distillation loss
     HYDRA_ARGS+=(
         actor_rollout_ref.actor.policy_loss.loss_mode=sdpo
+        actor_rollout_ref.actor.self_distillation.full_logit_distillation=${FULL_LOGIT_DISTILLATION}
         actor_rollout_ref.actor.self_distillation.distillation_topk=${DISTILL_TOPK}
         actor_rollout_ref.actor.self_distillation.alpha=${ALPHA}
         actor_rollout_ref.actor.self_distillation.dont_reprompt_on_self_success=${DONT_REPROMPT_ON_SELF_SUCCESS}
