@@ -37,6 +37,9 @@ GEODESIC_BETA_SCALE="${GEODESIC_BETA_SCALE:-0.5}"
 # 粒度控制参数
 FULL_LOGIT_DISTILLATION="${FULL_LOGIT_DISTILLATION:-True}"  # True=vocab粒度, False=token粒度
 
+# 训练步数（支持 smoke test）
+MAX_STEPS="${MAX_STEPS:-250}"  # 默认250步，smoke test可设为10
+
 # 数据集路径
 train_data_path="${OSS_ROOT}/datasets/${DATASET}/train.parquet"
 val_data_path="${OSS_ROOT}/datasets/${DATASET}/test.parquet"
@@ -78,7 +81,7 @@ HYDRA_ARGS=(
     actor_rollout_ref.rollout.gpu_memory_utilization=0.85
     algorithm.rollout_correction.rollout_is=token
     trainer.total_epochs=30
-    trainer.total_training_steps=250
+    trainer.total_training_steps=${MAX_STEPS}
     trainer.save_freq=-1
     trainer.save_best_metric="val-core/sciknoweval/acc/mean@16"
     trainer.n_gpus_per_node=4
