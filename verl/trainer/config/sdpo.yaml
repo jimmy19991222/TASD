@@ -23,7 +23,8 @@ actor_rollout_ref:
       # Geodesic SDPO: Fisher 度量加权（流形约束）
       # 理论：在概率流形上做 Natural Gradient 更新，内生保护熵结构
       use_geodesic: False  # 默认关闭，消融实验时开启
-      geodesic_clip_max: 10.0  # 流形权重截断阈值（防止低概率 token 梯度爆炸）
+      geodesic_trust_region: 5.0  # Trust Region 阈值（几何 Huber 裁剪，比 clamp 更平滑）
+      geodesic_beta_scale: 0.5    # β 缩放因子（补偿 manifold weight 的梯度放大效应）
     optim:
       lr: 1e-5
   rollout:

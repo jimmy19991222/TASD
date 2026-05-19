@@ -64,8 +64,9 @@ MAX_STEPS="500"
 
 EXPERIMENTS=(
     "sdpo_baseline:use_geodesic=False"
-    "geodesic_sdpo:use_geodesic=True,geodesic_clip_max=10.0"
-    "geodesic_sdpo_conservative:use_geodesic=True,geodesic_clip_max=5.0"
+    "geodesic_sdpo:use_geodesic=True,geodesic_trust_region=5.0,geodesic_beta_scale=0.5"
+    "geodesic_sdpo_conservative:use_geodesic=True,geodesic_trust_region=3.0,geodesic_beta_scale=0.5"
+    "geodesic_sdpo_aggressive:use_geodesic=True,geodesic_trust_region=8.0,geodesic_beta_scale=0.3"
 )
 
 # =============================================================================
@@ -90,11 +91,17 @@ for dataset in "${DATASETS[@]}"; do
         
         # 解析实验参数
         use_geodesic=$(echo "$exp_params" | grep -o 'use_geodesic=[^,]*' | cut -d'=' -f2)
-        geodesic_clip_max=$(echo "$exp_params" | grep -o 'geodesic_clip_max=[^,]*' | cut -d'=' -f2)
+        geodesic_trust_region=$(echo "$exp_params" | grep -o 'geodesic_trust_region=[^,]*' | cut -d'=' -f2)
+        geodesic_beta_scale=$(echo "$exp_params" | grep -o 'geodesic_beta_scale=[^,]*' | cut -d'=' -f2)
         
-        # 如果没有指定 clip_max，使用默认值
-        if [ -z "$geodesic_clip_max" ]; then
-            geodesic_clip_max="10.0"
+        # 如果没有指定 trust_region，使用默认值
+        if [ -z "$geodesic_trust_region" ]; then
+            geodesic_trust_region="5.0"
+        fi
+        
+        # 如果没有指定 beta_scale，使用默认值
+        if [ -z "$geodesic_beta_scale" ]; then
+            geodesic_beta_scale="0.5"
         fi
         
         # 构建任务名称
@@ -103,7 +110,7 @@ for dataset in "${DATASETS[@]}"; do
         echo ""
         echo "📝 准备提交: $TASK_NAME"
         echo "   数据集: $dataset"
-        echo "   参数: use_geodesic=$use_geodesic, geodesic_clip_max=$geodesic_clip_max"
+        echo "   参数: use_geodesic=$use_geodesic, trust_region=$geodesic_trust_region, beta_scale=$geodesic_beta_scale"
         
         # 构建 nebulactl 命令
         CMD="nebulactl run mdl \
@@ -131,7 +138,8 @@ for dataset in "${DATASETS[@]}"; do
                 train_batch_size=$TRAIN_BATCH_SIZE \
                 max_steps=$MAX_STEPS \
                 use_geodesic=$use_geodesic \
-                geodesic_clip_max=$geodesic_clip_max \
+                geodesic_trust_region=$geodesic_trust_region \
+                geodesic_beta_scale=$geodesic_beta_scale \
                 exp_name=$exp_name \
                 project_name=$PROJECT_NAME
             \""
@@ -158,8 +166,9 @@ echo "========================================================================="
 echo ""
 echo "📊 实验矩阵:"
 echo "  A: SDPO baseline (use_geodesic=False)"
-echo "  B: Geodesic SDPO (use_geodesic=True, clip_max=10.0)"
-echo "  C: Geodesic SDPO Conservative (use_geodesic=True, clip_max=5.0)"
+echo "  B: Geodesic SDPO (trust_region=5.0, beta_scale=0.5)"
+echo "  C: Geodesic SDPO Conservative (trust_region=3.0, beta_scale=0.5)"
+echo "  D: Geodesic SDPO Aggressive (trust_region=8.0, beta_scale=0.3)"
 echo ""
 echo "🔍 监控方式:"
 echo "  - SwanLab: 查看 actor/geodesic_* 指标"
