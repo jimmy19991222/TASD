@@ -54,7 +54,8 @@ MODEL_NAME="Qwen3-8B"
 MAX_STEPS="250"
 
 # ── SDPO 参数 ────────────────────────────────────────────────
-ALPHA="0.5"
+ALPHA="0.5"              # Vocabulary 粒度默认值（JSD）
+ALPHA_TOKEN="1.0"        # Token 粒度必须用 1.0（reverse KL）
 DISTILL_TOPK="100"
 DONT_REPROMPT_ON_SELF_SUCCESS="True"
 
@@ -108,8 +109,11 @@ for dataset in "${DATASETS[@]}"; do
         # 转换 full_logit 格式（false -> False, true -> True）
         if [ "$full_logit" = "False" ]; then
             full_logit_distillation="False"
+            # Token 粒度必须用 alpha=1.0（reverse KL）
+            current_alpha="$ALPHA_TOKEN"
         else
             full_logit_distillation="True"
+            current_alpha="$ALPHA"
         fi
         
         # 如果没有指定 use_vce，默认为 False
@@ -127,7 +131,7 @@ for dataset in "${DATASETS[@]}"; do
         echo ""
         echo "📝 准备提交: $TASK_NAME"
         echo "   数据集: $dataset"
-        echo "   模式: loss_mode=$loss_mode, full_logit=$full_logit, use_geodesic=$use_geodesic"
+        echo "   模式: loss_mode=$loss_mode, full_logit=$full_logit, use_geodesic=$use_geodesic, alpha=$current_alpha"
         echo "   Seed: $SEED"
         
         # 构建 ENV_PARAMS（所有业务参数通过 --env 传递，参考 reference_submit.sh）
@@ -143,7 +147,7 @@ for dataset in "${DATASETS[@]}"; do
             --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} \
             --env=ROLLOUT_N=${ROLLOUT_N} \
             --env=MODEL_NAME=${MODEL_NAME} \
-            --env=ALPHA=${ALPHA} \
+            --env=ALPHA=${current_alpha} \
             --env=DISTILL_TOPK=${DISTILL_TOPK} \
             --env=DONT_REPROMPT_ON_SELF_SUCCESS=${DONT_REPROMPT_ON_SELF_SUCCESS} \
             --env=CLIP_VALUE=${CLIP_VALUE} \
