@@ -1214,11 +1214,46 @@ def compute_self_distillation_loss(
         # 外部缩放：重塑梯度流而不改变最优点
         per_token_loss = per_token_loss * manifold_weight
         
-        # 记录指标用于监控（SwanLab 自动采集）
+        # ===== 记录详细统计信息（为 Phase 2 动态路由做准备） =====
+        # 1. 全局统计
         metrics["actor/geodesic_mean_weight"] = manifold_weight.mean().detach().item()
         metrics["actor/geodesic_max_weight"] = manifold_weight.max().detach().item()
         metrics["actor/geodesic_min_weight"] = manifold_weight.min().detach().item()
+        metrics["actor/geodesic_std_weight"] = manifold_weight.std().detach().item()
         metrics["actor/geodesic_trust_region_scale"] = trust_region_scale
+        
+        # 2. 置信度分布分析（验证 SRPO 的 Optimization Ambiguity）
+        # 高置信度 token (p > 0.9)：验证是否应该降权
+        high_conf_mask = (p_student > 0.9)
+        low_conf_mask = (p_student < 0.1)
+        mid_conf_mask = ~high_conf_mask & ~low_conf_mask
+        
+        if high_conf_mask.sum() > 0:
+            metrics["actor/geodesic_high_conf_mean_weight"] = manifold_weight[high_conf_mask].mean().detach().item()
+            metrics["actor/geodesic_high_conf_ratio"] = (high_conf_mask.sum() / high_conf_mask.numel()).item()
+        if low_conf_mask.sum() > 0:
+            metrics["actor/geodesic_low_conf_mean_weight"] = manifold_weight[low_conf_mask].mean().detach().item()
+            metrics["actor/geodesic_low_conf_ratio"] = (low_conf_mask.sum() / low_conf_mask.numel()).item()
+        if mid_conf_mask.sum() > 0:
+            metrics["actor/geodesic_mid_conf_mean_weight"] = manifold_weight[mid_conf_mask].mean().detach().item()
+        
+        # 3. 位置敏感性分析（验证 Rethinking OPD 的 Suffix 坍缩）
+        # 只在全 logit 模式下计算（有完整的序列维度）
+        if student_all_log_probs is not None:
+            seq_len = manifold_weight.shape[-1]
+            if seq_len > 10:
+                # 将序列分为 Prefix (前 30%)、Middle (中间 40%)、Suffix (后 30%)
+                prefix_len = max(1, int(seq_len * 0.3))
+                suffix_len = max(1, int(seq_len * 0.3))
+                
+                prefix_weight = manifold_weight[..., :prefix_len].mean().detach().item()
+                suffix_weight = manifold_weight[..., -suffix_len:].mean().detach().item()
+                middle_weight = manifold_weight[..., prefix_len:-suffix_len].mean().detach().item()
+                
+                metrics["actor/geodesic_prefix_weight"] = prefix_weight
+                metrics["actor/geodesic_middle_weight"] = middle_weight
+                metrics["actor/geodesic_suffix_weight"] = suffix_weight
+                metrics["actor/geodesic_suffix_prefix_ratio"] = suffix_weight / (prefix_weight + 1e-5)
 
     loss = agg_loss(
         loss_mat=per_token_loss,
