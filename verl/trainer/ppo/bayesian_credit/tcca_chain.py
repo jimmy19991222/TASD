@@ -385,7 +385,20 @@ def _get_chain_server_manager(async_rollout_manager):
 
 
 def _student_continue_async(y_prev_batch, t_i, teacher_tokens, async_rollout_manager, config, tokenizer) -> list:
-    """asyncio.gather over B samples, each with different prefix."""
+    """asyncio.gather over B samples, each with different prefix.
+
+    IMPORTANT (was source of v1 flash_attn scheduler_metadata[:n] bug for ~14 attempts):
+    Phase 1 `_standard_rollout` ends with `generate_sequences()` which calls
+    `AgentLoopManager.sleep()` to free vLLM GPU memory (so FSDP teacher forwards
+    can use full GPU). After that, vLLM is in *sleep* state — its scheduler
+    metadata buffers are torn down. If we fire `server_manager.generate` at a
+    sleeping engine, the v1 scheduler crashes inside flash_attn when assigning
+    `scheduler_metadata[:n] = ...` (n > 0 but buffer was freed).
+
+    GRPO never hits this because it only ever talks to vLLM via
+    `generate_sequences()`, which wraps wake_up/sleep around every call.
+    Our chain bypasses that, so we MUST wake_up before generate and sleep after.
+    """
     B = len(t_i)
     T = y_prev_batch.batch["responses"].shape[1]
     P_orig = y_prev_batch.batch["input_ids"].shape[1] - T
@@ -421,18 +434,40 @@ def _student_continue_async(y_prev_batch, t_i, teacher_tokens, async_rollout_man
     async def _gather_all():
         return await asyncio.gather(*coros)
 
+    # Wake vLLM out of sleep state (see docstring). wake_up is idempotent on
+    # already-awake replicas. Wrapped in try/finally so we always sleep
+    # afterwards even if generate fails — leaving vLLM awake would steal GPU
+    # from FSDP teacher forwards on the next chain attempt.
     try:
-        # If a loop is already running (e.g. we're being called from an async
-        # ray actor body), asyncio.run() refuses; offload to a dedicated thread.
-        asyncio.get_running_loop()
-        import concurrent.futures
-        def _run():
-            return asyncio.run(_gather_all())
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            continuations = ex.submit(_run).result()
-    except RuntimeError:
-        # No running loop — safe to start one here.
-        continuations = asyncio.run(_gather_all())
+        async_rollout_manager.wake_up()
+    except Exception as _wake_e:  # noqa: BLE001 — best-effort, log + continue
+        import logging
+        logging.getLogger(__name__).warning(
+            "[chain] wake_up failed (%s); attempting generate anyway", _wake_e
+        )
+
+    try:
+        try:
+            # If a loop is already running (e.g. we're being called from an async
+            # ray actor body), asyncio.run() refuses; offload to a dedicated thread.
+            asyncio.get_running_loop()
+            import concurrent.futures
+            def _run():
+                return asyncio.run(_gather_all())
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                continuations = ex.submit(_run).result()
+        except RuntimeError:
+            # No running loop — safe to start one here.
+            continuations = asyncio.run(_gather_all())
+    finally:
+        try:
+            async_rollout_manager.sleep()
+        except Exception as _sleep_e:  # noqa: BLE001
+            import logging
+            logging.getLogger(__name__).warning(
+                "[chain] sleep after continue failed (%s); next FSDP fwd may OOM",
+                _sleep_e,
+            )
     return continuations
 
 
