@@ -470,12 +470,15 @@ def compute_teacher_qv_advantage(
     norm_by_std: bool = False,
     clip_value: Optional[float] = None,
     std_floor: float = 1e-3,
-    detach_q: bool = True,
-    detach_v: bool = True,
     student_all_log_probs: Optional[torch.Tensor] = None,
     teacher_all_log_probs: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Token-level advantage A = Q - V with Q = log p_teacher and configurable V.
+
+    All computations run under torch.no_grad(): advantage is a stop-grad scalar
+    weight in standard PG, same convention as compute_grpo_outcome_advantage and
+    compute_self_teacher_advantage in this file. The returned tensor has no
+    autograd graph attached.
 
     All advantages are zero outside ``response_mask``. Returns (advantages, metrics)
     where advantages has shape ``(B, T)`` matching the inputs.
@@ -498,78 +501,84 @@ def compute_teacher_qv_advantage(
     if baseline_type not in {"student", "ce", "group_mean", "group_hier"}:
         raise ValueError(f"unknown baseline_type: {baseline_type}")
 
-    mask = response_mask.float()
-    valid = mask.sum().clamp(min=1.0)
-
-    Q = teacher_log_probs.detach() if detach_q else teacher_log_probs
-    if baseline_type == "student":
-        V = student_log_probs.detach() if detach_v else student_log_probs
-        adv = (Q - V) * mask
-    elif baseline_type == "ce":
-        if student_all_log_probs is None or teacher_all_log_probs is None:
-            raise ValueError(
-                "baseline_type='ce' requires student_all_log_probs and teacher_all_log_probs "
-                "(full vocab or topk-aligned). Enable full_logit_distillation or distillation_topk."
-            )
-        if student_all_log_probs.shape != teacher_all_log_probs.shape:
-            raise ValueError(
-                "student_all_log_probs and teacher_all_log_probs must share the same shape; "
-                f"got {tuple(student_all_log_probs.shape)} vs {tuple(teacher_all_log_probs.shape)}."
-            )
-        # V_t = E_{y~p_s}[log p_t(y)] = sum_v p_s(v) * log p_t(v).
-        # detach_v controls whether gradients flow through p_s; the teacher side is
-        # always detached because it's already a no-grad tensor.
-        s_log = student_all_log_probs if not detach_v else student_all_log_probs.detach()
-        t_log = teacher_all_log_probs.detach()
-        # numerically stable: p_s = exp(s_log), then weighted sum with t_log.
-        V = (torch.exp(s_log) * t_log).sum(dim=-1)
-        adv = (Q - V) * mask
-    elif baseline_type == "group_mean":
-        Q_masked = Q * mask
-        mean_q = Q_masked.sum() / valid
-        adv = (Q - mean_q) * mask
-        if norm_by_std:
-            var = ((Q - mean_q) ** 2 * mask).sum() / valid
-            std = torch.sqrt(var.clamp(min=0.0)).clamp(min=std_floor)
-            adv = adv / std
-    else:  # group_hier -- GRPO-style additive decomposition.
-        # Token-level z-score within each sequence + broadcasted seq-level
-        # z-score across sequences within the same group (uid). This is the
-        # user's "first per-seq token norm, then per-seq norm across the group"
-        # spec, made symmetric so both terms contribute on the token axis.
-        seq_token_count = mask.sum(dim=-1, keepdim=True).clamp(min=1.0)  # (B, 1)
-        seq_mean = (Q * mask).sum(dim=-1, keepdim=True) / seq_token_count  # (B, 1)
-        within_seq_centered = (Q - seq_mean) * mask
-        if norm_by_std:
-            within_seq_var = ((Q - seq_mean) ** 2 * mask).sum(dim=-1, keepdim=True) / seq_token_count
-            within_seq_std = torch.sqrt(within_seq_var.clamp(min=0.0)).clamp(min=std_floor)
-            within_seq_z = within_seq_centered / within_seq_std
-        else:
-            within_seq_z = within_seq_centered
-
-        if index is None:
-            grp_idx = torch.zeros(Q.shape[0], dtype=torch.long, device=Q.device)
-        else:
-            grp_idx = as_torch_index(index, device=Q.device)
-        seq_mean_flat = seq_mean.squeeze(-1)  # (B,)
-        mean_g, std_g, _ = group_mean_std(seq_mean_flat, grp_idx, eps=1e-8)
-        seq_centered = seq_mean_flat - mean_g[grp_idx]
-        if norm_by_std:
-            seq_z = seq_centered / std_g[grp_idx].clamp(min=std_floor)
-        else:
-            seq_z = seq_centered
-        # Broadcast the seq-level z-score to all tokens of the seq.
-        across_seq_term = seq_z.unsqueeze(-1) * mask
-        adv = within_seq_z + across_seq_term
-
-    if clip_value is not None:
-        adv = torch.clamp(adv, -clip_value, clip_value)
-    adv = adv * mask
-
+    # All advantage math runs detached: A is a constant weight in PG.
     with torch.no_grad():
-        adv_sum = (adv * mask).sum()
-        adv_abs_sum = (adv.abs() * mask).sum()
-        adv_sq_sum = (adv * adv * mask).sum()
+        mask = response_mask.float()
+        valid = mask.sum().clamp(min=1.0)
+
+        Q = teacher_log_probs.detach()
+        if baseline_type == "student":
+            V = student_log_probs.detach()
+            adv = (Q - V) * mask
+        elif baseline_type == "ce":
+            if student_all_log_probs is None or teacher_all_log_probs is None:
+                raise ValueError(
+                    "baseline_type='ce' requires student_all_log_probs and teacher_all_log_probs "
+                    "(full vocab or topk-aligned). Enable full_logit_distillation or distillation_topk."
+                )
+            if student_all_log_probs.shape != teacher_all_log_probs.shape:
+                raise ValueError(
+                    "student_all_log_probs and teacher_all_log_probs must share the same shape; "
+                    f"got {tuple(student_all_log_probs.shape)} vs {tuple(teacher_all_log_probs.shape)}."
+                )
+            # V_t = E_{y~p_s}[log p_t(y)] = sum_v p_s(v) * log p_t(v).
+            # numerically stable: p_s = exp(s_log), then weighted sum with t_log.
+            V = (torch.exp(student_all_log_probs.detach()) * teacher_all_log_probs.detach()).sum(dim=-1)
+            adv = (Q - V) * mask
+        elif baseline_type == "group_mean":
+            Q_masked = Q * mask
+            mean_q = Q_masked.sum() / valid
+            adv = (Q - mean_q) * mask
+            if norm_by_std:
+                var = ((Q - mean_q) ** 2 * mask).sum() / valid
+                std = torch.sqrt(var.clamp(min=0.0)).clamp(min=std_floor)
+                adv = adv / std
+        else:  # group_hier -- GRPO-style additive decomposition.
+            # Token-level z-score within each sequence + broadcasted seq-level
+            # z-score across sequences within the same group (uid). This is the
+            # user's "first per-seq token norm, then per-seq norm across the group"
+            # spec, made symmetric so both terms contribute on the token axis.
+            seq_token_count = mask.sum(dim=-1, keepdim=True).clamp(min=1.0)  # (B, 1)
+            seq_mean = (Q * mask).sum(dim=-1, keepdim=True) / seq_token_count  # (B, 1)
+            within_seq_centered = (Q - seq_mean) * mask
+            if norm_by_std:
+                within_seq_var = ((Q - seq_mean) ** 2 * mask).sum(dim=-1, keepdim=True) / seq_token_count
+                within_seq_std = torch.sqrt(within_seq_var.clamp(min=0.0)).clamp(min=std_floor)
+                within_seq_z = within_seq_centered / within_seq_std
+            else:
+                within_seq_z = within_seq_centered
+
+            if index is None:
+                grp_idx = torch.zeros(Q.shape[0], dtype=torch.long, device=Q.device)
+            else:
+                grp_idx = as_torch_index(index, device=Q.device)
+            seq_mean_flat = seq_mean.squeeze(-1)  # (B,)
+            mean_g, std_g, _ = group_mean_std(seq_mean_flat, grp_idx, eps=1e-8)
+            seq_centered = seq_mean_flat - mean_g[grp_idx]
+            if norm_by_std:
+                seq_z = seq_centered / std_g[grp_idx].clamp(min=std_floor)
+            else:
+                seq_z = seq_centered
+            # Broadcast the seq-level z-score to all tokens of the seq.
+            across_seq_term = seq_z.unsqueeze(-1) * mask
+            adv = within_seq_z + across_seq_term
+
+        if clip_value is not None:
+            adv = torch.clamp(adv, -clip_value, clip_value)
+
+        # Defensive NaN/inf scrubbing. Sources we've seen:
+        #   - ce baseline with topk+add_tail at masked positions (forward returns
+        #     garbage logits there; expm1/log chain can produce NaN/inf).
+        #   - any divide-by-tiny-std in group_hier when seq has length 1.
+        # torch.where (not multiply) guarantees masked + non-finite slots become 0,
+        # because "NaN * 0 = NaN" but "torch.where(False, NaN, 0) = 0".
+        finite_mask = torch.isfinite(adv)
+        adv = torch.where(mask.bool() & finite_mask, adv, torch.zeros_like(adv))
+
+        non_finite_unmasked = ((~finite_mask) & mask.bool()).sum().item()
+        adv_sum = adv.sum()
+        adv_abs_sum = adv.abs().sum()
+        adv_sq_sum = (adv * adv).sum()
         mean = (adv_sum / valid).item()
         mean_abs = (adv_abs_sum / valid).item()
         var = (adv_sq_sum / valid).item() - mean * mean
@@ -578,11 +587,15 @@ def compute_teacher_qv_advantage(
             "actor/teacher_qv_adv_mean": mean,
             "actor/teacher_qv_adv_std": std,
             "actor/teacher_qv_adv_abs_mean": mean_abs,
-            "actor/teacher_qv_adv_max": (adv * mask).max().item(),
-            "actor/teacher_qv_adv_min": (adv * mask).min().item(),
+            "actor/teacher_qv_adv_max": adv.max().item(),
+            "actor/teacher_qv_adv_min": adv.min().item(),
             "actor/teacher_qv_baseline_type_id": float(
                 {"student": 0, "ce": 1, "group_mean": 2, "group_hier": 3}[baseline_type]
             ),
+            # Diagnostic: how many unmasked tokens hit NaN/inf in V/Q computation.
+            # Should be 0 in healthy runs; any non-zero means topk/add_tail or
+            # group-stat division produced bad values.
+            "actor/teacher_qv_non_finite_unmasked": float(non_finite_unmasked),
         }
 
     return adv, metrics

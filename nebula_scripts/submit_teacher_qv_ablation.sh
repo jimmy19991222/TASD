@@ -52,8 +52,6 @@ DONT_REPROMPT_ON_SELF_SUCCESS="True"
 NORM_BY_STD="False"
 CLIP_VALUE="null"
 STD_FLOOR="1e-3"
-DETACH_Q="True"
-DETACH_V="True"
 GEODESIC_TRUST_REGION="5.0"
 
 # 实验矩阵：(name, baseline_type, use_geodesic)
@@ -100,8 +98,6 @@ for dataset in "${DATASETS[@]}"; do
             --env=NORM_BY_STD=${NORM_BY_STD} \
             --env=CLIP_VALUE=${CLIP_VALUE} \
             --env=STD_FLOOR=${STD_FLOOR} \
-            --env=DETACH_Q=${DETACH_Q} \
-            --env=DETACH_V=${DETACH_V} \
             --env=GIT_BRANCH=${GIT_BRANCH} \
             --env=GIT_COMMIT=${GIT_COMMIT}"
 

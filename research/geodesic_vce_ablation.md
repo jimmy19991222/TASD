@@ -58,12 +58,16 @@ LLM 这套里，token-level 的真实 future return 拿不到（reward sparse）
 
 当前 Q 固定为 `log p_teacher(y_t)`（detach）。V 由 `policy_loss.teacher_qv.baseline_type` 选：
 
+**A_t 永远 detached**——整个 `compute_teacher_qv_advantage` 包在 `with torch.no_grad()` 里，跟 `compute_grpo_outcome_advantage` / `compute_self_teacher_advantage` 同样的约定。Advantage 在 PG 里只是个 scalar weight，梯度只从 `-A · log p_s` 里 ∇log p_s 那一支走，A 本身不应该有梯度（如果有，loss 求导多出 `-∇A · log p_s`，结果就不是 PG 梯度）。
+
 | baseline_type | V_t | A_t | 等价于 |
 |---------------|-----|-----|--------|
-| `student` | log p_s(y_t) (detach) | log p_t − log p_s | SDPO sampled-token 形式（reverse-KL gradient） |
+| `student` | log p_s(y_t) | log p_t − log p_s | SDPO sampled-token 形式（on-policy + 无 clip 触发时严格等价 reverse-KL gradient） |
 | `ce` | **Σ_v p_s(v) · log p_t(v)** = E_{y~p_s}[log p_t] | log p_t(y_t) + CE(p_s, p_t) | 真正的 V_CE（zero-mean PG baseline） |
 | `group_mean` | batch-mean(Q over valid tokens) | (Q − μ) [/ σ if `norm_by_std`] | 单一全局 baseline，类似 outcome-only GRPO 但在 token 维上 |
 | `group_hier` | within-seq z(Q) + across-seq z(seq_mean_Q) | GRPO 风格双层 z-score（uid 分组） | 把"token 在 seq 内的相对位置"和"seq 在组内的相对位置"两个尺度叠加 |
+
+> 注意：student / ce 是"等价于 SDPO sampled-token"，但**严格等价的前提是 on-policy（`ppo_epochs=1`）且 PPO clip 未触发**——off-policy 多 epoch 时 teacher_qv 走 vanilla PPO 路径，会多出 importance sampling 项。
 
 实现细节：
 - `baseline_type=ce` **需要 full vocab 或 topk-aligned log-probs**。Dp_actor 自动检测并打开 `full_logit_distillation=True, distillation_topk=100`（默认）。topk 模式下用 `_qv_add_tail` 补一个 sum-to-1 的尾桶。

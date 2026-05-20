@@ -20,8 +20,7 @@ actor_rollout_ref:
         norm_by_std: False
         clip_value: null            # set e.g. 5.0 to clamp |A|
         std_floor: 1e-3
-        detach_q: True
-        detach_v: True              # detach p_s in the V expectation (ce only)
+        # A is always detached (standard PG, same as compute_grpo_outcome_advantage).
     self_distillation:
       # Reuse SDPO's reprompt + EMA teacher infrastructure.
       # NOTE: baseline_type='ce' REQUIRES full_logit_distillation=True

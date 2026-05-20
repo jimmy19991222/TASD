@@ -27,8 +27,8 @@ SEED="${SEED:-42}"
 NORM_BY_STD="${NORM_BY_STD:-False}"
 CLIP_VALUE="${CLIP_VALUE:-null}"
 STD_FLOOR="${STD_FLOOR:-1e-3}"
-DETACH_Q="${DETACH_Q:-True}"
-DETACH_V="${DETACH_V:-True}"
+# DETACH_Q / DETACH_V env vars are no longer used (A is always detached). Accepted
+# silently for backward compat; the Hydra overrides have been removed below.
 
 # Geodesic Fisher manifold weighting (orthogonal to baseline_type)
 USE_GEODESIC="${USE_GEODESIC:-False}"
@@ -80,8 +80,6 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.policy_loss.teacher_qv.norm_by_std=${NORM_BY_STD} \
     actor_rollout_ref.actor.policy_loss.teacher_qv.clip_value=${CLIP_VALUE} \
     actor_rollout_ref.actor.policy_loss.teacher_qv.std_floor=${STD_FLOOR} \
-    actor_rollout_ref.actor.policy_loss.teacher_qv.detach_q=${DETACH_Q} \
-    actor_rollout_ref.actor.policy_loss.teacher_qv.detach_v=${DETACH_V} \
     actor_rollout_ref.actor.self_distillation.full_logit_distillation=${FULL_LOGIT} \
     actor_rollout_ref.actor.self_distillation.distillation_topk=${DISTILL_TOPK} \
     actor_rollout_ref.actor.self_distillation.use_geodesic=${USE_GEODESIC} \

@@ -174,16 +174,12 @@ class TeacherQVConfig(BaseConfig):
             per-group for 'group_hier').
         clip_value (Optional[float]): If set, clamp A to [-clip_value, clip_value].
         std_floor (float): Floor on std denominators for numerical stability.
-        detach_q (bool): Whether to stop-grad on log_teacher_prob (default True).
-        detach_v (bool): Whether to stop-grad on V (default True).
     """
 
     baseline_type: str = "student"
     norm_by_std: bool = False
     clip_value: Optional[float] = None
     std_floor: float = 1e-3
-    detach_q: bool = True
-    detach_v: bool = True
 
     def __post_init__(self):
         valid = {"student", "ce", "group_mean", "group_hier"}

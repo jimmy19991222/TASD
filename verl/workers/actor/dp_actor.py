@@ -58,10 +58,17 @@ def _qv_add_tail(log_probs: torch.Tensor) -> torch.Tensor:
     compute_self_distillation_loss.
 
     log_probs: (..., K) -> (..., K+1) with last column = log(1 - sum exp(log_probs)).
+
+    Sanitization: at masked positions the forward returns garbage logits, which
+    can drive log_s past 0 and trigger NaN through expm1/log. We additionally
+    clamp log_s below as well, and scrub any residual NaN/inf to a safe constant
+    so downstream V_t computation stays finite.
     """
     log_s = torch.logsumexp(log_probs, dim=-1, keepdim=True)
-    log_s = torch.clamp(log_s, max=-1e-7)
+    # Clamp BOTH sides: above to avoid log(<=0), below to avoid log(0).
+    log_s = torch.clamp(log_s, min=-30.0, max=-1e-7)
     tail_log = torch.log(-torch.expm1(log_s))
+    tail_log = torch.nan_to_num(tail_log, nan=-30.0, posinf=-30.0, neginf=-30.0)
     return torch.cat([log_probs, tail_log], dim=-1)
 
 logger = logging.getLogger(__file__)

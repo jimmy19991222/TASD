@@ -52,8 +52,6 @@ MODEL_NAME="Qwen3-8B"
 DONT_REPROMPT_ON_SELF_SUCCESS="True"
 CLIP_VALUE="null"
 STD_FLOOR="1e-3"
-DETACH_Q="True"
-DETACH_V="True"
 USE_GEODESIC="False"
 GEODESIC_TRUST_REGION="5.0"
 
@@ -100,8 +98,6 @@ for dataset in "${DATASETS[@]}"; do
             --env=GEODESIC_TRUST_REGION=${GEODESIC_TRUST_REGION} \
             --env=CLIP_VALUE=${CLIP_VALUE} \
             --env=STD_FLOOR=${STD_FLOOR} \
-            --env=DETACH_Q=${DETACH_Q} \
-            --env=DETACH_V=${DETACH_V} \
             --env=GIT_BRANCH=${GIT_BRANCH} \
             --env=GIT_COMMIT=${GIT_COMMIT}"
 

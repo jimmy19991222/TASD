@@ -76,6 +76,7 @@ policy_loss:
   ppo_kl_coef: 0.1
 
   # Token-level Q - V advantage; only used when loss_mode == "teacher_qv"
+  # A is always detached (standard PG), so no detach_* knobs.
   teacher_qv:
     _target_: verl.workers.config.TeacherQVConfig
     # student | ce | group_mean | group_hier
@@ -83,8 +84,6 @@ policy_loss:
     norm_by_std: False
     clip_value: null
     std_floor: 1.0e-3
-    detach_q: True
-    detach_v: True
 
 # self-distillation config
 self_distillation:
