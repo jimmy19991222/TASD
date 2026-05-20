@@ -946,8 +946,6 @@ class DataParallelPPOActor(BasePPOActor):
                             norm_by_std=teacher_qv_cfg.get("norm_by_std", False),
                             clip_value=teacher_qv_cfg.get("clip_value", None),
                             std_floor=teacher_qv_cfg.get("std_floor", 1e-3),
-                            detach_q=teacher_qv_cfg.get("detach_q", True),
-                            detach_v=teacher_qv_cfg.get("detach_v", True),
                             student_all_log_probs=qv_student_full,
                             teacher_all_log_probs=qv_teacher_full,
                         )

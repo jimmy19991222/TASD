@@ -221,25 +221,152 @@ w_t = trust_region + log(1/F_t - trust_region + 1)   if 1/F_t > trust_region
 
 ## 五、Q 估计的改进方向（post-Phase 3）
 
-当前 Q_t = log p_teacher(y_t) 只是 **instantaneous proxy**——teacher 对采样 token 的瞬时偏好，**不是教科书 RL 里的 Q(s,a) = E[future return | s, a]**。1.1 节已经讲过，这是 LLM-RL 里普遍的代理选择，但显然不是最优。下面四个方向按"工程改动量"从小到大列，可以作为 teacher_qv 框架的横向扩展。
+### 5.0 Motivation：为什么必须包含 future tokens
 
-### A. TD/GAE 多步 teacher 信号（最便宜，回报最大）
+教科书 RL 里 **Q(s_t, y_t) = E[Σ_{k≥0} γ^k r_{t+k}]**——当前 reward + **所有未来折扣 reward**。我们当前 `Q_t = log p_teacher(y_t)` 实际只是 r_t（per-step reward），不是真正的 Q。这导致 **myopic 问题**，对 LLM reasoning 任务非常严重：
 
-把 log p_t 当稠密 token-level reward，做标准 TD/GAE bootstrap：
+| 场景 | y_t 描述 | 只看 r_t 的 A_t | 看 Q_t = r_t + future 的 A_t | 谁对？ |
+|------|---------|-----------------|------------------------------|--------|
+| 单 token typo | log p_t(y_t)=-10，后续全正常 | 巨负，重罚 | 单点错被未来平均掉，中等罚 | **后者**——单 token 错不该毁掉整体 |
+| Cascading derailment | log p_t(y_t)=-1（不算差），但 y_t 选错关键概念导致后续全 -8~-12 | 轻微负，**没识别出问题** | 重罚（未来低 log-prob 反映 y_t 把轨迹带偏） | **后者**——这正是 long-horizon credit assignment |
+| 早期关键决策 | math 推理第一步选错方向 | 只看局部 token，看不出 | 通过未来轨迹质量回灌 credit | **后者** |
+
+LLM reasoning 里 **cascading derailment 是常态**——一个细微的早期决策决定整段推理走向。只看 r_t 的算法**完全没有 multi-step credit assignment 能力**。
+
+下面四个方向按工程改动量从小到大列：
+
+---
+
+### 5.A. TD/GAE：沿 token 轴累计 future 信号（最便宜，回报最大）
+
+#### 5.A.1 公式直觉
 
 ```
-r_t = log p_teacher(y_t)
-Q_t = Σ_{k=0}^{T-t-1} γ^k · r_{t+k}              ← N-step return
-δ_t = r_t + γ·V_{t+1} - V_t                      ← TD residual
-A_t = Σ_{k≥0} (γλ)^k · δ_{t+k}                   ← GAE
+r_t = log p_teacher(y_t)                ← per-step "reward"（teacher 对 y_t 的瞬时偏好）
+V_t = baseline_type 给出的 state value   ← "如果我在 s_t 随便采样一个 token，期望 reward 多少"
+
+δ_t = r_t + γ·V_{t+1} - V_t             ← TD residual：走这一步比"期望"多/少多少
+A^GAE_t = δ_t + γλ · A^GAE_{t+1}        ← 沿 token 轴 reverse 累加
 ```
 
-V_t 仍用现有四种 baseline 之一（student / ce / group_*）。
+物理意义：
+- **δ_t (one-step advantage)**：从 s_t 选 y_t 走到 s_{t+1}，跟"按平均水平走"比，多 / 少了多少 reward
+- **A^GAE_t**：把 δ_t, δ_{t+1}, ... 以 (γλ)^k 折扣累加 → "y_t 带动整个未来轨迹比预期好多少"
 
-**改动**：在 `compute_teacher_qv_advantage` 里加一个 `q_aggregation: instant | nstep | gae` 配置，instant 是当前行为；nstep/gae 在 token 维做反向扫描（O(T)，不需要任何额外 forward）。
-**优势**：A 立刻变成"token 对未来 teacher confidence 累计的贡献"，跟教科书 PG 形式对齐；γ < 1 自动衰减远期信号。
-**风险**：γ / λ 引入新超参；累加后 Q 的量纲会扩大 (1-γ)^(-1) 倍，需要重新调 `clip_value`；teacher 在长 sequence 后段如果置信度异常，会污染前段 A。
-**期望收益**：中-高，理论清晰，跟 4 个 baseline_type 都可以正交叠加。
+#### 5.A.2 走一遍数字例子（4 token 玩具序列）
+
+student 采样 4 个 token；teacher 在每个位置的 log-prob 和 ce baseline V_t：
+
+| t | y_t | r_t = log p_t(y_t) | V_t = E_{y~p_s\|s_t}[log p_t(y)] |
+|---|-----|--------------------|--------------------------------|
+| 1 | "解" | -0.5 | -0.6 |
+| 2 | "题" | -1.2 | -1.0 |
+| 3 | "需" | -0.3 | -0.5 |
+| 4 | "要" | -0.8 | -0.7 |
+
+取 γ=1, λ=0.95, V_5=0（terminal）。
+
+**Step 1：算 δ_t**
+```
+δ_4 = r_4 + γ·V_5 - V_4 = -0.8 +   0    - (-0.7) = -0.1
+δ_3 = r_3 + γ·V_4 - V_3 = -0.3 + (-0.7) - (-0.5) = -0.5
+δ_2 = r_2 + γ·V_3 - V_2 = -1.2 + (-0.5) - (-1.0) = -0.7
+δ_1 = r_1 + γ·V_2 - V_1 = -0.5 + (-1.0) - (-0.6) = -0.9
+```
+
+**Step 2：reverse scan 累加** A^GAE_t = δ_t + γλ · A^GAE_{t+1}
+```
+A_4 = δ_4              = -0.100
+A_3 = δ_3 + 0.95·A_4   = -0.5 + 0.95·(-0.100) = -0.595
+A_2 = δ_2 + 0.95·A_3   = -0.7 + 0.95·(-0.595) = -1.265
+A_1 = δ_1 + 0.95·A_2   = -0.9 + 0.95·(-1.265) = -2.102
+```
+
+**对比 instant 模式**（current behavior，γ=0）：
+```
+A_1^instant = r_1 - V_1 = -0.5 - (-0.6) = +0.10  ← 单点看挺正
+A_2^instant =                              -0.20
+A_3^instant =                              +0.20
+A_4^instant =                              -0.10
+```
+
+**关键观察**：
+- instant 下 A_1 = +0.10（"解"这个 token 看起来正常）
+- GAE 下 A_1 = -2.10（"解"被未来 token 的低 r 拖累成重罚）
+
+GAE **把后续 token 的 negative reward 反向传到了 y_1**。如果 y_1 是导致后续跑偏的早期决策（cascading derailment），这个重罚正确；如果 y_1 跟后续无关，这是 noise。**λ 控制传多远**：
+- λ=0 → 完全不传
+- λ=1 → 传到底（MC return）
+- λ=0.95 → 经典折中，~20 step 外的信号衰减到 35%
+
+#### 5.A.3 几个特殊角的退化
+
+| (γ, λ) | A^GAE_t 退化成 | 等价于 | 适用场景 |
+|--------|----------------|--------|---------|
+| (0, *) | r_t − V_t | **当前 instant 模式** | 短序列、token 间近独立、低方差偏好 |
+| (1, 0) | r_t + V_{t+1} − V_t | 一步 TD | 经典 actor-critic advantage |
+| (1, 0.95) | δ_t + 0.95·δ_{t+1} + 0.9·δ_{t+2} + ... | **经典 GAE** | 默认推荐 |
+| (1, 1) | Σ_{k≥0} r_{t+k} − V_t | MC return − baseline | unbiased，长序列方差爆炸 |
+
+#### 5.A.4 跟 4 个 baseline 的对接
+
+GAE 公式里要塞 V_t，由 baseline_type 提供：
+
+| baseline_type | V_t | GAE 自洽性 |
+|---------------|-----|-----------|
+| **`ce`** | E_{y~p_s\|s_t}[log p_t(y)] | ✅ **完全自洽**——V_t 是教科书定义的 state value |
+| `student` | log p_s(y_t) | ⚠️ unbiased 但 V 不是真正 state value，方差性质弱 |
+| `group_mean` / `group_hier` | batch / group 均值 | ⚠️ V 是经验常数，跟 s_t 没关系 |
+
+**最干净的组合：`baseline_type=ce` + `q_aggregation=gae`**——V_t 严格是 state value，整个公式跟 actor-critic 教科书一致。
+
+#### 5.A.5 实现框架
+
+```python
+# verl/workers/config/actor.py: TeacherQVConfig 加配置
+q_aggregation: str = "instant"     # "instant" | "td" | "gae"
+gae_gamma: float = 1.0             # LLM 短序列默认不折扣
+gae_lambda: float = 0.95
+
+# verl/trainer/ppo/core_algos.py: 在 compute_teacher_qv_advantage 里替换 A 计算
+if q_aggregation == "instant":
+    adv = (Q - V) * mask                       # 当前行为
+else:
+    r = Q                                       # log p_t(y_t)
+    V_next = torch.cat([V[:, 1:], torch.zeros_like(V[:, :1])], dim=1)
+    delta = (r + gamma * V_next - V) * mask     # TD residual
+    if q_aggregation == "td":
+        adv = delta                             # 一步 TD
+    else:                                       # gae
+        adv = torch.zeros_like(delta)
+        running = torch.zeros(delta.shape[0], device=delta.device)
+        for t in reversed(range(delta.shape[1])):
+            next_valid = mask[:, t+1] if t+1 < delta.shape[1] else 0
+            running = delta[:, t] + gamma * lam * running * next_valid
+            adv[:, t] = running * mask[:, t]
+```
+
+#### 5.A.6 预期实验矩阵
+
+固定 `baseline_type=ce`，做 q_aggregation × λ 的 sweep：
+
+| 组 | q_aggregation | λ | 看什么 |
+|----|--------------|---|--------|
+| ce-instant | instant | — | Phase 1 B 组（myopic A，对照） |
+| ce-td | td | — | 一步 TD（多一项 γV_{t+1}） |
+| ce-gae-low | gae | 0.5 | 短半衰期（~5 token） |
+| ce-gae-mid | gae | 0.95 | 经典 GAE |
+| ce-mc | gae | 1.0 | 满展开 MC return |
+
+若 ce-gae 显著优于 ce-instant，证明 future-aware Q 估计有效。
+
+#### 5.A.7 潜在的坑
+
+1. **量纲膨胀**：λ=1 时 A 量纲 ≈ T × instant 量纲；T~2000 的话 A 会膨胀 ~2000 倍——`clip_value` 必须重新调或关掉
+2. **terminal V 必须置 0**：mask 末尾 V_T=0 是 telescoping 成立的前提，否则引入虚假项
+3. **NaN 防护**：reverse scan 是累加，某步 V_t 出 NaN 会污染前所有 A_t——必须在 δ_t 上先 `nan_to_num`
+4. **teacher EMA 漂移**：同一 micro-batch 内 V_t 和 V_{t+1} 一致没问题；cross-step 累加默认 teacher 静态，EMA rate 大时这个假设要审视
+5. **discount γ 的选择**：LLM 通常 γ=1，但序列特别长（>4K）可以 γ=0.99 防远处 noise 主导
 
 ### B. Teacher 价值头（critic on teacher hidden states）
 
