@@ -219,7 +219,87 @@ w_t = trust_region + log(1/F_t - trust_region + 1)   if 1/F_t > trust_region
 
 ---
 
-## 五、实验执行约定
+## 五、Q 估计的改进方向（post-Phase 3）
+
+当前 Q_t = log p_teacher(y_t) 只是 **instantaneous proxy**——teacher 对采样 token 的瞬时偏好，**不是教科书 RL 里的 Q(s,a) = E[future return | s, a]**。1.1 节已经讲过，这是 LLM-RL 里普遍的代理选择，但显然不是最优。下面四个方向按"工程改动量"从小到大列，可以作为 teacher_qv 框架的横向扩展。
+
+### A. TD/GAE 多步 teacher 信号（最便宜，回报最大）
+
+把 log p_t 当稠密 token-level reward，做标准 TD/GAE bootstrap：
+
+```
+r_t = log p_teacher(y_t)
+Q_t = Σ_{k=0}^{T-t-1} γ^k · r_{t+k}              ← N-step return
+δ_t = r_t + γ·V_{t+1} - V_t                      ← TD residual
+A_t = Σ_{k≥0} (γλ)^k · δ_{t+k}                   ← GAE
+```
+
+V_t 仍用现有四种 baseline 之一（student / ce / group_*）。
+
+**改动**：在 `compute_teacher_qv_advantage` 里加一个 `q_aggregation: instant | nstep | gae` 配置，instant 是当前行为；nstep/gae 在 token 维做反向扫描（O(T)，不需要任何额外 forward）。
+**优势**：A 立刻变成"token 对未来 teacher confidence 累计的贡献"，跟教科书 PG 形式对齐；γ < 1 自动衰减远期信号。
+**风险**：γ / λ 引入新超参；累加后 Q 的量纲会扩大 (1-γ)^(-1) 倍，需要重新调 `clip_value`；teacher 在长 sequence 后段如果置信度异常，会污染前段 A。
+**期望收益**：中-高，理论清晰，跟 4 个 baseline_type 都可以正交叠加。
+
+### B. Teacher 价值头（critic on teacher hidden states）
+
+冻结 teacher backbone，在最后一层 hidden state 上挂个小 MLP head：
+
+```
+V_φ(h_t) → scalar，目标拟合 sequence terminal verifier reward
+critic loss: L_V = (V_φ(h_t) - R_terminal)²       ← 跟 actor loss 一起优化
+Q_t = log p_teacher(y_t) + γ·V_φ(s_{t+1})         ← TD-bootstrap 风格
+```
+
+**改动**：teacher forward 多 return hidden states；加一个独立的 critic head 模块；在 actor loss 里加 critic loss 项（带系数 c_v）；新增 `q_source = teacher_critic`。
+**优势**：把稀疏 outcome reward 通过 critic 反向传到 token 级，bootstrap 比 raw teacher log-prob 更精准；critic head 参数量极小，只训 head 几乎零额外算力。
+**风险**：critic 冷启动阶段全是 noise，前期反而拖累训练；需要 critic learning rate / loss coefficient 调参；用 hidden states 把 teacher 和 critic 绑死，teacher 更新（EMA）会让 critic 失配。
+**期望收益**：中，依赖 critic 训得好不好；适合作为 A 的下一步增强。
+
+### C. Teacher peek with ground truth（专门针对 verifiable-answer 数据集）
+
+sciknoweval 这类数据每条都有 ground-truth answer。让 teacher 在**已经看到答案**的条件下评估 student 当前 token：
+
+```
+Q_t = log p_teacher(y_t | prompt, ground_truth_answer, y_<t)
+```
+
+本质是 **inverse RL 视角**：teacher + oracle ≈ optimal policy，optimal policy 给的 log-prob ≈ Q*。
+
+**改动**：复用 SDPO 现有的 reprompt 框架（[`ray_trainer.py:680`](verl/trainer/ppo/ray_trainer.py#L680) `_maybe_build_self_distillation_batch`），把 `solution_template` 从"successful previous attempt"换成"correct answer reference"，构造一个新的 `q_source = teacher_oracle`。
+**优势**：理论上**最接近真 Q***，因为 teacher + oracle 信息最完整；不需要训 critic、不需要 rollout。
+**风险**：(1) 训练信号里灌入了 ground-truth，泛化性可能下降（student 学到"假设 teacher 看过答案"的捷径）；(2) 跟 SDPO 的 reprompt 路径高度耦合，"Q 估计质量"这个变量不容易单独 ablate；(3) 只能用于有可枚举正确答案的数据集，generalization 受限。
+**期望收益**：高（如果泛化性问题能控制住），但**应该单独作为 baseline 跟 A/B 比，不要混进 Phase 1 那种受控对比**。
+
+### D. Teacher rollout completion（最准但成本爆炸）
+
+每个 token 位置 t，让 teacher 从 y_<=t 接着续写到底，跑 verifier 拿 0/1 reward：
+
+```
+Q_t = verifier( teacher_complete(prompt, y_<=t) )
+```
+
+直接是 terminal-reward 形式的真 Q。但每个 training token 多一次 teacher rollout，**成本 O(T) 倍**——基本不可行，除非：
+- 只在 reasoning chunk boundary（每 K token）做一次，token 内插值
+- 或者 batch 起来用 vLLM prefill + 短 decode 把 latency 摊下来
+- 或者只对 high-uncertainty 位置做（用 student entropy 选样）
+
+**期望收益**：理论最强，工程代价最大。等 A+B 走完且效果还不够时再考虑。
+
+### 优先级建议
+
+| 顺序 | 方向 | 理由 |
+|------|------|------|
+| 1 | **A (TD/GAE)** | 改动最小，让 Q 真正变成 future return，跟教科书 PG 对齐；可以跟当前 4 个 baseline_type 正交叠加 |
+| 2 | **B (critic head)** | A 跑通后的自然延伸：把 outcome reward bootstrap 进 token 级 Q |
+| 3 | **C (oracle peek)** | 当作独立研究分支，因为公平对比的难度大，但理论上界最高 |
+| 4 | **D (full rollout)** | 等 A+B 跑出明显瓶颈再考虑 |
+
+A 和 B 都可以归到现有 `teacher_qv` 框架的扩展（新增 config 字段），不破坏现有 4 个 baseline_type 的实验设计。C 应当作 SDPO 系列的新变种 (`teacher_qv_oracle`)。D 单独立项。
+
+---
+
+## 六、实验执行约定
 
 - 一次只改一个变量；同时改两个的实验不读
 - 每个变量都要有 ON/OFF 两组（否则不构成 ablation）
@@ -230,7 +310,7 @@ w_t = trust_region + log(1/F_t - trust_region + 1)   if 1/F_t > trust_region
 
 ---
 
-## 六、未决问题（提醒自己）
+## 七、未决问题（提醒自己）
 
 1. **VCE 的 zero-mean baseline 在 topk=100 下近似多准？** 如果 `actor/teacher_qv_adv_mean` 系统性偏离 0，需要换 full vocab 或加 add_tail 修正幅度
 2. **Geodesic 加到 teacher_qv 后，clip_value 还需不需要？** Geodesic 已经在做 fisher 倒数缩放，可能重复
