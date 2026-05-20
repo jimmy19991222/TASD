@@ -28,7 +28,9 @@ OSS_BUCKET="lazada-ai-model"
 CLUSTER_FILE="nebula_scripts/cluster.json"
 SCRIPT_PATH="nebula_scripts/sdpo/teacher_qv_sciknoweval_parametric.sh"
 CUSTOM_DOCKER_IMAGE="${CUSTOM_DOCKER_IMAGE:-hub.docker.alibaba-inc.com/mdl/notebook_saved:loujieming.ljm_yueqiu_sdpo_env_torch260_20260324155942}"
-PROJECT_NAME="Teacher-QV-Phase3"
+# Unified SwanLab project — Phase 1 + Phase 3 share one dashboard.
+# JOB_NAME prefixes (QV1- / QV3-) distinguish the phase.
+PROJECT_NAME="Teacher-QV-Ablation"
 
 GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
 GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
