@@ -422,6 +422,7 @@ def compute_geodesic_manifold_weight(
     student_all_log_probs: Optional[torch.Tensor] = None,
     trust_region_scale: float = 5.0,
     eps: float = 1e-5,
+    response_mask: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Fisher-metric based manifold weight for natural-gradient-style loss scaling.
 
@@ -433,31 +434,64 @@ def compute_geodesic_manifold_weight(
         is summed over vocab: F_t = Σ_v p_s(v) * (1 - p_s(v)).
       * Otherwise (token-level) F_t = p_s(y_t) * (1 - p_s(y_t)).
 
+    If ``response_mask`` is supplied, the returned weight is set to 1.0 at
+    masked positions and any NaN/inf is scrubbed. This is important because:
+      - forward returns garbage logits at padding positions -> garbage Fisher
+        -> garbage weight (possibly inf). Multiplying inf * 0 (from a masked
+        advantage) yields NaN, which then poisons pg_loss.
+      - metrics ought to be computed over valid tokens only.
+
     Returns ``(weight, metrics)`` where ``weight`` has shape ``(B, T)``.
     """
-    if student_all_log_probs is not None:
-        p_s = torch.exp(student_all_log_probs.detach())
-        fisher = (p_s * (1.0 - p_s)).sum(-1)
-        full_logit = True
-    else:
-        p_s = torch.exp(student_log_probs.detach())
-        fisher = p_s * (1.0 - p_s)
-        full_logit = False
-    fisher = fisher + eps
-    raw = 1.0 / fisher
-    weight = torch.where(
-        raw > trust_region_scale,
-        trust_region_scale + torch.log(raw - trust_region_scale + 1.0),
-        raw,
-    )
-    metrics = {
-        "actor/geodesic_mean_weight": weight.mean().detach().item(),
-        "actor/geodesic_max_weight": weight.max().detach().item(),
-        "actor/geodesic_min_weight": weight.min().detach().item(),
-        "actor/geodesic_std_weight": weight.std().detach().item(),
-        "actor/geodesic_trust_region_scale": float(trust_region_scale),
-        "actor/geodesic_full_logit_mode": float(full_logit),
-    }
+    with torch.no_grad():
+        if student_all_log_probs is not None:
+            p_s = torch.exp(student_all_log_probs.detach())
+            fisher = (p_s * (1.0 - p_s)).sum(-1)
+            full_logit = True
+        else:
+            p_s = torch.exp(student_log_probs.detach())
+            fisher = p_s * (1.0 - p_s)
+            full_logit = False
+        fisher = fisher + eps
+        raw = 1.0 / fisher
+        weight = torch.where(
+            raw > trust_region_scale,
+            trust_region_scale + torch.log(raw - trust_region_scale + 1.0),
+            raw,
+        )
+        # Mask + NaN scrub. Masked positions get weight = 1.0 (no-op when
+        # multiplied with a masked advantage that's already 0) instead of
+        # garbage that could blow up to inf.
+        if response_mask is not None:
+            mask_bool = response_mask.bool()
+            finite = torch.isfinite(weight)
+            weight = torch.where(mask_bool & finite, weight, torch.ones_like(weight))
+            # Metrics restricted to valid tokens only.
+            valid = response_mask.float().sum().clamp(min=1.0)
+            w_masked = weight * response_mask.float()
+            w_sum = w_masked.sum()
+            w_sq_sum = (w_masked * weight).sum()  # = sum_{valid} w^2
+            mean = (w_sum / valid).item()
+            var = (w_sq_sum / valid).item() - mean * mean
+            std = (var if var > 0 else 0.0) ** 0.5
+            max_w = weight[mask_bool].max().item() if mask_bool.any() else 0.0
+            min_w = weight[mask_bool].min().item() if mask_bool.any() else 0.0
+            non_finite_unmasked = ((~finite) & mask_bool).sum().item()
+        else:
+            mean = weight.mean().item()
+            std = weight.std().item()
+            max_w = weight.max().item()
+            min_w = weight.min().item()
+            non_finite_unmasked = (~torch.isfinite(weight)).sum().item()
+        metrics = {
+            "actor/geodesic_mean_weight": mean,
+            "actor/geodesic_max_weight": max_w,
+            "actor/geodesic_min_weight": min_w,
+            "actor/geodesic_std_weight": std,
+            "actor/geodesic_trust_region_scale": float(trust_region_scale),
+            "actor/geodesic_full_logit_mode": float(full_logit),
+            "actor/geodesic_non_finite_unmasked": float(non_finite_unmasked),
+        }
     return weight, metrics
 
 

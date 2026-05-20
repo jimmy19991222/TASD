@@ -962,8 +962,17 @@ class DataParallelPPOActor(BasePPOActor):
                                 student_log_probs=log_prob,
                                 student_all_log_probs=geodesic_full,
                                 trust_region_scale=trust_region,
+                                response_mask=loss_mask,  # mask masked positions out of weight + metrics
                             )
                             qv_advantages = qv_advantages * manifold_weight
+                            # Final safety: weight at masked positions is now 1.0 (no garbage),
+                            # but in case the multiplication still produced anything weird,
+                            # force masked + non-finite slots to exactly 0.
+                            qv_advantages = torch.where(
+                                loss_mask.bool() & torch.isfinite(qv_advantages),
+                                qv_advantages,
+                                torch.zeros_like(qv_advantages),
+                            )
                             qv_metrics.update(geodesic_metrics)
 
                         # Reuse vanilla PPO loss with the override advantages.
