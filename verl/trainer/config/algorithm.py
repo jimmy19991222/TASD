@@ -597,9 +597,7 @@ class AlgoConfig(BaseConfig):
 
             For backward compatibility, you can still pass a dict, which will be converted to
             RolloutCorrectionConfig automatically.
-        use_vce (bool): Whether to use V_CE baseline for advantage computation.
-        use_log_pi_s (bool): Whether to use log pi_s in advantage computation.
-        clip_value (float): Advantage clip threshold for V_CE.
+        clip_value (float): Advantage clip threshold for ``self_teacher`` advantage.
         adv_std_floor (float): Standard deviation floor for advantage normalization.
     """
 
@@ -617,8 +615,10 @@ class AlgoConfig(BaseConfig):
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None
 
-    # Self-Teacher Advantage configuration
-    use_vce: bool = False  # Whether to use V_CE baseline for advantage computation
-    use_log_pi_s: bool = False  # Whether to use log pi_s in advantage computation
-    clip_value: float = 3.0  # Advantage clip threshold for V_CE
+    # Self-Teacher Advantage configuration (clip / std-floor only).
+    # The historical ``use_vce`` and ``use_log_pi_s`` flags were dead -- the
+    # actual V_CE baseline now lives on the ``teacher_qv`` policy-loss path
+    # (see verl/workers/config/actor.py::TeacherQVConfig and the
+    # ``baseline_type='ce'`` branch of compute_teacher_qv_advantage).
+    clip_value: float = 3.0  # Advantage clip threshold
     adv_std_floor: float = 0.0  # Standard deviation floor for advantage normalization

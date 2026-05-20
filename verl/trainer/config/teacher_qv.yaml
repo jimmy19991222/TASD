@@ -1,0 +1,36 @@
+defaults:
+  - sdpo
+  - _self_
+
+# Token-level Q - V advantage with PG loss.
+#   Q_t = log p_teacher(y_t)
+#   V_t selected by teacher_qv.baseline_type:
+#     - student     : V_t = log p_student(y_t)                       -> A = log p_t - log p_s (SDPO log-ratio)
+#     - ce          : V_t = E_{y~p_s}[log p_t(y)] = sum_v p_s log p_t -> A = log p_t(y_t) + CE(p_s, p_t)
+#                     (zero-mean PG baseline; needs full or topk logits on both sides)
+#     - group_mean  : V   = batch-mean of Q over valid tokens (single global baseline)
+#     - group_hier  : within-seq token z-score + across-seq seq-level z-score (uid-grouped)
+
+actor_rollout_ref:
+  actor:
+    policy_loss:
+      loss_mode: teacher_qv
+      teacher_qv:
+        baseline_type: student      # student | ce | group_mean | group_hier
+        norm_by_std: False
+        clip_value: null            # set e.g. 5.0 to clamp |A|
+        std_floor: 1e-3
+        detach_q: True
+        detach_v: True              # detach p_s in the V expectation (ce only)
+    self_distillation:
+      # Reuse SDPO's reprompt + EMA teacher infrastructure.
+      # NOTE: baseline_type='ce' REQUIRES full_logit_distillation=True
+      # (default below mirrors SDPO: topk=100 keeps memory bounded).
+      # For 'student' / 'group_mean' / 'group_hier' you can set
+      # full_logit_distillation=False to skip the full-vocab forward.
+      full_logit_distillation: True
+      distillation_topk: 100
+      alpha: 1.0                    # ignored for teacher_qv but kept valid
+      max_reprompt_len: 10240
+      is_clip: null
+      use_geodesic: False

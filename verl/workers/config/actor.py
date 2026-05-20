@@ -28,6 +28,7 @@ from .optimizer import OptimizerConfig
 __all__ = [
     "SelfDistillationConfig",
     "PolicyLossConfig",
+    "TeacherQVConfig",
     "RouterReplayConfig",
     "ActorConfig",
     "FSDPActorConfig",
@@ -150,18 +151,66 @@ class RouterReplayConfig(BaseConfig):
 
 
 @dataclass
+class TeacherQVConfig(BaseConfig):
+    """Configuration for the teacher_qv policy loss.
+
+    Token-level advantage A_t = Q_t - V_t, with Q_t = log p_teacher(y_t | y_<t)
+    (detached) and V_t selected by ``baseline_type``. The advantages are then
+    fed into the standard vanilla PPO loss machinery.
+
+    Args:
+        baseline_type (str): Source for V_t.
+            - 'student': V_t = log p_student(y_t) (detached). Recovers the
+              SDPO log-ratio signal: A = log p_t - log p_s.
+            - 'ce': V_t = -log p_student(y_t) (detached); A = log p_t + log p_s
+              (a "joint confidence" advantage).
+            - 'group_mean': V_t = mean of Q over all valid tokens in the
+              current micro-batch (single global baseline).
+            - 'group_hier': V_t implements the two-level normalization the user
+              proposed -- first remove the per-sequence token-mean of Q, then
+              divide by per-group std across sequences (uid-grouped).
+        norm_by_std (bool): Whether to divide A by the std used at the same
+            granularity as ``baseline_type`` (per-batch for 'group_mean',
+            per-group for 'group_hier').
+        clip_value (Optional[float]): If set, clamp A to [-clip_value, clip_value].
+        std_floor (float): Floor on std denominators for numerical stability.
+        detach_q (bool): Whether to stop-grad on log_teacher_prob (default True).
+        detach_v (bool): Whether to stop-grad on V (default True).
+    """
+
+    baseline_type: str = "student"
+    norm_by_std: bool = False
+    clip_value: Optional[float] = None
+    std_floor: float = 1e-3
+    detach_q: bool = True
+    detach_v: bool = True
+
+    def __post_init__(self):
+        valid = {"student", "ce", "group_mean", "group_hier"}
+        if self.baseline_type not in valid:
+            raise ValueError(
+                f"teacher_qv.baseline_type must be one of {sorted(valid)}, got {self.baseline_type}"
+            )
+        if self.clip_value is not None and self.clip_value <= 0:
+            raise ValueError(f"teacher_qv.clip_value must be positive, got {self.clip_value}")
+        if self.std_floor < 0:
+            raise ValueError(f"teacher_qv.std_floor must be >= 0, got {self.std_floor}")
+
+
+@dataclass
 class PolicyLossConfig(BaseConfig):
     """Configuration for policy loss computation.
 
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
 
     Args:
-        loss_mode (str): Loss function mode. Options: 'vanilla', 'clip-cov', 'kl-cov', 'gpg', 'sdpo'.
+        loss_mode (str): Loss function mode. Options: 'vanilla', 'clip-cov', 'kl-cov', 'gpg', 'sdpo', 'teacher_qv'.
         clip_cov_ratio (float): Ratio of tokens to be clipped for clip-cov loss.
         clip_cov_lb (float): Lower bound for clip-cov loss.
         clip_cov_ub (float): Upper bound for clip-cov loss.
         kl_cov_ratio (float): Ratio of tokens to be applied KL penalty for kl-cov loss.
         ppo_kl_coef (float): KL divergence penalty coefficient.
+        teacher_qv (TeacherQVConfig): Configuration for the teacher_qv loss.
     """
 
     loss_mode: str = "vanilla"
@@ -170,6 +219,7 @@ class PolicyLossConfig(BaseConfig):
     clip_cov_ub: float = 5.0
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
+    teacher_qv: TeacherQVConfig = field(default_factory=TeacherQVConfig)
 
 
 @dataclass

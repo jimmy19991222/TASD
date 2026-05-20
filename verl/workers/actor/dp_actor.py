@@ -29,7 +29,14 @@ from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, compute_self_distillation_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import (
+    agg_loss,
+    compute_geodesic_manifold_weight,
+    compute_self_distillation_loss,
+    compute_teacher_qv_advantage,
+    get_policy_loss_fn,
+    kl_penalty,
+)
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -43,6 +50,19 @@ from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
 
 __all__ = ["DataParallelPPOActor"]
+
+
+def _qv_add_tail(log_probs: torch.Tensor) -> torch.Tensor:
+    """Append a synthetic 'everything else' bucket so a topk log-prob slab
+    normalizes to 1 over the last dim. Same trick used in SDPO's
+    compute_self_distillation_loss.
+
+    log_probs: (..., K) -> (..., K+1) with last column = log(1 - sum exp(log_probs)).
+    """
+    log_s = torch.logsumexp(log_probs, dim=-1, keepdim=True)
+    log_s = torch.clamp(log_s, max=-1e-7)
+    tail_log = torch.log(-torch.expm1(log_s))
+    return torch.cat([log_probs, tail_log], dim=-1)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -132,7 +152,7 @@ class DataParallelPPOActor(BasePPOActor):
     def _update_teacher(self) -> None:
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-        if not self_distillation_cfg or loss_mode != "sdpo":
+        if not self_distillation_cfg or loss_mode not in ("sdpo", "teacher_qv"):
             return
         teacher_regularization = getattr(self_distillation_cfg, "teacher_regularization", "ema")
         if teacher_regularization != "ema":
@@ -682,8 +702,11 @@ class DataParallelPPOActor(BasePPOActor):
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
         self_distillation_enabled = loss_mode == "sdpo"
+        teacher_qv_enabled = loss_mode == "teacher_qv"
+        teacher_forward_required = self_distillation_enabled or teacher_qv_enabled
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
-        if self_distillation_enabled:
+        teacher_qv_cfg = self.config.policy_loss.get("teacher_qv", None) if teacher_qv_enabled else None
+        if teacher_forward_required:
             self_distillation_required_keys = {
                 "teacher_input_ids",
                 "teacher_attention_mask",
@@ -705,7 +728,7 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("prompts")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
-        if self_distillation_enabled:
+        if teacher_forward_required:
             select_keys.extend(list(self_distillation_required_keys))
         # Include pre-computed IS weights if present in batch
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
@@ -721,7 +744,16 @@ class DataParallelPPOActor(BasePPOActor):
         non_tensor_select_keys = []
         if has_multi_modal_inputs:
             non_tensor_select_keys.append("multi_modal_inputs")
-        if self.use_prefix_grouper and "uid" in data.non_tensor_batch.keys():
+        teacher_qv_needs_uid = (
+            teacher_qv_enabled
+            and teacher_qv_cfg is not None
+            and teacher_qv_cfg.get("baseline_type", "student") in ("group_hier",)
+        )
+        if (
+            (self.use_prefix_grouper or teacher_qv_needs_uid)
+            and "uid" in data.non_tensor_batch.keys()
+            and "uid" not in non_tensor_select_keys
+        ):
             non_tensor_select_keys.append("uid")
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
@@ -762,8 +794,8 @@ class DataParallelPPOActor(BasePPOActor):
                     loss_agg_mode = self.config.loss_agg_mode
 
                     calculate_entropy = self.config.calculate_entropy or (entropy_coeff != 0)
-                    self_distillation_mask = model_inputs.get("self_distillation_mask") if self_distillation_enabled else None
-                    if self_distillation_enabled:
+                    self_distillation_mask = model_inputs.get("self_distillation_mask") if teacher_forward_required else None
+                    if teacher_forward_required:
                         assert not has_multi_modal_inputs, "Multi-modal inputs are not supported for distillation"
 
                     if self.config.use_dynamic_bsz:
@@ -771,12 +803,34 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
 
-                    teacher_regularization = self_distillation_cfg.get("teacher_regularization", "ema")
-                    if teacher_regularization == "trust-region" and self.use_fused_kernels:
-                        raise ValueError("trust-region teacher requires disabling fused kernels to access logits.")
-                    # all return: (bsz, response_length)
-                    return_all_logps = self_distillation_cfg.full_logit_distillation and not self_distillation_cfg.distillation_topk
-                    distill_topk = self_distillation_cfg.distillation_topk if self_distillation_cfg.full_logit_distillation else None
+                    if teacher_forward_required:
+                        teacher_regularization = self_distillation_cfg.get("teacher_regularization", "ema")
+                        if teacher_regularization == "trust-region" and self.use_fused_kernels:
+                            raise ValueError("trust-region teacher requires disabling fused kernels to access logits.")
+                        # teacher_qv with baseline_type='ce' needs full or topk-aligned vocab
+                        # log-probs on both sides to compute V_t = E_{y~p_s}[log p_t(y)].
+                        # Other baselines only need the sampled-token log-prob.
+                        qv_needs_full_logits = (
+                            teacher_qv_enabled
+                            and teacher_qv_cfg is not None
+                            and teacher_qv_cfg.get("baseline_type", "student") == "ce"
+                        )
+                        if teacher_qv_enabled and not qv_needs_full_logits:
+                            return_all_logps = False
+                            distill_topk = None
+                        else:
+                            return_all_logps = self_distillation_cfg.full_logit_distillation and not self_distillation_cfg.distillation_topk
+                            distill_topk = self_distillation_cfg.distillation_topk if self_distillation_cfg.full_logit_distillation else None
+                            if qv_needs_full_logits and not (return_all_logps or distill_topk):
+                                raise ValueError(
+                                    "teacher_qv baseline_type='ce' requires self_distillation.full_logit_distillation=True "
+                                    "(optionally with distillation_topk to limit memory)."
+                                )
+                    else:
+                        teacher_regularization = None
+                        return_all_logps = False
+                        distill_topk = None
+                        qv_needs_full_logits = False
                     outputs = self._forward_micro_batch(
                         model_inputs,
                         temperature=temperature,
@@ -805,7 +859,7 @@ class DataParallelPPOActor(BasePPOActor):
                     # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                     rollout_is_weights = model_inputs.get("rollout_is_weights", None)
 
-                    if self_distillation_enabled:
+                    if teacher_forward_required:
                         teacher_inputs = {
                             "responses": model_inputs["responses"],
                             "input_ids": model_inputs["teacher_input_ids"],
@@ -830,6 +884,8 @@ class DataParallelPPOActor(BasePPOActor):
                         teacher_log_prob = teacher_outputs["log_probs"]
                         teacher_all_logps = teacher_outputs.get("all_logps") if return_all_logps else None
                         teacher_topk_logps = teacher_outputs.get("topk_logps") if distill_topk else None
+
+                    if self_distillation_enabled:
                         pg_loss, pg_metrics = compute_self_distillation_loss(
                             student_log_probs=log_prob,
                             teacher_log_probs=teacher_log_prob,
@@ -846,6 +902,82 @@ class DataParallelPPOActor(BasePPOActor):
                         )
 
                         pg_metrics["self_distillation/empty_target_batch"] = self_distillation_mask.sum().item() == 0
+                        micro_batch_metrics.update(pg_metrics)
+                    elif teacher_qv_enabled:
+                        # PG with token-level A_t = log p_teacher - V_t.
+                        # V_t is selected by ``policy_loss.teacher_qv.baseline_type``.
+                        loss_mask = response_mask
+                        if self_distillation_mask is not None:
+                            loss_mask = loss_mask * self_distillation_mask.unsqueeze(1)
+                        qv_index = model_inputs.get("uid", None)
+                        qv_baseline_type = teacher_qv_cfg.get("baseline_type", "student")
+
+                        # For baseline_type='ce' we need full-vocab (or topk-with-tail)
+                        # log-probs on both student and teacher so the per-token
+                        # expectation V_t = sum_v p_s(v) * log p_t(v) is well-defined.
+                        qv_student_full = None
+                        qv_teacher_full = None
+                        if qv_baseline_type == "ce":
+                            if student_all_logps is not None and teacher_all_logps is not None:
+                                qv_student_full = student_all_logps
+                                qv_teacher_full = teacher_all_logps
+                            elif student_topk_logps is not None and teacher_topk_logps is not None:
+                                qv_student_full = _qv_add_tail(student_topk_logps)
+                                qv_teacher_full = _qv_add_tail(teacher_topk_logps)
+                            else:
+                                raise ValueError(
+                                    "teacher_qv baseline_type='ce' produced neither all_logps nor topk_logps; "
+                                    "check self_distillation.full_logit_distillation."
+                                )
+
+                        qv_advantages, qv_metrics = compute_teacher_qv_advantage(
+                            student_log_probs=log_prob,
+                            teacher_log_probs=teacher_log_prob,
+                            response_mask=loss_mask,
+                            baseline_type=qv_baseline_type,
+                            index=qv_index,
+                            norm_by_std=teacher_qv_cfg.get("norm_by_std", False),
+                            clip_value=teacher_qv_cfg.get("clip_value", None),
+                            std_floor=teacher_qv_cfg.get("std_floor", 1e-3),
+                            detach_q=teacher_qv_cfg.get("detach_q", True),
+                            detach_v=teacher_qv_cfg.get("detach_v", True),
+                            student_all_log_probs=qv_student_full,
+                            teacher_all_log_probs=qv_teacher_full,
+                        )
+
+                        # Geodesic Fisher manifold weight (orthogonal to baseline_type).
+                        # Reuses self_distillation.use_geodesic / geodesic_trust_region so SDPO
+                        # and teacher_qv share the same Geodesic switch.
+                        if self_distillation_cfg.get("use_geodesic", False):
+                            trust_region = float(
+                                self_distillation_cfg.get("geodesic_trust_region", 5.0)
+                            )
+                            geodesic_full = qv_student_full  # populated when ce mode runs
+                            manifold_weight, geodesic_metrics = compute_geodesic_manifold_weight(
+                                student_log_probs=log_prob,
+                                student_all_log_probs=geodesic_full,
+                                trust_region_scale=trust_region,
+                            )
+                            qv_advantages = qv_advantages * manifold_weight
+                            qv_metrics.update(geodesic_metrics)
+
+                        # Reuse vanilla PPO loss with the override advantages.
+                        from verl.trainer.ppo.core_algos import compute_policy_loss_vanilla
+
+                        pg_loss, pg_metrics = compute_policy_loss_vanilla(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=qv_advantages,
+                            response_mask=loss_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                        )
+                        pg_metrics.update(qv_metrics)
+                        if self_distillation_mask is not None:
+                            pg_metrics["teacher_qv/empty_target_batch"] = (
+                                self_distillation_mask.sum().item() == 0
+                            )
                         micro_batch_metrics.update(pg_metrics)
                     else:
                         # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg

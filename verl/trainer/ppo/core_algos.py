@@ -344,10 +344,12 @@ def compute_self_teacher_advantage(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Compute advantage for Self-Teacher mode.
-    
-    This is a GRPO-based advantage estimator with optional V_CE baseline and
-    log_pi_s support for self-distillation scenarios.
-    
+
+    GRPO-style outcome advantage on sequence-summed rewards with optional
+    clipping and std floor. The historical ``use_vce`` / ``use_log_pi_s`` flags
+    were never wired into this function -- proper V_CE / log-pi_s logic now
+    lives on the ``teacher_qv`` policy-loss path.
+
     Args:
         token_level_rewards: `(torch.Tensor)`
             shape is (bs, response_length)
@@ -360,12 +362,10 @@ def compute_self_teacher_advantage(
         norm_adv_by_std_in_grpo: `(bool)`
             whether to scale the advantage by std
         config: `(Optional[AlgoConfig])`
-            algorithm configuration object with optional self_teacher settings:
-            - use_vce: (bool) Whether to use V_CE baseline
-            - use_log_pi_s: (bool) Whether to use log pi_s
+            algorithm configuration with optional fields:
             - clip_value: (float) Advantage clip threshold
             - adv_std_floor: (float) Standard deviation floor
-    
+
     Returns:
         advantages: `(torch.Tensor)`
             shape is (bs, response_length)
@@ -378,15 +378,10 @@ def compute_self_teacher_advantage(
     id2mean = {}
     id2std = {}
 
-    # Parse self_teacher config
-    use_vce = False
-    use_log_pi_s = False
     clip_value = None
     adv_std_floor = 0.0
-    
+
     if config is not None:
-        use_vce = config.get("use_vce", False)
-        use_log_pi_s = config.get("use_log_pi_s", False)
         clip_value = config.get("clip_value", None)
         adv_std_floor = config.get("adv_std_floor", 0.0)
 
@@ -420,6 +415,177 @@ def compute_self_teacher_advantage(
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores
+
+
+def compute_geodesic_manifold_weight(
+    student_log_probs: torch.Tensor,
+    student_all_log_probs: Optional[torch.Tensor] = None,
+    trust_region_scale: float = 5.0,
+    eps: float = 1e-5,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Fisher-metric based manifold weight for natural-gradient-style loss scaling.
+
+    Reproduces the same formula used inside ``compute_self_distillation_loss``
+    so SDPO and teacher_qv can share the Geodesic axis.
+
+    Two modes:
+      * If ``student_all_log_probs`` is provided (B, T, V) the diagonal Fisher
+        is summed over vocab: F_t = Σ_v p_s(v) * (1 - p_s(v)).
+      * Otherwise (token-level) F_t = p_s(y_t) * (1 - p_s(y_t)).
+
+    Returns ``(weight, metrics)`` where ``weight`` has shape ``(B, T)``.
+    """
+    if student_all_log_probs is not None:
+        p_s = torch.exp(student_all_log_probs.detach())
+        fisher = (p_s * (1.0 - p_s)).sum(-1)
+        full_logit = True
+    else:
+        p_s = torch.exp(student_log_probs.detach())
+        fisher = p_s * (1.0 - p_s)
+        full_logit = False
+    fisher = fisher + eps
+    raw = 1.0 / fisher
+    weight = torch.where(
+        raw > trust_region_scale,
+        trust_region_scale + torch.log(raw - trust_region_scale + 1.0),
+        raw,
+    )
+    metrics = {
+        "actor/geodesic_mean_weight": weight.mean().detach().item(),
+        "actor/geodesic_max_weight": weight.max().detach().item(),
+        "actor/geodesic_min_weight": weight.min().detach().item(),
+        "actor/geodesic_std_weight": weight.std().detach().item(),
+        "actor/geodesic_trust_region_scale": float(trust_region_scale),
+        "actor/geodesic_full_logit_mode": float(full_logit),
+    }
+    return weight, metrics
+
+
+def compute_teacher_qv_advantage(
+    student_log_probs: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    baseline_type: str = "student",
+    index: Optional[np.ndarray] = None,
+    norm_by_std: bool = False,
+    clip_value: Optional[float] = None,
+    std_floor: float = 1e-3,
+    detach_q: bool = True,
+    detach_v: bool = True,
+    student_all_log_probs: Optional[torch.Tensor] = None,
+    teacher_all_log_probs: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Token-level advantage A = Q - V with Q = log p_teacher and configurable V.
+
+    All advantages are zero outside ``response_mask``. Returns (advantages, metrics)
+    where advantages has shape ``(B, T)`` matching the inputs.
+
+    baseline_type semantics:
+      * 'student'    : V_t = log p_student(y_t)             -> A = log p_t - log p_s
+      * 'ce'         : V_t = E_{y~p_s}[log p_t(y)]          -> A = log p_t(y_t) + CE(p_s, p_t).
+                       The zero-mean policy-gradient baseline. Requires full-vocab
+                       (or topk-aligned) ``student_all_log_probs`` and
+                       ``teacher_all_log_probs`` so the per-token expectation
+                       Σ_v p_s(v) · log p_t(v) can be computed.
+      * 'group_mean' : V = mean over all valid tokens in batch (scalar baseline);
+                       optional std-norm uses the same global std.
+      * 'group_hier' : two-level normalization. Step 1: Q_t' = Q_t - mean_seq(Q),
+                       Step 2: scale by group std of (per-seq token-mean of Q'),
+                       grouped by ``index``. Falls back to all-batch grouping if
+                       ``index`` is None.
+    """
+
+    if baseline_type not in {"student", "ce", "group_mean", "group_hier"}:
+        raise ValueError(f"unknown baseline_type: {baseline_type}")
+
+    mask = response_mask.float()
+    valid = mask.sum().clamp(min=1.0)
+
+    Q = teacher_log_probs.detach() if detach_q else teacher_log_probs
+    if baseline_type == "student":
+        V = student_log_probs.detach() if detach_v else student_log_probs
+        adv = (Q - V) * mask
+    elif baseline_type == "ce":
+        if student_all_log_probs is None or teacher_all_log_probs is None:
+            raise ValueError(
+                "baseline_type='ce' requires student_all_log_probs and teacher_all_log_probs "
+                "(full vocab or topk-aligned). Enable full_logit_distillation or distillation_topk."
+            )
+        if student_all_log_probs.shape != teacher_all_log_probs.shape:
+            raise ValueError(
+                "student_all_log_probs and teacher_all_log_probs must share the same shape; "
+                f"got {tuple(student_all_log_probs.shape)} vs {tuple(teacher_all_log_probs.shape)}."
+            )
+        # V_t = E_{y~p_s}[log p_t(y)] = sum_v p_s(v) * log p_t(v).
+        # detach_v controls whether gradients flow through p_s; the teacher side is
+        # always detached because it's already a no-grad tensor.
+        s_log = student_all_log_probs if not detach_v else student_all_log_probs.detach()
+        t_log = teacher_all_log_probs.detach()
+        # numerically stable: p_s = exp(s_log), then weighted sum with t_log.
+        V = (torch.exp(s_log) * t_log).sum(dim=-1)
+        adv = (Q - V) * mask
+    elif baseline_type == "group_mean":
+        Q_masked = Q * mask
+        mean_q = Q_masked.sum() / valid
+        adv = (Q - mean_q) * mask
+        if norm_by_std:
+            var = ((Q - mean_q) ** 2 * mask).sum() / valid
+            std = torch.sqrt(var.clamp(min=0.0)).clamp(min=std_floor)
+            adv = adv / std
+    else:  # group_hier -- GRPO-style additive decomposition.
+        # Token-level z-score within each sequence + broadcasted seq-level
+        # z-score across sequences within the same group (uid). This is the
+        # user's "first per-seq token norm, then per-seq norm across the group"
+        # spec, made symmetric so both terms contribute on the token axis.
+        seq_token_count = mask.sum(dim=-1, keepdim=True).clamp(min=1.0)  # (B, 1)
+        seq_mean = (Q * mask).sum(dim=-1, keepdim=True) / seq_token_count  # (B, 1)
+        within_seq_centered = (Q - seq_mean) * mask
+        if norm_by_std:
+            within_seq_var = ((Q - seq_mean) ** 2 * mask).sum(dim=-1, keepdim=True) / seq_token_count
+            within_seq_std = torch.sqrt(within_seq_var.clamp(min=0.0)).clamp(min=std_floor)
+            within_seq_z = within_seq_centered / within_seq_std
+        else:
+            within_seq_z = within_seq_centered
+
+        if index is None:
+            grp_idx = torch.zeros(Q.shape[0], dtype=torch.long, device=Q.device)
+        else:
+            grp_idx = as_torch_index(index, device=Q.device)
+        seq_mean_flat = seq_mean.squeeze(-1)  # (B,)
+        mean_g, std_g, _ = group_mean_std(seq_mean_flat, grp_idx, eps=1e-8)
+        seq_centered = seq_mean_flat - mean_g[grp_idx]
+        if norm_by_std:
+            seq_z = seq_centered / std_g[grp_idx].clamp(min=std_floor)
+        else:
+            seq_z = seq_centered
+        # Broadcast the seq-level z-score to all tokens of the seq.
+        across_seq_term = seq_z.unsqueeze(-1) * mask
+        adv = within_seq_z + across_seq_term
+
+    if clip_value is not None:
+        adv = torch.clamp(adv, -clip_value, clip_value)
+    adv = adv * mask
+
+    with torch.no_grad():
+        adv_sum = (adv * mask).sum()
+        adv_abs_sum = (adv.abs() * mask).sum()
+        adv_sq_sum = (adv * adv * mask).sum()
+        mean = (adv_sum / valid).item()
+        mean_abs = (adv_abs_sum / valid).item()
+        var = (adv_sq_sum / valid).item() - mean * mean
+        std = (var if var > 0 else 0.0) ** 0.5
+        metrics = {
+            "actor/teacher_qv_adv_mean": mean,
+            "actor/teacher_qv_adv_std": std,
+            "actor/teacher_qv_adv_abs_mean": mean_abs,
+            "actor/teacher_qv_adv_max": (adv * mask).max().item(),
+            "actor/teacher_qv_adv_min": (adv * mask).min().item(),
+            "actor/teacher_qv_baseline_type_id": float(
+                {"student": 0, "ce": 1, "group_mean": 2, "group_hier": 3}[baseline_type]
+            ),
+        }
+
+    return adv, metrics
 
 
 @register_adv_est(AdvantageEstimator.GRPO_VECTORIZED)

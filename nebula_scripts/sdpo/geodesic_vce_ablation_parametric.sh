@@ -112,12 +112,13 @@ if [ "$LOSS_MODE" = "sdpo" ]; then
         actor_rollout_ref.actor.self_distillation.geodesic_beta_scale=${GEODESIC_BETA_SCALE}
     )
 elif [ "$LOSS_MODE" = "self_teacher" ]; then
-    # Self-Teacher 模式：使用 advantage + policy gradient
+    # Self-Teacher 模式：sequence-level GRPO outcome advantage + vanilla PG.
+    # NOTE: the historical USE_VCE / USE_LOG_PI_S env vars are accepted for
+    # backward compatibility but ignored -- those flags were never wired in.
+    # For a real V_CE baseline use loss_mode=teacher_qv with baseline_type=ce.
     HYDRA_ARGS+=(
         actor_rollout_ref.actor.policy_loss.loss_mode=vanilla
         algorithm.adv_estimator=self_teacher
-        algorithm.use_vce=${USE_VCE}
-        algorithm.use_log_pi_s=${USE_LOG_PI_S}
         algorithm.clip_value=${CLIP_VALUE}
         algorithm.adv_std_floor=${ADV_STD_FLOOR}
     )

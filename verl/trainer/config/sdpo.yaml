@@ -38,9 +38,8 @@ algorithm:
     rollout_is: token
     rollout_is_threshold: 2.0
 
-  # Self-Teacher Advantage configuration (for loss_mode=self_teacher)
-  use_vce: False  # Whether to use V_CE baseline
-  use_log_pi_s: False  # Whether to use log pi_s
+  # Self-Teacher Advantage configuration (for adv_estimator=self_teacher).
+  # Real V_CE now lives on policy_loss.teacher_qv (see configs/teacher_qv.yaml).
   clip_value: 3.0  # Advantage clip threshold
   adv_std_floor: 0.0  # Standard deviation floor
 

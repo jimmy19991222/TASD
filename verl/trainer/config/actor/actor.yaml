@@ -57,7 +57,7 @@ policy_loss:
   # # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: verl.workers.config.PolicyLossConfig
 
-  # Loss function mode: vanilla / clip-cov / kl-cov / gpg / sdpo
+  # Loss function mode: vanilla / clip-cov / kl-cov / gpg / sdpo / teacher_qv
   loss_mode: "vanilla"
 
   # Ratio of tokens to be clipped for clip-cov loss
@@ -74,6 +74,17 @@ policy_loss:
 
   # KL divergence penalty coefficient
   ppo_kl_coef: 0.1
+
+  # Token-level Q - V advantage; only used when loss_mode == "teacher_qv"
+  teacher_qv:
+    _target_: verl.workers.config.TeacherQVConfig
+    # student | ce | group_mean | group_hier
+    baseline_type: "student"
+    norm_by_std: False
+    clip_value: null
+    std_floor: 1.0e-3
+    detach_q: True
+    detach_v: True
 
 # self-distillation config
 self_distillation:
