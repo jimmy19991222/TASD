@@ -1,332 +1,239 @@
-# Geodesic-VCE 融合实验：理论动机与实现文档
+# Q − V 统一框架下的 PG 训练方法
 
-**分支**: `geodesic-sdpo`  
-**创建时间**: 2026-05-19  
-**实验状态**: 🚀 待提交（Nebula 环境配置修复中）  
-**Seed**: 42（严格控制，保证可复现性）
-
----
-
-## 📋 TL;DR
-
-本文档记录了 **Geodesic SDPO**（测地线偏好优化）与 **V_CE**（Cross-Entropy Baseline）的融合实验设计与实现。核心科学问题是：
-
-1. **V_CE 是否真的导致 entropy collapse？**（复现历史问题）
-2. **Geodesic 约束能否免疫 V_CE 的熵崩溃？**（理论验证）
-3. **SDPO+Geodesic vs VCE+Geodesic 哪个更强？**（算法对比）
-
-实验采用 **4 组消融设计**，在 `sciknoweval/biology` 数据集上严格统一 seed=42 和所有超参，唯一变量是算法设计。
+**分支**: `geodesic-sdpo-v2`
+**最后更新**: 2026-05-20
+**Seed**: 42（所有实验严格统一）
 
 ---
 
-## 🎯 一、理论动机
+## 一、设计原则
 
-### 1.1 V_CE 的熵崩溃问题
+把所有正在比较的训练方法**统一到**一个最小架构：
 
-在 `self-teacher-advantage` 分支的研究中，我们发现 V_CE（Cross-Entropy Baseline）会导致严重的 **entropy collapse**：
-
-```python
-# V_CE 的核心公式
-V_CE[i,t] = Σ_k π_student(k) · log π_teacher(k)  # 期望值
-A_raw[i,t] = Q[i,t] - V_CE[i,t]                   # advantage
+```
+loss  = -A_t · log π_θ(y_t)              (PG，沿用 PPO 的 IS clip)
+A_t   = Q_t - V_t                         (token-level advantage)
 ```
 
-**崩溃机制**：
-- 当 student 分布集中（低熵）时，V_CE ≈ log π_teacher(y_t)
-- 导致 A_raw → 0，**advantage 消失**
-- 模型失去探索动力，进一步固化低熵分布 → **正反馈循环**
+不同算法只对应不同的 (Q, V) 选择。这样：
+- 每个新算法 = 一行 config，而不是一份新 loss 文件
+- 跨方法对比可控（同一份 PG/clip/aggregation/rollout correction）
+- Geodesic 等"loss 后处理"（Fisher 加权、IS 截断）和 (Q, V) 正交，可独立开关
 
-### 1.2 Geodesic SDPO 的内生熵保护
+### 1.1 Q / V 语义澄清
 
-Geodesic SDPO 基于 **信息几何**（Information Geometry）理论，在概率流形上做 Natural Gradient 更新：
+教科书 RL 里 A = Q − V 的 Q 和 V **都是 return（累计折扣回报的期望）**，不是 reward：
 
-```python
-# Fisher 对角近似
-F ≈ p(1-p)  # p = π_student(y_t)
-
-# 流形权重（Trust Region 平滑裁剪）
-manifold_weight = torch.where(
-    1/F > trust_region,
-    trust_region + torch.log(1/F - trust_region + 1.0),
-    1/F
-)
-
-# 外部缩放 loss
-loss = manifold_weight × base_loss
+```
+V(s_t)     = E[ G_t | s_t ]        state value
+Q(s_t,a_t) = E[ G_t | s_t, a_t ]   action value（指定动作 a_t）
+A(s_t,a_t) = Q(s_t,a_t) - V(s_t)   "选 a_t 比按策略 π 平均能多带回多少 return"
 ```
 
-**保护机制**：
-| Student 置信度 $p$ | Fisher $F=p(1-p)$ | manifold_weight $1/F$ | 效果 |
-|-------------------|-------------------|----------------------|------|
-| $p \to 1$（过度自信） | $F \to 0$ | $\to \infty$（截断后很大） | **强烈惩罚** |
-| $p \to 0$（完全不确定） | $F \to 0$ | $\to \infty$ | **鼓励探索** |
-| $p = 0.5$（最大熵） | $F = 0.25$ | $1/F = 4$ | 正常更新 |
+由 V(s)=E_{a~π}[Q(s,a)]，所以 E_{a~π}[A | s] = 0——这是 PG 用 V 做 baseline 减方差的根本理由。
 
-### 1.3 融合假设
+LLM 这套里，token-level 的真实 future return 拿不到（reward sparse），所以我们用各种**代理**：
 
-**核心假说**：Geodesic 约束可以在 **loss 层面** 提供熵保护，而 V_CE 在 **advantage 层面** 做 variance reduction，二者正交互补。
+| 框架角色 | 我们这里的代理 | 是否严格匹配 RL 定义 |
+|----------|----------------|---------------------|
+| Q_t | `log p_teacher(y_t)` | ❌ 不是 E[future reward \| y_t]，是 teacher 瞬时偏好作为 stand-in |
+| V_t (`student`) | log p_s(y_t) | ❌ 不是 E_{a~π}[Q]，是 student 自己对该 token 的瞬时偏好 |
+| V_t (`ce`) | Σ_v p_s(v) · log p_t(v) = E_{y~p_s}[Q(y)] | ✅ **严格符合 V = E_a[Q]**——所以 E[A\|s]=0 也严格成立 |
+| V_t (`group_mean`) | batch token-mean of Q | ❌ 经验 baseline，不严格符合 V=E[Q]（但 state-conditional → 不引入 bias） |
+| V_t (`group_hier`) | within-seq z + across-seq z | 同上 |
+
+**关键含义**：只有 `baseline_type='ce'` 是严格意义上的 V = E[Q]；其它 baseline 都是工程意义上的"任何 state-conditional 量都不引入 bias"的近似。这也是为什么 ce 是"零均值 PG baseline"，其它支只能保证不偏但不一定零均值。如果未来加 critic 网络估计真正的 V(s_t)（GAE 风格），那才是教科书意义的 A=Q−V。
 
 ---
 
-## 🔬 二、实验设计
+## 二、已实现的代码
 
-### 2.1 实验矩阵（4 组）
+### 2.1 新增入口：`loss_mode = "teacher_qv"`
 
-| 实验编号 | 名称 | loss_mode | use_vce | use_geodesic | 核心验证目标 |
-|---------|------|-----------|---------|--------------|-------------|
-| **A** | SDPO baseline | `sdpo` | False | False | 对照组（标准 SDPO） |
-| **B** | V_CE baseline | `self_teacher` | True | False | 复现熵崩溃 |
-| **C** | V_CE + Geodesic | `self_teacher` | True | True | 验证 Geodesic 免疫熵崩溃 |
-| **D** | SDPO + Geodesic | `sdpo` | False | True | 验证 Geodesic 在 SDPO 上的效果 |
+[verl/trainer/ppo/core_algos.py](verl/trainer/ppo/core_algos.py#L425) `compute_teacher_qv_advantage`：在 micro-batch 里现算 token-level A = Q − V，复用 vanilla PPO 的 `compute_policy_loss_vanilla`（保留 ratio clip、IS、loss 聚合）。
 
-### 2.2 控制变量
+接入点：[verl/workers/actor/dp_actor.py](verl/workers/actor/dp_actor.py)。复用 SDPO 已有的 teacher forward / EMA / trust-region 基础设施，只换 loss 计算这一步。
 
-所有实验严格统一以下超参：
+### 2.2 baseline_type 四选一
 
-```yaml
-# 训练参数
-seed: 42
-lr: 1e-5
-train_batch_size: 32
-rollout_n: 8
-model_name: Qwen3-8B
-total_training_steps: 250
+当前 Q 固定为 `log p_teacher(y_t)`（detach）。V 由 `policy_loss.teacher_qv.baseline_type` 选：
 
-# SDPO 参数
-alpha: 0.5  # Jensen-Shannon divergence
-distill_topk: 100
+| baseline_type | V_t | A_t | 等价于 |
+|---------------|-----|-----|--------|
+| `student` | log p_s(y_t) (detach) | log p_t − log p_s | SDPO sampled-token 形式（reverse-KL gradient） |
+| `ce` | **Σ_v p_s(v) · log p_t(v)** = E_{y~p_s}[log p_t] | log p_t(y_t) + CE(p_s, p_t) | 真正的 V_CE（zero-mean PG baseline） |
+| `group_mean` | batch-mean(Q over valid tokens) | (Q − μ) [/ σ if `norm_by_std`] | 单一全局 baseline，类似 outcome-only GRPO 但在 token 维上 |
+| `group_hier` | within-seq z(Q) + across-seq z(seq_mean_Q) | GRPO 风格双层 z-score（uid 分组） | 把"token 在 seq 内的相对位置"和"seq 在组内的相对位置"两个尺度叠加 |
 
-# V_CE 参数
-clip_value: 3.0  # advantage clip threshold
-adv_std_floor: 0.0
+实现细节：
+- `baseline_type=ce` **需要 full vocab 或 topk-aligned log-probs**。Dp_actor 自动检测并打开 `full_logit_distillation=True, distillation_topk=100`（默认）。topk 模式下用 `_qv_add_tail` 补一个 sum-to-1 的尾桶。
+- 所有 baseline 都支持：
+  - `norm_by_std`: 是否除以对应尺度的 std
+  - `clip_value`: 是否 clamp |A| ≤ c
+  - `std_floor`: std 下限防数值崩溃
+  - `detach_q / detach_v`: 是否切断对应分支的梯度（默认都切，保持纯 PG 行为）
 
-# Geodesic 参数
-geodesic_trust_region: 5.0
-geodesic_beta_scale: 0.5
+#### V_CE 公式 + 数值例子（澄清 A 的正负号）
+
+```
+V_t = E_{y~p_s(·|ctx_t)}[ log p_t(y|ctx_t) ]    ← 负数（log 概率的期望）
+    = -CE(p_s, p_t)                              ← 等价写法
+A_t = log p_t(y_t) - V_t
+    = log p_t(y_t) + CE(p_s, p_t)                ← 同一个东西的不同写法
 ```
 
-### 2.3 预期结果
+第三行的 "+CE" 不是"两个正数相加"——`log p_t(y_t)` 是负数，CE 是正数，**符号取决于"采样到的 token 在 teacher 眼里的 log-prob，是否高于 student 分布下 log p_t 的平均水平"**。
 
-| 对比 | 预期现象 | 科学意义 |
-|------|---------|---------|
-| **B vs A** | B 的 entropy 快速下降，accuracy 初期上升后崩塌 | 复现 V_CE 熵崩溃 |
-| **C vs B** | C 的 entropy 稳定，accuracy 持续上升 | Geodesic 免疫熵崩溃 ✓ |
-| **D vs C** | 对比最终 accuracy 和收敛速度 | 哪种范式更强？ |
+例：vocab={A,B,C}，p_s=[0.7, 0.2, 0.1]，p_t=[0.4, 0.5, 0.1]：
 
----
+```
+log p_t       = [-0.92, -0.69, -2.30]
+V_t           = 0.7·(-0.92) + 0.2·(-0.69) + 0.1·(-2.30) = -1.012
+CE(p_s,p_t)   = +1.012
 
-## 🛠️ 三、代码实现
+采样到 B (teacher 喜欢): A = -0.69 - (-1.012) = +0.32  → 提升 student 给 B 的概率
+采样到 C (teacher 不喜欢): A = -2.30 - (-1.012) = -1.29  → 压低 student 给 C 的概率
+采样到 A (中等): A = -0.92 - (-1.012) = +0.09  → 轻微提升
 
-### 3.1 核心修改文件
-
-#### 1. `verl/trainer/ppo/core_algos.py`（Geodesic 约束实现）
-
-**修改位置**: `compute_self_distillation_loss` 函数（~L1179）
-
-```python
-# ===== Geodesic SDPO: Fisher 度量加权 (流形约束) =====
-use_geodesic = getattr(self_distillation_config, "use_geodesic", False)
-if use_geodesic:
-    # 计算 Fisher 对角近似
-    if student_all_log_probs is not None:
-        # Full logit 模式：在 vocab 维度计算 Fisher
-        p_student = torch.exp(student_all_log_probs.detach())
-        fisher_metric = (p_student * (1.0 - p_student)).sum(-1)
-    else:
-        # Token-level 模式
-        p_student = torch.exp(student_log_probs.detach())
-        fisher_metric = p_student * (1.0 - p_student)
-    
-    fisher_metric = fisher_metric + 1e-5
-    
-    # Trust Region / Geometric Huber-style clipping
-    trust_region_scale = getattr(self_distillation_config, "geodesic_trust_region", 5.0)
-    manifold_weight = torch.where(
-        1.0 / fisher_metric > trust_region_scale,
-        trust_region_scale + torch.log(1.0 / fisher_metric - trust_region_scale + 1.0),
-        1.0 / fisher_metric
-    )
-    
-    # 外部缩放
-    per_token_loss = per_token_loss * manifold_weight
-    
-    # 记录指标
-    metrics["actor/geodesic_mean_weight"] = manifold_weight.mean().detach().item()
-    metrics["actor/geodesic_max_weight"] = manifold_weight.max().detach().item()
+E[A | s] = 0.7·0.09 + 0.2·0.32 + 0.1·(-1.29) ≈ 0  ✓ (state-dependent zero-mean baseline)
 ```
 
-**关键设计决策**：
-- ✅ 使用 `detach()` 阻断计算图（不优化 Fisher 本身）
-- ✅ Trust Region 平滑裁剪（而非硬 clamp，保留梯度方向）
-- ✅ 外部缩放（不改变 BT 模型最优点）
+### 2.3 Geodesic Fisher manifold weight（已接入 teacher_qv）
 
-#### 2. `verl/trainer/config/sdpo.yaml`（配置开关）
+[verl/trainer/ppo/core_algos.py](verl/trainer/ppo/core_algos.py) 新增 `compute_geodesic_manifold_weight` 公共 helper。SDPO 和 teacher_qv **共享同一个 Geodesic 开关**：`self_distillation.use_geodesic` + `self_distillation.geodesic_trust_region`（沿用原 SDPO 的 config 字段名，不另立门户）。
 
-```yaml
-actor_rollout_ref:
-  actor:
-    self_distillation:
-      use_geodesic: False  # 默认关闭
-      geodesic_trust_region: 5.0
-      geodesic_beta_scale: 0.5
+公式：
+```
+F_t = Σ_v p_s(v) · (1 - p_s(v))   （full-logit 模式，对 vocab 求和）
+    或 p_s(y_t)·(1-p_s(y_t))      （token-level 模式，仅采样 token）
+w_t = trust_region + log(1/F_t - trust_region + 1)   if 1/F_t > trust_region
+    = 1/F_t                                          otherwise
 ```
 
-#### 3. `nebula_scripts/sdpo/geodesic_vce_ablation_parametric.sh`（统一参数化脚本）
+应用方式：在 teacher_qv 分支里，用 `qv_advantages = qv_advantages * w_t`，再喂给 `compute_policy_loss_vanilla`。由于 w_t > 0 且 PPO loss 对 advantages 是分段线性的，这等价于把整个 per-token loss 乘以 w_t。
 
-支持两种 loss_mode 的动态切换：
+记录的指标（前缀 `actor/geodesic_*`）：mean / max / min / std / trust_region_scale / full_logit_mode（0 或 1，反映是否是 full-vocab Fisher）。
 
-```bash
-if [ "$LOSS_MODE" = "sdpo" ]; then
-    # SDPO 模式：self_distillation loss
-    HYDRA_ARGS+=(
-        actor_rollout_ref.actor.policy_loss.loss_mode=sdpo
-        actor_rollout_ref.actor.self_distillation.use_geodesic=${USE_GEODESIC}
-        ...
-    )
-elif [ "$LOSS_MODE" = "self_teacher" ]; then
-    # Self-Teacher 模式：advantage + policy gradient
-    HYDRA_ARGS+=(
-        actor_rollout_ref.actor.policy_loss.loss_mode=vanilla
-        algorithm.adv_estimator=self_teacher
-        algorithm.use_vce=${USE_VCE}
-        ...
-    )
-fi
-```
+### 2.3 涉及的修改
 
-#### 4. `nebula_scripts/submit_geodesic_vce_ablation.sh`（标准化提交脚本）
+| 文件 | 变化 |
+|------|------|
+| [verl/workers/config/actor.py](verl/workers/config/actor.py) | 新增 `TeacherQVConfig` dataclass，嵌入 `PolicyLossConfig.teacher_qv` |
+| [verl/trainer/ppo/core_algos.py](verl/trainer/ppo/core_algos.py#L425) | 新增 `compute_teacher_qv_advantage`（四种 baseline + metrics） |
+| [verl/workers/actor/dp_actor.py](verl/workers/actor/dp_actor.py) | 新增 `loss_mode=teacher_qv` 分支；新增 `_qv_add_tail` |
+| [verl/trainer/ppo/ray_trainer.py:680](verl/trainer/ppo/ray_trainer.py#L680) / [main_ppo.py:131](verl/trainer/main_ppo.py#L131) / [fsdp_workers.py:896](verl/workers/fsdp_workers.py#L896) | gate `loss_mode == "sdpo"` → `loss_mode in ("sdpo", "teacher_qv")` |
+| [verl/trainer/config/actor/actor.yaml](verl/trainer/config/actor/actor.yaml) | 新增 `policy_loss.teacher_qv` schema 块 |
+| [verl/trainer/config/teacher_qv.yaml](verl/trainer/config/teacher_qv.yaml) | 新 Hydra config，继承自 `sdpo` |
+| [run_local_teacher_qv_smoke.sh](run_local_teacher_qv_smoke.sh) | 单卡 smoke test，传 baseline_type 即可 |
+| [nebula_scripts/sdpo/teacher_qv_sciknoweval_parametric.sh](nebula_scripts/sdpo/teacher_qv_sciknoweval_parametric.sh) | 集群 parametric 脚本 |
+| [nebula_scripts/submit_teacher_qv_ablation.sh](nebula_scripts/submit_teacher_qv_ablation.sh) | 4 组 ablation 提交器 |
 
-遵循 `submit_baseline_sweep.sh` 的 nebulactl 标准格式：
+### 2.4 老 `use_vce` / `use_log_pi_s` 配置项已移除
 
-```bash
-nebulactl run mdl \
-    --force \
-    --engine=xdl \
-    --queue=$QUEUE \
-    --entry=nebula_scripts/entry.py \
-    --user_params="--script_path=${SCRIPT_PATH} --world_size=${WORLD_SIZE} --job_name=${JOB_NAME} ${USER_PARAMS}" \
-    --worker_count=$WORLD_SIZE \
-    --file.cluster_file=$CLUSTER_FILE \
-    --job_name=$JOB_NAME \
-    --env=OPENLM_TOKEN=$OPENLM_TOKEN \
-    --env=OSS_ACCESS_ID=$OSS_ACCESS_ID \
-    ...
-```
+历史上的 `algorithm.use_vce` 和 `algorithm.use_log_pi_s` 这两个 flag 在 `compute_self_teacher_advantage` 里只 parse 不使用——之前所有标着 "VCE" 的实验跑的都是 sequence-level GRPO + clip（不含任何 V_CE 数学）。已经在 [algorithm.py](verl/trainer/config/algorithm.py)、[sdpo.yaml](verl/trainer/config/sdpo.yaml)、[geodesic_vce_ablation_parametric.sh](nebula_scripts/sdpo/geodesic_vce_ablation_parametric.sh) 里清除掉这两个 flag（保留 `clip_value` / `adv_std_floor` 因为它们真的有用）。
 
-### 3.2 Git 提交记录
+老 `compute_self_teacher_advantage` 函数本身保留，作为 sequence-level GRPO 的别名仍可用。**真 V_CE 完全走 `teacher_qv` 这条新路径。**
 
-| Commit | 说明 |
-|--------|------|
-| `53bd131` | feat: implement Geodesic SDPO with Fisher metric weighting |
-| `1e98dea` | refactor: replace clamp with trust region clipping for Geodesic SDPO |
-| `610fd20` | feat: add Geodesic-VCE ablation experiment scripts (4-way comparison) |
-| `77ac99c` | fix: standardize nebulactl submission format |
+### 2.5 还没接的能力（下一步要补）
+
+- ~~**Geodesic manifold weight 没挂到 teacher_qv loss 路径**~~ ✅ 已接，见 2.3
+- **`q_source` 维度只有 `log_teacher`**——把 GRPO（Q = outcome reward）、REINFORCE（V = 0）也纳入统一框架还需要再加一个 `q_source` 配置项
+- **SDPO 的 full-logit JSD 分支**（alpha ≠ 1）本质是 vocab 维 KL 散度的梯度，不是 token-level PG，不能用 Q−V 表达，需要继续保留独立 loss path
 
 ---
 
-## 📊 四、监控与诊断
+## 三、Q − V 表达下的方法对照
 
-### 4.1 SwanLab 关键指标
-
-| 指标名称 | 含义 | 预期行为 |
-|---------|------|---------|
-| `actor/entropy` | Student 策略熵值 | C/D 应显著高于 B |
-| `actor/geodesic_mean_weight` | 平均流形权重 | 应稳定在 2-8 之间 |
-| `actor/geodesic_max_weight` | 最大流形权重 | 验证 trust_region 截断 |
-| `val/accuracy` | 验证集准确率 | C/D 应持续上升，B 后期崩塌 |
-| `actor/kl_divergence` | Student-Teacher KL | 监控分布匹配程度 |
-
-### 4.2 异常诊断清单
-
-| 现象 | 可能原因 | 解决方案 |
-|------|---------|---------|
-| `geodesic_mean_weight` → ∞ | trust_region 设置过大 | 降低到 3.0 |
-| entropy 仍快速下降 | beta_scale 过小 | 增加到 0.7-1.0 |
-| accuracy 不收敛 | lr 过大或 mini_batch 过小 | 检查配置对齐 |
-| NaN loss | Fisher 计算溢出 | 检查 `detach()` 是否正确 |
+| 算法 | q_source | baseline_type | 备注 | 当前是否可跑 |
+|------|----------|---------------|------|--------------|
+| SDPO sampled-token | log_teacher | student | reverse-KL 在 sampled token 上的展开 | ✅ |
+| 真 V_CE | log_teacher | ce | zero-mean baseline | ✅ |
+| Token-level GRPO（teacher 提供 Q） | log_teacher | group_mean / group_hier | 不依赖 outcome reward 的"组内归一" | ✅ |
+| Outcome GRPO | outcome_reward | group_mean | 经典 GRPO（R_i − μ_g） | ❌ 待加 `q_source` |
+| REINFORCE | outcome_reward | zero | 无 baseline | ❌ 待加 `q_source` + `zero` baseline |
+| SDPO full-logit JSD | — | — | 不在 Q−V 框架内 | 保留独立路径 |
+| SDPO/VCE + Geodesic | 同上 | 同上 + `use_geodesic=True` | Fisher 加权 loss 后处理 | ❌ Geodesic 待移植到 teacher_qv |
+| Critic-based PPO | learned_value | bootstrap | 需要 critic 网络 | ❌ 本批不做 |
 
 ---
 
-## 🔮 五、后续扩展
+## 四、接下来的实验计划
 
-### 5.1 短期（本周）
+### Phase 0（先补完缺口）
 
-- [ ] 完成 4 组实验提交并监控训练动态
-- [ ] 对比 entropy 曲线验证 Geodesic 保护效果
-- [ ] 分析 accuracy 收敛速度差异
+| 任务 | 状态 | 产出 |
+|------|------|------|
+| 把 Geodesic manifold weight 移植到 teacher_qv loss | ✅ 完成 | `compute_geodesic_manifold_weight` helper，SDPO 与 teacher_qv 共享同一个开关 |
+| 移除 dead `use_vce` / `use_log_pi_s` 配置 | ✅ 完成 | 杜绝"挂了 use_vce=True 但其实跑 GRPO"的老坑 |
+| 给 teacher_qv 加 `q_source ∈ {log_teacher, outcome_reward}` | ⏳ Pending | GRPO 落到统一框架，阻塞 Phase 2 |
+| 加 `baseline_type=zero` | ⏳ Pending | REINFORCE 落到统一框架 |
 
-### 5.2 中期（下周）
+### Phase 1: 真·VCE 与 SDPO 对照（先跑这一组）
 
-- [ ] 在 `sciknoweval/chemistry` 上复现（跨领域验证）
-- [ ] 增加 `geodesic_trust_region` sweep（3.0/5.0/8.0）
-- [ ] 尝试 Geodesic-VCE 融合（V_CE advantage + Geodesic loss weighting）
+| 组 | loss_mode | baseline_type | use_geodesic | 期望验证 |
+|----|-----------|---------------|--------------|----------|
+| A | teacher_qv | student | False | 真 · SDPO sampled-token（基线） |
+| B | teacher_qv | ce | False | **真·V_CE，预计观察 entropy collapse**（验证文档第 34-37 行假说） |
+| C | teacher_qv | ce | True | V_CE + Geodesic（检验 Geodesic 是否救回崩溃） |
+| D | teacher_qv | student | True | SDPO + Geodesic（对照 D vs A 看 Geodesic 净增量） |
 
-### 5.3 长期（论文方向）
+控制变量：`Qwen3-8B / sciknoweval-biology / seed=42 / lr=1e-5 / batch=32 / rollout_n=8 / 250 step / distillation_topk=100`。
 
-- [ ] 理论证明：Geodesic 约束下的熵下界
-- [ ] 扩展到 DPO-TGS（On-Policy DPO with Teacher-Guided Sampling）
-- [ ] 与 Sinkhorn Credit Assignment 结合（最优传输视角）
+关键观测：
+- `actor/entropy`：B 是否在前 50 步内快速下降到接近 0；C 是否被 Geodesic 拉住
+- `actor/teacher_qv_adv_mean`：B 应稳定在 0 附近（zero-mean baseline 的性质），偏离 0 说明 topk=100 近似误差大
+- `actor/teacher_qv_adv_std`：A 跟 B 量纲差异
+- `val-core/sciknoweval/acc/mean@16`：终端准确率
+- `actor/geodesic_mean_weight`（C/D 才有）
 
----
+### Phase 2: Q 源对照（验证统一框架的覆盖力）
 
-## 📚 六、理论背景
+固定 V = group_mean（最稳的 baseline），改 Q：
 
-### 6.1 Natural Gradient 与 Fisher 信息矩阵
+| 组 | q_source | 等价于 |
+|----|----------|--------|
+| E | log_teacher | "teacher 信号 + outcome 风格 baseline"（新组合） |
+| F | outcome_reward | 经典 GRPO 复刻 |
 
-Natural Gradient 的核心思想是在 **统计流形**（Statistical Manifold）上做优化，而非欧氏参数空间：
+如果 E、F 都收敛且 E ≥ F，说明 teacher 信号比 sparse outcome reward 更稠密更稳；如果 F 显著好，说明 teacher 信号有偏（teacher 已经收敛后效用衰减）。
 
-$$\tilde{\nabla}_\theta L = F^{-1} \nabla_\theta L$$
+### Phase 3: 双层归一 vs 单层（验证 hierarchical 设计）
 
-其中 $F$ 是 Fisher 信息矩阵。对于 Categorical 分布，对角近似为：
+固定 q_source=log_teacher：
 
-$$F_{ii} \approx p_i(1-p_i)$$
+| 组 | baseline_type | norm_by_std | 看什么 |
+|----|---------------|-------------|--------|
+| G | group_mean | True | 单层全局 z-score |
+| H | group_hier | True | within-seq z + across-seq z 叠加 |
+| H' | group_hier | False | 只做中心化、不归一 |
 
-### 6.2 Trust Region 与几何 Huber 裁剪
+预期 H > G（hierarchical 能保留 seq 内 token 的相对结构）；H vs H' 看归一化必要性。
 
-标准的 Natural Gradient 在 $p \to 0$ 或 $p \to 1$ 时会导致梯度爆炸。我们提出 **几何 Huber 裁剪**：
+### Phase 4（如果 Phase 1 的 B 真崩溃且 C 救回）
 
-$$w(p) = \begin{cases} 
-\frac{1}{F(p)} & \text{if } \frac{1}{F(p)} \leq \tau \\
-\tau + \log\left(\frac{1}{F(p)} - \tau + 1\right) & \text{otherwise}
-\end{cases}$$
-
-这比硬截断（clamp）更平滑，保留了梯度方向向量。
-
-### 6.3 与 PPO Clip 的关系
-
-PPO 的 clip 机制本质上也是一种 trust region：
-
-$$L^{CLIP} = \min(r_t A_t, \text{clip}(r_t, 1-\epsilon, 1+\epsilon) A_t)$$
-
-Geodesic 的 trust region 是在 **概率流形** 上，而 PPO clip 是在 **重要性采样比率** 上。二者互补而非替代。
-
----
-
-## 📝 七、实验日志
-
-### 2026-05-19
-
-- ✅ 完成 Geodesic SDPO 核心实现（core_algos.py）
-- ✅ 添加配置开关（sdpo.yaml）
-- ✅ 创建统一参数化脚本（geodesic_vce_ablation_parametric.sh）
-- ✅ 创建标准化提交脚本（submit_geodesic_vce_ablation.sh）
-- ⚠️ 修复 nebulactl 格式问题（缺少 worker_count 参数）
-- 🚀 准备提交 4 组实验到 Nebula
+写一个最小的 entropy collapse 复现 case（合成数据 + 玩具 vocab），把崩溃机制讲透，附在论文 appendix。
 
 ---
 
-## 🔗 八、相关文件
+## 五、实验执行约定
 
-| 文件路径 | 说明 |
-|---------|------|
-| `verl/trainer/ppo/core_algos.py` | Geodesic 约束核心实现 |
-| `verl/trainer/config/sdpo.yaml` | 配置开关与超参 |
-| `nebula_scripts/sdpo/geodesic_vce_ablation_parametric.sh` | 统一参数化训练脚本 |
-| `nebula_scripts/submit_geodesic_vce_ablation.sh` | Nebula 提交脚本 |
-| `research/01_evolution.md` | OPD 演进文献综述 |
+- 一次只改一个变量；同时改两个的实验不读
+- 每个变量都要有 ON/OFF 两组（否则不构成 ablation）
+- Seed 永远 42；要看种子敏感性单独再跑一轮 multi-seed
+- 所有 run 通过 `nebula_scripts/submit_teacher_qv_ablation.sh` 提交，保证 `JOB_NAME / GROUP_NAME` 在 SwanLab 自动分组
+- 监控阈值：`actor/entropy < 0.1` 或 `grad_norm > 100` 自动钉钉告警
+- Phase 1 完成前不动 hyperparams，只改 baseline_type / use_geodesic
 
 ---
 
-**文档维护者**: Jimmy  
-**最后更新**: 2026-05-19  
-**下次审查**: 实验结果出来后更新预期 vs 实际对比
+## 六、未决问题（提醒自己）
+
+1. **VCE 的 zero-mean baseline 在 topk=100 下近似多准？** 如果 `actor/teacher_qv_adv_mean` 系统性偏离 0，需要换 full vocab 或加 add_tail 修正幅度
+2. **Geodesic 加到 teacher_qv 后，clip_value 还需不需要？** Geodesic 已经在做 fisher 倒数缩放，可能重复
+3. **是否要给 teacher_qv 加 group-relative reward**（即在 V 里加上"组内其他 sample 的 token-level Q 均值"）？这就把 GRPO 的 group 结构搬到 token 级，可能比 group_mean / group_hier 更强
+4. **`detach_v=False`（让 V 也参与梯度）是 actor-critic 风格**，可能更不稳但理论上方差更小，留作 Phase 4 之后探索
+
+---
+
+**维护人**：Jimmy
+**对应 commit hash**：实现 commit 待 push
