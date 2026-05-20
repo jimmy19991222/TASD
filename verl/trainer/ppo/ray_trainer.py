@@ -1655,7 +1655,12 @@ class RayPPOTrainer:
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
             default_backend=self.config.trainer.logger,
-            config=OmegaConf.to_container(self.config, resolve=True),
+            config={
+                **OmegaConf.to_container(self.config, resolve=True),
+                # Add git info from environment variables for experiment traceability
+                "git_branch": os.environ.get("GIT_BRANCH", "unknown"),
+                "git_commit": os.environ.get("GIT_COMMIT", "unknown"),
+            },
             group_name=_swanlab_group,
             tags=_swanlab_tags,
         )

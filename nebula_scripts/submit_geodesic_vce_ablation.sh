@@ -30,6 +30,10 @@ SCRIPT_PATH="nebula_scripts/sdpo/geodesic_vce_ablation_parametric.sh"
 CUSTOM_DOCKER_IMAGE="${CUSTOM_DOCKER_IMAGE:-hub.docker.alibaba-inc.com/mdl/notebook_saved:loujieming.ljm_yueqiu_sdpo_env_torch260_20260324155942}"
 PROJECT_NAME="Geodesic-VCE-Ablation"
 
+# ── Git 信息（用于 SwanLab 记录）────────────────────────────────────
+GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
+GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
+
 # ── 数据集配置 ──────────────────────────────────────────────────────
 DATASETS=(
     "sciknoweval/biology"
@@ -120,7 +124,8 @@ for dataset in "${DATASETS[@]}"; do
         TIMESTAMP=$(date +%Y%m%d_%H%M%S)
         TASK_NAME="${PROJECT_NAME}-${dataset_name}-${exp_name}-${TIMESTAMP}"
         
-        # 构建 JOB_NAME（用于 OSS 路径）
+        # 构建 JOB_NAME（用于 OSS 路径和 SwanLab experiment_name）
+        # 注意：使用 exp_name 而不是 TASK_NAME，保证同一实验在 SwanLab 中能归组
         JOB_NAME="GVCE-${dataset_name}-${exp_name}"
         
         echo ""
@@ -166,7 +171,9 @@ for dataset in "${DATASETS[@]}"; do
             --env=CLIP_VALUE=${CLIP_VALUE} \
             --env=ADV_STD_FLOOR=${ADV_STD_FLOOR} \
             --env=GEODESIC_TRUST_REGION=${GEODESIC_TRUST_REGION} \
-            --env=GEODESIC_BETA_SCALE=${GEODESIC_BETA_SCALE}"
+            --env=GEODESIC_BETA_SCALE=${GEODESIC_BETA_SCALE} \
+            --env=GIT_BRANCH=${GIT_BRANCH} \
+            --env=GIT_COMMIT=${GIT_COMMIT}"
         
         # 构建 nebulactl 命令（标准化格式）
         if [ "$DRY_RUN" = true ]; then

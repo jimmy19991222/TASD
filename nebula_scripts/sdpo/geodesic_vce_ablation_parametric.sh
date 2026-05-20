@@ -62,6 +62,10 @@ pip install -e . --no-deps --no-build-isolation --quiet 2>/dev/null || true
 
 mkdir -p "${SWANLAB_LOG_DIR}" 2>/dev/null || true
 
+# ── 添加 Git 信息到环境变量（SwanLab 会读取整个 config）───────────────
+export GIT_BRANCH="${GIT_BRANCH:-unknown}"
+export GIT_COMMIT="${GIT_COMMIT:-unknown}"
+
 # ── 构建 Hydra 命令 ─────────────────────────────────────────────────
 HYDRA_ARGS=(
     --config-name sdpo
