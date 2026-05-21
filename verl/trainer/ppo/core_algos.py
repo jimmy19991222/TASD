@@ -1466,28 +1466,39 @@ def agg_loss(
         loss: `a scalar torch.Tensor`
             aggregated loss
     """
+    # Defensive divisor clamp: when a micro-batch has no valid tokens / sequences
+    # (e.g. self_distillation_mask is all False), the natural divisor is 0 and the
+    # loss becomes 0/0 = NaN. The NaN doesn't necessarily break training (FSDP
+    # skips NaN-grad updates) but it permanently poisons += accumulated metrics
+    # like actor/pg_loss. SDPO patched this by passing batch_num_tokens=clamp(min=1)
+    # explicitly, but every other caller forgets. Clamping here fixes all of them.
+    def _safe_divisor(x):
+        if torch.is_tensor(x):
+            return x.clamp(min=1.0)
+        return max(float(x), 1.0)
+
     if loss_agg_mode == "token-mean":
         if batch_num_tokens is None:
             batch_num_tokens = loss_mask.sum()
-        loss = verl_F.masked_sum(loss_mat, loss_mask) / batch_num_tokens * dp_size
+        loss = verl_F.masked_sum(loss_mat, loss_mask) / _safe_divisor(batch_num_tokens) * dp_size
     elif loss_agg_mode == "seq-mean-token-sum":
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)  # token-sum
         seq_mask = (torch.sum(loss_mask, dim=-1) > 0).float()  # exclude fully masked sequences
         if global_batch_size is None:
             global_batch_size = seq_mask.sum()
-        loss = verl_F.masked_sum(seq_losses, seq_mask) / global_batch_size * dp_size  # seq-mean
+        loss = verl_F.masked_sum(seq_losses, seq_mask) / _safe_divisor(global_batch_size) * dp_size
     elif loss_agg_mode == "seq-mean-token-mean":
         seq_mask = torch.sum(loss_mask, dim=-1)  # per-sequence token count
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1) / (seq_mask + 1e-8)  # token-mean
         seq_mask = (seq_mask > 0).float()  # exclude fully masked sequences
         if global_batch_size is None:
             global_batch_size = seq_mask.sum()
-        loss = verl_F.masked_sum(seq_losses, seq_mask) / global_batch_size * dp_size  # seq-mean
+        loss = verl_F.masked_sum(seq_losses, seq_mask) / _safe_divisor(global_batch_size) * dp_size
     elif loss_agg_mode == "seq-mean-token-sum-norm":
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)
         if loss_scale_factor is None:
             loss_scale_factor = loss_mask.shape[-1]
-        loss = torch.sum(seq_losses) / loss_scale_factor
+        loss = torch.sum(seq_losses) / _safe_divisor(loss_scale_factor)
     else:
         raise ValueError(f"Invalid loss_agg_mode: {loss_agg_mode}")
 
