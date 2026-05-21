@@ -587,7 +587,12 @@ def compute_teacher_qv_advantage(
             else:
                 grp_idx = as_torch_index(index, device=Q.device)
             seq_mean_flat = seq_mean.squeeze(-1)  # (B,)
-            mean_g, std_g, _ = group_mean_std(seq_mean_flat, grp_idx, eps=1e-8)
+            # NOTE: explicit device= avoids verl.utils.groupwise._resolve_device()
+            # falling back to get_torch_device(), which returns a module object on
+            # some torch builds and then crashes inside .to(device=module).
+            mean_g, std_g, _ = group_mean_std(
+                seq_mean_flat, grp_idx, eps=1e-8, device=Q.device
+            )
             seq_centered = seq_mean_flat - mean_g[grp_idx]
             if norm_by_std:
                 seq_z = seq_centered / std_g[grp_idx].clamp(min=std_floor)
