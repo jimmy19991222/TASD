@@ -640,6 +640,109 @@ def compute_teacher_qv_advantage(
     return adv, metrics
 
 
+def compute_teacher_qv_full_logit_loss(
+    student_full_log_probs: torch.Tensor,
+    teacher_full_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    baseline_type: str = "student",
+    loss_agg_mode: str = "token-mean",
+    rollout_is_weights: Optional[torch.Tensor] = None,
+    **agg_kwargs,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Vocab-summed PG loss for teacher_qv (no Monte Carlo over sampled token).
+
+    Computes loss whose gradient is:
+        ∇ = -Σ_v p_s(v).detach() · A(v).detach() · ∇ log p_s(v)
+    summed over vocab at each position, then aggregated over tokens.
+
+    A(v) by baseline_type:
+      * 'student'    : A(v) = log p_t(v) - log p_s(v)
+                       => gradient = ∇ KL(p_s || p_t) (exact reverse KL).
+                       Mathematically identical to old SDPO with alpha=1 +
+                       full_logit_distillation=True.
+      * 'ce'         : A(v) = log p_t(v) - V_t (scalar V_t = E_{u~p_s}[log p_t(u)]).
+                       V_t is constant w.r.t. v so it cancels under Σ p_s·∇log p_s.
+                       => gradient = ∇ E_{v~p_s}[log p_t(v)] (forward cross-entropy).
+      * 'group_mean' / 'group_hier' : V is also scalar in vocab, same as ce gradient.
+
+    Note: this collapses 4 baseline_types into 2 effective gradients
+    ({student=reverse_KL} vs {ce/group_*=forward_CE}). The student/V_CE distinction
+    that mattered in sampled-token mode disappears in full_logit mode -- this is a
+    feature, not a bug: it tells us that variance-reduction baselines only help when
+    we're doing Monte Carlo estimation.
+
+    Args:
+        student_full_log_probs : (B, T, V) differentiable student log probs.
+        teacher_full_log_probs : (B, T, V) detached teacher log probs.
+        response_mask          : (B, T)
+        baseline_type          : see above
+        loss_agg_mode          : passed to agg_loss
+        rollout_is_weights     : optional (B, T) IS weights for off-policy correction
+        **agg_kwargs           : passed to agg_loss (dp_size, batch_num_tokens, ...)
+
+    Returns ``(loss_scalar, metrics_dict)``.
+    """
+    if baseline_type not in {"student", "ce", "group_mean", "group_hier"}:
+        raise ValueError(f"unknown baseline_type: {baseline_type}")
+
+    with torch.no_grad():
+        p_s = torch.exp(student_full_log_probs.detach())  # (B, T, V)
+        t_log = teacher_full_log_probs.detach()
+        if baseline_type == "student":
+            adv = t_log - student_full_log_probs.detach()
+        else:
+            # ce / group_mean / group_hier all collapse to the same gradient
+            # because the V is scalar w.r.t. vocab and cancels under Σ p_s·∇log p_s.
+            # We still subtract V for consistency / numerical hygiene (smaller A magnitudes).
+            V = (p_s * t_log).sum(-1, keepdim=True)
+            adv = t_log - V
+        adv = torch.nan_to_num(adv, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Vocab-summed per-token loss. Gradient flows ONLY through student_full_log_probs;
+    # p_s and adv are detached above.
+    loss_per_token = -(p_s * adv * student_full_log_probs).sum(-1)  # (B, T)
+
+    # NaN scrub at masked positions: garbage logits at padding can produce NaN here.
+    finite_mask = torch.isfinite(loss_per_token)
+    loss_per_token = torch.where(
+        response_mask.bool() & finite_mask,
+        loss_per_token,
+        torch.zeros_like(loss_per_token),
+    )
+
+    if rollout_is_weights is not None:
+        loss_per_token = loss_per_token * rollout_is_weights
+
+    loss = agg_loss(
+        loss_mat=loss_per_token,
+        loss_mask=response_mask,
+        loss_agg_mode=loss_agg_mode,
+        **agg_kwargs,
+    )
+
+    with torch.no_grad():
+        valid = response_mask.float().sum().clamp(min=1.0)
+        non_finite_unmasked = ((~finite_mask) & response_mask.bool()).sum().item()
+        adv_abs_mean = (adv.abs().mean(-1) * response_mask).sum() / valid
+        adv_max = adv.max().item()
+        adv_min = adv.min().item()
+        ent_p_s = -(p_s * student_full_log_probs.detach()).sum(-1)  # vocab entropy of p_s
+        ent_mean = (ent_p_s * response_mask).sum().item() / valid.item()
+        metrics = {
+            "actor/teacher_qv_full_logit_loss": loss.detach().item(),
+            "actor/teacher_qv_full_logit_adv_abs_mean": adv_abs_mean.item(),
+            "actor/teacher_qv_full_logit_adv_max": adv_max,
+            "actor/teacher_qv_full_logit_adv_min": adv_min,
+            "actor/teacher_qv_full_logit_p_s_entropy": ent_mean,
+            "actor/teacher_qv_non_finite_unmasked": float(non_finite_unmasked),
+            "actor/teacher_qv_baseline_type_id": float(
+                {"student": 0, "ce": 1, "group_mean": 2, "group_hier": 3}[baseline_type]
+            ),
+            "actor/teacher_qv_gradient_mode_id": 1.0,  # 1 = full_logit, 0 = sampled
+        }
+    return loss, metrics
+
+
 @register_adv_est(AdvantageEstimator.GRPO_VECTORIZED)
 def compute_grpo_vectorized_outcome_advantage(
     token_level_rewards: torch.Tensor,

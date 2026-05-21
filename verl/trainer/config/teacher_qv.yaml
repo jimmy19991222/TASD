@@ -20,6 +20,10 @@ actor_rollout_ref:
         norm_by_std: False
         clip_value: null            # set e.g. 5.0 to clamp |A|
         std_floor: 1e-3
+        # sampled = MC PG on the single sampled token (= old SDPO sampled-token form)
+        # full_logit = vocab-summed PG (= old SDPO full_logit form for baseline=student;
+        #              forward CE for baseline in {ce,group_*}). Requires full_logit_distillation=True.
+        gradient_mode: full_logit
         # A is always detached (standard PG, same as compute_grpo_outcome_advantage).
     self_distillation:
       # Reuse SDPO's reprompt + EMA teacher infrastructure.

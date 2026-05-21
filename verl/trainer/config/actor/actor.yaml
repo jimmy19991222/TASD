@@ -84,6 +84,9 @@ policy_loss:
     norm_by_std: False
     clip_value: null
     std_floor: 1.0e-3
+    # "sampled" = -A(y_t)·log p_s(y_t) (MC, high variance)
+    # "full_logit" = -Σ_v p_s(v)·A(v)·log p_s(v) (vocab-summed, lower variance)
+    gradient_mode: "sampled"
 
 # self-distillation config
 self_distillation:

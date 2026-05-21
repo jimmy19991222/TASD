@@ -34,6 +34,7 @@ from verl.trainer.ppo.core_algos import (
     compute_geodesic_manifold_weight,
     compute_self_distillation_loss,
     compute_teacher_qv_advantage,
+    compute_teacher_qv_full_logit_loss,
     get_policy_loss_fn,
     kl_penalty,
 )
@@ -820,7 +821,10 @@ class DataParallelPPOActor(BasePPOActor):
                         qv_needs_full_logits = (
                             teacher_qv_enabled
                             and teacher_qv_cfg is not None
-                            and teacher_qv_cfg.get("baseline_type", "student") == "ce"
+                            and (
+                                teacher_qv_cfg.get("baseline_type", "student") == "ce"
+                                or teacher_qv_cfg.get("gradient_mode", "sampled") == "full_logit"
+                            )
                         )
                         if teacher_qv_enabled and not qv_needs_full_logits:
                             return_all_logps = False
@@ -918,13 +922,14 @@ class DataParallelPPOActor(BasePPOActor):
                             loss_mask = loss_mask * self_distillation_mask.unsqueeze(1)
                         qv_index = model_inputs.get("uid", None)
                         qv_baseline_type = teacher_qv_cfg.get("baseline_type", "student")
+                        qv_gradient_mode = teacher_qv_cfg.get("gradient_mode", "sampled")
 
-                        # For baseline_type='ce' we need full-vocab (or topk-with-tail)
-                        # log-probs on both student and teacher so the per-token
-                        # expectation V_t = sum_v p_s(v) * log p_t(v) is well-defined.
+                        # Full vocab log probs needed when:
+                        #   - baseline_type=ce (V_t expectation)
+                        #   - gradient_mode=full_logit (vocab-summed PG)
                         qv_student_full = None
                         qv_teacher_full = None
-                        if qv_baseline_type == "ce":
+                        if qv_baseline_type == "ce" or qv_gradient_mode == "full_logit":
                             if student_all_logps is not None and teacher_all_logps is not None:
                                 qv_student_full = student_all_logps
                                 qv_teacher_full = teacher_all_logps
@@ -933,61 +938,71 @@ class DataParallelPPOActor(BasePPOActor):
                                 qv_teacher_full = _qv_add_tail(teacher_topk_logps)
                             else:
                                 raise ValueError(
-                                    "teacher_qv baseline_type='ce' produced neither all_logps nor topk_logps; "
-                                    "check self_distillation.full_logit_distillation."
+                                    f"teacher_qv (baseline={qv_baseline_type}, gradient_mode={qv_gradient_mode}) "
+                                    "requires self_distillation.full_logit_distillation=True."
                                 )
 
-                        qv_advantages, qv_metrics = compute_teacher_qv_advantage(
-                            student_log_probs=log_prob,
-                            teacher_log_probs=teacher_log_prob,
-                            response_mask=loss_mask,
-                            baseline_type=qv_baseline_type,
-                            index=qv_index,
-                            norm_by_std=teacher_qv_cfg.get("norm_by_std", False),
-                            clip_value=teacher_qv_cfg.get("clip_value", None),
-                            std_floor=teacher_qv_cfg.get("std_floor", 1e-3),
-                            student_all_log_probs=qv_student_full,
-                            teacher_all_log_probs=qv_teacher_full,
-                        )
-
-                        # Geodesic Fisher manifold weight (orthogonal to baseline_type).
-                        # Reuses self_distillation.use_geodesic / geodesic_trust_region so SDPO
-                        # and teacher_qv share the same Geodesic switch.
-                        if self_distillation_cfg.get("use_geodesic", False):
-                            trust_region = float(
-                                self_distillation_cfg.get("geodesic_trust_region", 5.0)
+                        if qv_gradient_mode == "full_logit":
+                            # Vocab-summed PG: loss = -Σ_v p_s(v)·A(v)·log p_s(v).
+                            # Matches old SDPO alpha=1 full_logit for baseline=student;
+                            # forward CE for baseline in {ce, group_mean, group_hier}.
+                            assert qv_student_full is not None
+                            pg_loss, pg_metrics = compute_teacher_qv_full_logit_loss(
+                                student_full_log_probs=qv_student_full,
+                                teacher_full_log_probs=qv_teacher_full,
+                                response_mask=loss_mask,
+                                baseline_type=qv_baseline_type,
+                                loss_agg_mode=loss_agg_mode,
+                                rollout_is_weights=rollout_is_weights,
+                                **self.config.global_batch_info,
                             )
-                            geodesic_full = qv_student_full  # populated when ce mode runs
-                            manifold_weight, geodesic_metrics = compute_geodesic_manifold_weight(
+                        else:
+                            # Sampled-token PG: A_t = log p_t(y_t) - V_t, loss = -A · log p_s(y_t).
+                            qv_advantages, qv_metrics = compute_teacher_qv_advantage(
                                 student_log_probs=log_prob,
-                                student_all_log_probs=geodesic_full,
-                                trust_region_scale=trust_region,
-                                response_mask=loss_mask,  # mask masked positions out of weight + metrics
+                                teacher_log_probs=teacher_log_prob,
+                                response_mask=loss_mask,
+                                baseline_type=qv_baseline_type,
+                                index=qv_index,
+                                norm_by_std=teacher_qv_cfg.get("norm_by_std", False),
+                                clip_value=teacher_qv_cfg.get("clip_value", None),
+                                std_floor=teacher_qv_cfg.get("std_floor", 1e-3),
+                                student_all_log_probs=qv_student_full,
+                                teacher_all_log_probs=qv_teacher_full,
                             )
-                            qv_advantages = qv_advantages * manifold_weight
-                            # Final safety: weight at masked positions is now 1.0 (no garbage),
-                            # but in case the multiplication still produced anything weird,
-                            # force masked + non-finite slots to exactly 0.
-                            qv_advantages = torch.where(
-                                loss_mask.bool() & torch.isfinite(qv_advantages),
-                                qv_advantages,
-                                torch.zeros_like(qv_advantages),
+                            # Geodesic Fisher manifold weight (orthogonal to baseline_type).
+                            # Reuses self_distillation.use_geodesic / geodesic_trust_region so SDPO
+                            # and teacher_qv share the same Geodesic switch.
+                            if self_distillation_cfg.get("use_geodesic", False):
+                                trust_region = float(
+                                    self_distillation_cfg.get("geodesic_trust_region", 5.0)
+                                )
+                                geodesic_full = qv_student_full  # populated when ce mode runs
+                                manifold_weight, geodesic_metrics = compute_geodesic_manifold_weight(
+                                    student_log_probs=log_prob,
+                                    student_all_log_probs=geodesic_full,
+                                    trust_region_scale=trust_region,
+                                    response_mask=loss_mask,
+                                )
+                                qv_advantages = qv_advantages * manifold_weight
+                                qv_advantages = torch.where(
+                                    loss_mask.bool() & torch.isfinite(qv_advantages),
+                                    qv_advantages,
+                                    torch.zeros_like(qv_advantages),
+                                )
+                                qv_metrics.update(geodesic_metrics)
+                            from verl.trainer.ppo.core_algos import compute_policy_loss_vanilla
+                            pg_loss, pg_metrics = compute_policy_loss_vanilla(
+                                old_log_prob=old_log_prob,
+                                log_prob=log_prob,
+                                advantages=qv_advantages,
+                                response_mask=loss_mask,
+                                loss_agg_mode=loss_agg_mode,
+                                config=self.config,
+                                rollout_is_weights=rollout_is_weights,
                             )
-                            qv_metrics.update(geodesic_metrics)
-
-                        # Reuse vanilla PPO loss with the override advantages.
-                        from verl.trainer.ppo.core_algos import compute_policy_loss_vanilla
-
-                        pg_loss, pg_metrics = compute_policy_loss_vanilla(
-                            old_log_prob=old_log_prob,
-                            log_prob=log_prob,
-                            advantages=qv_advantages,
-                            response_mask=loss_mask,
-                            loss_agg_mode=loss_agg_mode,
-                            config=self.config,
-                            rollout_is_weights=rollout_is_weights,
-                        )
-                        pg_metrics.update(qv_metrics)
+                            pg_metrics.update(qv_metrics)
+                        # ---- shared post-dispatch ----
                         if self_distillation_mask is not None:
                             pg_metrics["teacher_qv/empty_target_batch"] = (
                                 self_distillation_mask.sum().item() == 0

@@ -55,6 +55,7 @@ DONT_REPROMPT_ON_SELF_SUCCESS="True"
 CLIP_VALUE="null"
 STD_FLOOR="1e-3"
 USE_GEODESIC="False"
+GRADIENT_MODE="full_logit"   # vocab-summed PG (V drops out for group baselines, gradient = ∇CE)
 GEODESIC_TRUST_REGION="5.0"
 
 # 实验矩阵：(name, baseline_type, norm_by_std)
@@ -78,8 +79,9 @@ for dataset in "${DATASETS[@]}"; do
         IFS=':' read -r exp_name baseline_type norm_by_std <<< "$exp"
 
         TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-        TASK_NAME="${PROJECT_NAME}-${dataset_name}-${exp_name}-${TIMESTAMP}"
-        JOB_NAME="QV3-${dataset_name}-${exp_name}"
+        TASK_NAME="${PROJECT_NAME}-${dataset_name}-${exp_name}-fl-${TIMESTAMP}"
+        # -fl suffix marks the new full_logit gradient_mode runs.
+        JOB_NAME="QV3-${dataset_name}-${exp_name}-fl"
 
         echo ""
         echo "📝 $TASK_NAME"
@@ -100,6 +102,7 @@ for dataset in "${DATASETS[@]}"; do
             --env=GEODESIC_TRUST_REGION=${GEODESIC_TRUST_REGION} \
             --env=CLIP_VALUE=${CLIP_VALUE} \
             --env=STD_FLOOR=${STD_FLOOR} \
+            --env=GRADIENT_MODE=${GRADIENT_MODE} \
             --env=GIT_BRANCH=${GIT_BRANCH} \
             --env=GIT_COMMIT=${GIT_COMMIT}"
 

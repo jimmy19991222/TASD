@@ -174,18 +174,34 @@ class TeacherQVConfig(BaseConfig):
             per-group for 'group_hier').
         clip_value (Optional[float]): If set, clamp A to [-clip_value, clip_value].
         std_floor (float): Floor on std denominators for numerical stability.
+        gradient_mode (str): How to convert advantage into gradient.
+            - 'sampled' : (default) loss = -A(y_t) * log p_s(y_t), Monte Carlo PG over
+              the single sampled token. High variance, no implicit exploration pressure.
+            - 'full_logit' : loss = -Σ_v p_s(v) * A(v) * log p_s(v), vocab-summed PG.
+              Lower variance, has implicit exploration on tokens with high p_t but low p_s.
+              For baseline_type='student', the gradient is exactly ∇ KL(p_s || p_t) (the
+              vocab-exact reverse KL gradient, same as old SDPO with alpha=1 + full_logit).
+              For ce/group_*, V is scalar in vocab, so it drops out and the gradient reduces
+              to ∇ E_{v~p_s}[log p_t(v)] (forward cross-entropy gradient).
+              Requires full vocab or topk+tail log probs on both student and teacher.
     """
 
     baseline_type: str = "student"
     norm_by_std: bool = False
     clip_value: Optional[float] = None
     std_floor: float = 1e-3
+    gradient_mode: str = "sampled"
 
     def __post_init__(self):
         valid = {"student", "ce", "group_mean", "group_hier"}
         if self.baseline_type not in valid:
             raise ValueError(
                 f"teacher_qv.baseline_type must be one of {sorted(valid)}, got {self.baseline_type}"
+            )
+        valid_grad = {"sampled", "full_logit"}
+        if self.gradient_mode not in valid_grad:
+            raise ValueError(
+                f"teacher_qv.gradient_mode must be one of {sorted(valid_grad)}, got {self.gradient_mode}"
             )
         if self.clip_value is not None and self.clip_value <= 0:
             raise ValueError(f"teacher_qv.clip_value must be positive, got {self.clip_value}")

@@ -34,9 +34,13 @@ STD_FLOOR="${STD_FLOOR:-1e-3}"
 USE_GEODESIC="${USE_GEODESIC:-False}"
 GEODESIC_TRUST_REGION="${GEODESIC_TRUST_REGION:-5.0}"
 
-# baseline_type='ce' needs full or topk logits on both sides.
-# Other baselines can leave FULL_LOGIT=False to save memory.
-if [ "${BASELINE_TYPE}" = "ce" ]; then
+# gradient_mode: sampled (MC, single-token) vs full_logit (vocab-summed)
+# Default to full_logit because sampled-token PG is known to entropy-collapse fast on
+# reverse-KL distillation; vocab-summed gradient has implicit exploration pressure.
+GRADIENT_MODE="${GRADIENT_MODE:-full_logit}"
+
+# full_logit gradient OR baseline_type='ce' both require vocab log probs on both sides.
+if [ "${GRADIENT_MODE}" = "full_logit" ] || [ "${BASELINE_TYPE}" = "ce" ]; then
     FULL_LOGIT="${FULL_LOGIT:-True}"
     DISTILL_TOPK="${DISTILL_TOPK:-100}"
 else
@@ -80,6 +84,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.policy_loss.teacher_qv.norm_by_std=${NORM_BY_STD} \
     actor_rollout_ref.actor.policy_loss.teacher_qv.clip_value=${CLIP_VALUE} \
     actor_rollout_ref.actor.policy_loss.teacher_qv.std_floor=${STD_FLOOR} \
+    actor_rollout_ref.actor.policy_loss.teacher_qv.gradient_mode=${GRADIENT_MODE} \
     actor_rollout_ref.actor.self_distillation.full_logit_distillation=${FULL_LOGIT} \
     actor_rollout_ref.actor.self_distillation.distillation_topk=${DISTILL_TOPK} \
     actor_rollout_ref.actor.self_distillation.use_geodesic=${USE_GEODESIC} \
