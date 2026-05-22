@@ -147,6 +147,10 @@ self_distillation:
   # Scaling factor for Geodesic manifold weight
   geodesic_beta_scale: 0.5
 
+  # Diagnostic: log per-step ΔW (= log p_T - log p_s) signal-to-noise stats
+  # Only effective when full_logit_distillation=True. Adds ~3x the KL forward cost.
+  log_delta_w_stats: False
+
   # IS clip for loss; null disables IS weighting
   is_clip: 2
 
