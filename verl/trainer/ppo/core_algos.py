@@ -1621,6 +1621,193 @@ def agg_loss(
     return loss
 
 
+def _compute_verdict_distillation_loss(
+    student_log_probs: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    teacher_log_probs_neg: Optional[torch.Tensor],
+    student_all_log_probs: Optional[torch.Tensor],
+    teacher_all_log_probs: Optional[torch.Tensor],
+    teacher_all_log_probs_neg: Optional[torch.Tensor],
+    student_topk_log_probs: Optional[torch.Tensor],
+    teacher_topk_log_probs: Optional[torch.Tensor],
+    teacher_topk_log_probs_neg: Optional[torch.Tensor],
+    verdict_R: Optional[torch.Tensor],
+    response_mask: torch.Tensor,
+    loss_mask: torch.Tensor,
+    self_distillation_config: Any,
+    old_log_probs: Optional[torch.Tensor],
+    rollout_is_weights: Optional[torch.Tensor],
+    loss_agg_mode: str,
+    metrics: dict[str, Any],
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Verdict-contrastive distillation losses.
+
+    Three methods:
+      - vc_opsd_sign: per-token sign-only credit
+            L = -(2R-1) · sg(log p_T+ - log p_T-) · log p_s
+      - vec: per-token telescoping log-Bayes credit
+            S_t   = log_prior + Σ_{i≤t} [log p_T+(s_i) - log p_T-(s_i)]
+            ΔV_t  = log σ((2R-1) · S_t) - log σ((2R-1) · S_{t-1})
+            L     = -sg(ΔV_t) · log p_s(s_t)
+      - opd_bayes: outcome-posterior KL projection on full / topk vocab
+            log π*(v) ∝ log π_θ(v) + log p̂(R_obs | v, s_<t)
+            L = KL(π* || π_θ)  (or forward KL)
+    """
+    if loss_mask.dtype != student_log_probs.dtype:
+        loss_mask = loss_mask.to(student_log_probs.dtype)
+
+    loss_method = self_distillation_config.loss_method
+    if teacher_log_probs_neg is None or verdict_R is None:
+        raise ValueError(
+            f"loss_method={loss_method} requires teacher_log_probs_neg and verdict_R."
+        )
+
+    # Resolve prior
+    prior_mode = getattr(self_distillation_config, "verdict_prior_mode", "uniform")
+    if prior_mode == "uniform":
+        log_prior = 0.0
+    elif prior_mode == "logit":
+        log_prior = float(getattr(self_distillation_config, "verdict_prior_logit", 0.0))
+    elif prior_mode == "empirical":
+        p_R = verdict_R.float().mean().clamp(min=1e-3, max=1.0 - 1e-3)
+        log_prior = float(torch.log(p_R / (1.0 - p_R)).item())
+    else:
+        raise ValueError(f"unknown verdict_prior_mode={prior_mode}")
+    metrics["self_distillation/verdict_log_prior"] = float(log_prior)
+
+    verdict_R = verdict_R.to(student_log_probs.dtype).view(-1, 1)  # (B, 1)
+    sgn_R = (2.0 * verdict_R - 1.0)  # (B, 1)
+
+    if loss_method == "vc_opsd_sign":
+        delta = (teacher_log_probs - teacher_log_probs_neg).detach()
+        # Standardisation diagnostics
+        with torch.no_grad():
+            m = loss_mask
+            denom = m.sum().clamp(min=1.0)
+            metrics["self_distillation/vc_delta_abs_mean"] = float(((delta.abs() * m).sum() / denom).item())
+            metrics["self_distillation/vc_delta_signed_mean"] = float(((delta * m).sum() / denom).item())
+        per_token_loss = -sgn_R * delta * student_log_probs  # (B, T)
+
+    elif loss_method == "vec":
+        diff = (teacher_log_probs - teacher_log_probs_neg).detach()  # (B, T)
+        # accumulate only over response tokens
+        diff_resp = diff * response_mask.to(diff.dtype)
+        S = torch.cumsum(diff_resp, dim=-1) + log_prior  # (B, T)
+        S_prev = torch.cat([
+            torch.full_like(S[:, :1], log_prior),
+            S[:, :-1],
+        ], dim=-1)
+        signed_S = sgn_R * S
+        signed_S_prev = sgn_R * S_prev
+        delta_v = F.logsigmoid(signed_S) - F.logsigmoid(signed_S_prev)  # (B, T)
+        # Numerical safety: zero out positions outside response
+        delta_v = delta_v * response_mask.to(delta_v.dtype)
+        per_token_loss = -delta_v.detach() * student_log_probs  # REINFORCE-style
+        with torch.no_grad():
+            S_final = (S * response_mask.to(S.dtype)).gather(
+                -1,
+                response_mask.sum(dim=-1, keepdim=True).clamp(min=1).long() - 1,
+            ).squeeze(-1)  # (B,)
+            signed_S_final = sgn_R.squeeze(-1) * S_final
+            # Calibration BCE diagnostic: -log p̂(R_obs | τ)
+            cal_bce = -F.logsigmoid(signed_S_final)
+            metrics["self_distillation/vec_S_final_mean"] = float(S_final.mean().item())
+            metrics["self_distillation/vec_S_final_std"] = float(S_final.std().item())
+            metrics["self_distillation/vec_calibration_bce"] = float(cal_bce.mean().item())
+            metrics["self_distillation/vec_delta_v_abs_mean"] = float(((delta_v.abs() * loss_mask).sum() / loss_mask.sum().clamp(min=1.0)).item())
+
+    elif loss_method == "opd_bayes":
+        if not self_distillation_config.full_logit_distillation:
+            raise ValueError("opd_bayes requires self_distillation.full_logit_distillation=True")
+        use_topk = self_distillation_config.distillation_topk is not None
+        if use_topk:
+            if (
+                student_topk_log_probs is None
+                or teacher_topk_log_probs is None
+                or teacher_topk_log_probs_neg is None
+            ):
+                raise ValueError("opd_bayes topk path requires student/teacher topk_log_probs (pos & neg).")
+            student_full = student_topk_log_probs
+            teacher_pos = teacher_topk_log_probs
+            teacher_neg = teacher_topk_log_probs_neg
+        else:
+            if (
+                student_all_log_probs is None
+                or teacher_all_log_probs is None
+                or teacher_all_log_probs_neg is None
+            ):
+                raise ValueError("opd_bayes full-vocab path requires student/teacher all_log_probs (pos & neg).")
+            student_full = student_all_log_probs
+            teacher_pos = teacher_all_log_probs
+            teacher_neg = teacher_all_log_probs_neg
+
+        # log-likelihood ratio per vocab token: log [p_T+(v) / p_T-(v)]
+        log_lr = (teacher_pos - teacher_neg).detach()  # (B, T, V_or_K)
+        # log p̂(R_obs | v) = log σ((2R-1) · (log_lr + log_prior))
+        x = log_lr + log_prior
+        sgn_R_v = sgn_R.unsqueeze(-1)  # (B, 1, 1)
+        log_p_R_obs = F.logsigmoid(sgn_R_v * x)  # (B, T, V)
+
+        # log π*(v) ∝ log π_θ(v) + log p̂(R_obs | v); detach student to make
+        # π* a fixed target distribution (KL projection).
+        log_pi_star_unnorm = student_full.detach() + log_p_R_obs
+        log_Z = torch.logsumexp(log_pi_star_unnorm, dim=-1, keepdim=True)
+        log_pi_star = log_pi_star_unnorm - log_Z
+
+        kl_direction = getattr(self_distillation_config, "kl_direction", "reverse")
+        if kl_direction == "reverse":
+            # KL(π_θ || π*) — student pushes toward π*
+            kl_per_vocab = F.kl_div(log_pi_star, student_full, reduction="none", log_target=True)
+        elif kl_direction == "forward":
+            kl_per_vocab = F.kl_div(student_full, log_pi_star, reduction="none", log_target=True)
+        else:
+            raise ValueError(f"unknown kl_direction={kl_direction}")
+        per_token_loss = kl_per_vocab.sum(-1)  # (B, T)
+
+        with torch.no_grad():
+            m = loss_mask
+            denom = m.sum().clamp(min=1.0)
+            metrics["self_distillation/opd_log_p_R_obs_mean"] = float(((log_p_R_obs.exp().mean(-1) * m).sum() / denom).item())
+            metrics["self_distillation/opd_kl_mean"] = float(((per_token_loss * m).sum() / denom).item())
+    else:
+        raise ValueError(f"unknown loss_method={loss_method}")
+
+    # Optional IS-clip (applies to all verdict methods)
+    is_clip = self_distillation_config.is_clip
+    if is_clip is not None:
+        if old_log_probs is None:
+            raise ValueError("old_log_probs is required for distillation IS ratio.")
+        negative_approx_kl = (student_log_probs - old_log_probs).detach()
+        negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+        ratio = torch.exp(negative_approx_kl).clamp(max=is_clip)
+        per_token_loss = per_token_loss * ratio
+
+    if rollout_is_weights is not None:
+        per_token_loss = per_token_loss * rollout_is_weights
+
+    loss = agg_loss(
+        loss_mat=per_token_loss,
+        loss_mask=loss_mask,
+        loss_agg_mode=loss_agg_mode,
+        batch_num_tokens=loss_mask.sum().clamp(min=1.0),
+    )
+
+    # Calibration regulariser (diagnostic-only when teacher is frozen, included
+    # in loss if calibration_weight > 0 so future learnable-prior extensions
+    # remain a drop-in change).
+    cal_weight = float(getattr(self_distillation_config, "calibration_weight", 0.0))
+    if loss_method in ("vc_opsd_sign", "vec") and cal_weight > 0.0:
+        diff_all = (teacher_log_probs - teacher_log_probs_neg).detach() * response_mask.to(teacher_log_probs.dtype)
+        S = diff_all.sum(dim=-1) + log_prior  # (B,)
+        signed_S = sgn_R.squeeze(-1) * S
+        cal = -F.logsigmoid(signed_S).mean()
+        metrics["self_distillation/calibration_loss"] = float(cal.item())
+        loss = loss + cal_weight * cal
+
+    metrics["self_distillation/loss_method_id"] = {"vc_opsd_sign": 1, "vec": 2, "opd_bayes": 3}[loss_method]
+    return loss, metrics
+
+
 def compute_self_distillation_loss(
     student_log_probs: torch.Tensor,
     teacher_log_probs: torch.Tensor,
@@ -1634,6 +1821,10 @@ def compute_self_distillation_loss(
     self_distillation_mask: Optional[torch.Tensor] = None,
     loss_agg_mode: str = "token-mean",
     rollout_is_weights: Optional[torch.Tensor] = None,
+    teacher_log_probs_neg: Optional[torch.Tensor] = None,
+    teacher_all_log_probs_neg: Optional[torch.Tensor] = None,
+    teacher_topk_log_probs_neg: Optional[torch.Tensor] = None,
+    verdict_R: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
 
     metrics = {}
@@ -1641,6 +1832,28 @@ def compute_self_distillation_loss(
     loss_mask = response_mask
     if self_distillation_mask is not None:
         loss_mask = loss_mask * self_distillation_mask.unsqueeze(1)
+
+    loss_method = getattr(self_distillation_config, "loss_method", "sdpo")
+    if loss_method != "sdpo":
+        return _compute_verdict_distillation_loss(
+            student_log_probs=student_log_probs,
+            teacher_log_probs=teacher_log_probs,
+            teacher_log_probs_neg=teacher_log_probs_neg,
+            student_all_log_probs=student_all_log_probs,
+            teacher_all_log_probs=teacher_all_log_probs,
+            teacher_all_log_probs_neg=teacher_all_log_probs_neg,
+            student_topk_log_probs=student_topk_log_probs,
+            teacher_topk_log_probs=teacher_topk_log_probs,
+            teacher_topk_log_probs_neg=teacher_topk_log_probs_neg,
+            verdict_R=verdict_R,
+            response_mask=response_mask,
+            loss_mask=loss_mask,
+            self_distillation_config=self_distillation_config,
+            old_log_probs=old_log_probs,
+            rollout_is_weights=rollout_is_weights,
+            loss_agg_mode=loss_agg_mode,
+            metrics=metrics,
+        )
 
     if self_distillation_config.full_logit_distillation:
         use_topk = self_distillation_config.distillation_topk is not None

@@ -61,6 +61,7 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.model import compute_position_id_with_mask
+from verl.utils.verdict_markers import VERDICT_RIGHT_MARKER, VERDICT_WRONG_MARKER
 from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.rollout_skip import RolloutSkip
@@ -680,6 +681,16 @@ class RayPPOTrainer:
         if self_distillation_cfg is None or loss_mode not in ("sdpo", "teacher_qv"):
             return None
 
+        # Reward-Bayes branches build dual verdict-conditioned teacher prompts
+        # instead of the privileged-reference single teacher.
+        loss_method = self_distillation_cfg.get("loss_method", "sdpo")
+        if loss_method in ("vc_opsd_sign", "opd_bayes", "vec"):
+            return self._build_verdict_self_distillation_batch(
+                batch=batch,
+                reward_tensor=reward_tensor,
+                self_distillation_cfg=self_distillation_cfg,
+            )
+
         device = batch.batch["input_ids"].device
         response_mask = batch.batch["response_mask"]
         responses = batch.batch["responses"]
@@ -794,6 +805,97 @@ class RayPPOTrainer:
             "teacher_position_ids": teacher_position_ids,
             "self_distillation_mask": self_distillation_mask,
         }), metrics
+
+    def _build_verdict_self_distillation_batch(
+        self,
+        batch: DataProto,
+        reward_tensor: torch.Tensor,
+        self_distillation_cfg: Any,
+    ) -> tuple[DataProto, dict[str, float]]:
+        """Build dual (right/wrong) verdict-conditioned teacher prompts.
+
+        The actor will run two teacher forwards on these prompts to obtain
+        p_T^±(v | s_<t), from which OPD-Bayes / VEC / vc_opsd_sign losses are
+        computed. self_distillation_mask is always 1 (R is always available).
+        """
+        device = batch.batch["input_ids"].device
+        response_mask = batch.batch["response_mask"]
+        responses = batch.batch["responses"]
+        prompt_texts = [msgs[-1]["content"] for msgs in batch.non_tensor_batch["raw_prompt"]]
+        batch_size = batch.batch.batch_size[0]
+
+        right_marker = (
+            self_distillation_cfg.get("verdict_right_marker", None) or VERDICT_RIGHT_MARKER
+        )
+        wrong_marker = (
+            self_distillation_cfg.get("verdict_wrong_marker", None) or VERDICT_WRONG_MARKER
+        )
+
+        def _build_messages(marker: str) -> list[list[dict]]:
+            out = []
+            for i in range(batch_size):
+                system_messages = batch.non_tensor_batch["raw_prompt"][i][:-1]
+                # Prepend the verdict marker to the user prompt to elicit
+                # right- or wrong-conditioned teacher distributions.
+                content = f"{marker}\n\n{prompt_texts[i]}"
+                out.append(system_messages + [{"role": "user", "content": content}])
+            return out
+
+        enable_thinking = (
+            self.config.data.apply_chat_template_kwargs.get("enable_thinking", True)
+            if self.config.data.apply_chat_template_kwargs
+            else True
+        )
+
+        def _encode(messages: list[list[dict]]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            prompt = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                return_tensors="pt",
+                return_dict=True,
+                continue_final_message=False,
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+                max_length=self_distillation_cfg.max_reprompt_len,
+                padding=True,
+                truncation=True,
+            )
+            input_ids = torch.cat([prompt["input_ids"].to(device), responses], dim=1)
+            attention_mask = torch.cat([prompt["attention_mask"].to(device), response_mask], dim=1)
+            position_ids = compute_position_id_with_mask(attention_mask)
+            return input_ids, attention_mask, position_ids
+
+        pos_ids, pos_mask, pos_pos = _encode(_build_messages(right_marker))
+        neg_ids, neg_mask, neg_pos = _encode(_build_messages(wrong_marker))
+
+        # Per-rollout outcome reward in {0, 1} (sum across response tokens; reward
+        # is sparse so this picks up the verifier's final scalar regardless of
+        # where it was deposited).
+        verdict_R = (reward_tensor.detach().sum(dim=-1) > 0).float().to(device)
+
+        self_distillation_mask = torch.ones(batch_size, dtype=torch.float32, device=device)
+
+        # Aliases under the legacy keys so the existing dp_actor path keeps
+        # the "teacher_forward_required" gate true; the actor will detect the
+        # _neg tensors and dispatch the verdict-based forward.
+        tensors = {
+            "teacher_input_ids": pos_ids,
+            "teacher_attention_mask": pos_mask,
+            "teacher_position_ids": pos_pos,
+            "teacher_input_ids_pos": pos_ids,
+            "teacher_attention_mask_pos": pos_mask,
+            "teacher_position_ids_pos": pos_pos,
+            "teacher_input_ids_neg": neg_ids,
+            "teacher_attention_mask_neg": neg_mask,
+            "teacher_position_ids_neg": neg_pos,
+            "verdict_R": verdict_R,
+            "self_distillation_mask": self_distillation_mask,
+        }
+        metrics = {
+            "self_distillation/verdict_R_mean": float(verdict_R.mean().item()),
+            "self_distillation/reprompt_sample_fraction": 1.0,
+        }
+        return DataProto.from_dict(tensors=tensors), metrics
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid", "raw_prompt"}) & batch.non_tensor_batch.keys()

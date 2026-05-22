@@ -34,6 +34,18 @@ else
     DISTILLATION_TOPK="${DISTILLATION_TOPK:-100}"
 fi
 
+# Verdict-conditioned self-distillation (reward_bayes_v2)
+LOSS_METHOD="${LOSS_METHOD:-sdpo}"                    # sdpo / vc_opsd_sign / opd_bayes / vec
+VERDICT_PRIOR_MODE="${VERDICT_PRIOR_MODE:-uniform}"   # uniform / logit / empirical
+VERDICT_PRIOR_LOGIT="${VERDICT_PRIOR_LOGIT:-0.0}"
+CALIBRATION_WEIGHT="${CALIBRATION_WEIGHT:-0.0}"
+KL_DIRECTION="${KL_DIRECTION:-reverse}"               # reverse / forward (opd_bayes)
+# opd_bayes requires full-logit; if user picks it, snap on full_logit & a reasonable topk
+if [ "${LOSS_METHOD}" = "opd_bayes" ]; then
+    FULL_LOGIT_DISTILLATION="True"
+    DISTILLATION_TOPK="${DISTILLATION_TOPK:-100}"
+fi
+
 # 数据集路径
 train_data_path="${OSS_ROOT}/datasets/${DATASET}/train.parquet"
 val_data_path="${OSS_ROOT}/datasets/${DATASET}/test.parquet"
@@ -76,6 +88,11 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.self_distillation.geodesic_trust_region=${GEODESIC_TRUST_REGION} \
     actor_rollout_ref.actor.self_distillation.geodesic_beta_scale=${GEODESIC_BETA_SCALE} \
     actor_rollout_ref.actor.self_distillation.log_delta_w_stats=${LOG_DELTA_W_STATS} \
+    actor_rollout_ref.actor.self_distillation.loss_method=${LOSS_METHOD} \
+    actor_rollout_ref.actor.self_distillation.verdict_prior_mode=${VERDICT_PRIOR_MODE} \
+    actor_rollout_ref.actor.self_distillation.verdict_prior_logit=${VERDICT_PRIOR_LOGIT} \
+    actor_rollout_ref.actor.self_distillation.calibration_weight=${CALIBRATION_WEIGHT} \
+    actor_rollout_ref.actor.self_distillation.kl_direction=${KL_DIRECTION} \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.rollout.n=${ROLLOUT_N} \
     actor_rollout_ref.rollout.val_kwargs.n=16 \

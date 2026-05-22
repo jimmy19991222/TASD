@@ -20,7 +20,7 @@ check_env MODEL_NAME
 
 N_EXAMPLES="${N_EXAMPLES:-50}"
 N_ROLLOUTS_PER_EXAMPLE="${N_ROLLOUTS_PER_EXAMPLE:-4}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-4096}"  # bio CoT routinely exceeds 1k; 512 truncates every answer → pos_rate=0
 TEMPERATURE="${TEMPERATURE:-1.0}"
 TOP_P="${TOP_P:-0.95}"
 SEED="${SEED:-42}"

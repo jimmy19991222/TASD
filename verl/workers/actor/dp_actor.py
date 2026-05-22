@@ -714,6 +714,11 @@ class DataParallelPPOActor(BasePPOActor):
         teacher_forward_required = self_distillation_enabled or teacher_qv_enabled
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
         teacher_qv_cfg = self.config.policy_loss.get("teacher_qv", None) if teacher_qv_enabled else None
+        verdict_loss_active = (
+            self_distillation_enabled
+            and self_distillation_cfg is not None
+            and self_distillation_cfg.get("loss_method", "sdpo") in ("vc_opsd_sign", "opd_bayes", "vec")
+        )
         if teacher_forward_required:
             self_distillation_required_keys = {
                 "teacher_input_ids",
@@ -721,6 +726,13 @@ class DataParallelPPOActor(BasePPOActor):
                 "teacher_position_ids",
                 "self_distillation_mask",
             }
+            if verdict_loss_active:
+                self_distillation_required_keys |= {
+                    "teacher_input_ids_neg",
+                    "teacher_attention_mask_neg",
+                    "teacher_position_ids_neg",
+                    "verdict_R",
+                }
             assert self_distillation_required_keys.issubset(set(data.batch.keys())), f"Missing required keys: {self_distillation_required_keys - set(data.batch.keys())}"
 
         select_keys = [
@@ -896,6 +908,32 @@ class DataParallelPPOActor(BasePPOActor):
                         teacher_all_logps = teacher_outputs.get("all_logps") if return_all_logps else None
                         teacher_topk_logps = teacher_outputs.get("topk_logps") if distill_topk else None
 
+                        teacher_log_prob_neg = None
+                        teacher_all_logps_neg = None
+                        teacher_topk_logps_neg = None
+                        verdict_R = None
+                        if verdict_loss_active:
+                            teacher_inputs_neg = {
+                                "responses": model_inputs["responses"],
+                                "input_ids": model_inputs["teacher_input_ids_neg"],
+                                "attention_mask": model_inputs["teacher_attention_mask_neg"],
+                                "position_ids": model_inputs["teacher_position_ids_neg"],
+                            }
+                            with torch.no_grad():
+                                teacher_outputs_neg = self._forward_micro_batch(
+                                    teacher_inputs_neg,
+                                    temperature=temperature,
+                                    calculate_entropy=False,
+                                    return_all_logps=return_all_logps,
+                                    distill_topk=distill_topk,
+                                    topk_indices=student_topk_indices,
+                                    module=teacher_model,
+                                )
+                            teacher_log_prob_neg = teacher_outputs_neg["log_probs"]
+                            teacher_all_logps_neg = teacher_outputs_neg.get("all_logps") if return_all_logps else None
+                            teacher_topk_logps_neg = teacher_outputs_neg.get("topk_logps") if distill_topk else None
+                            verdict_R = model_inputs["verdict_R"]
+
                     if self_distillation_enabled:
                         pg_loss, pg_metrics = compute_self_distillation_loss(
                             student_log_probs=log_prob,
@@ -910,6 +948,10 @@ class DataParallelPPOActor(BasePPOActor):
                             self_distillation_mask=self_distillation_mask,
                             loss_agg_mode=loss_agg_mode,
                             rollout_is_weights=rollout_is_weights,
+                            teacher_log_probs_neg=teacher_log_prob_neg if verdict_loss_active else None,
+                            teacher_all_log_probs_neg=teacher_all_logps_neg if verdict_loss_active else None,
+                            teacher_topk_log_probs_neg=teacher_topk_logps_neg if verdict_loss_active else None,
+                            verdict_R=verdict_R if verdict_loss_active else None,
                         )
 
                         pg_metrics["self_distillation/empty_target_batch"] = self_distillation_mask.sum().item() == 0
@@ -1002,6 +1044,41 @@ class DataParallelPPOActor(BasePPOActor):
                                 rollout_is_weights=rollout_is_weights,
                             )
                             pg_metrics.update(qv_metrics)
+                        # ---- SDPO-style alpha mixing (forward-KL anti-collapse) ----
+                        # When alpha < 1, mirror SDPO's JSD form:
+                        #     loss = alpha · PG_loss + (1 - alpha) · KL(p_teacher || p_student)
+                        # The forward-KL component is mass-covering and gives the student
+                        # distribution a floor on tokens the teacher still assigns mass to,
+                        # counteracting the reverse-KL mode-seeking collapse. Reuses the
+                        # same ``self_distillation.alpha`` knob that SDPO already exposes —
+                        # no teacher_qv-specific hyperparameter is introduced. alpha == 1
+                        # (default) preserves the original behaviour exactly.
+                        qv_alpha = float(self_distillation_cfg.get("alpha", 1.0))
+                        if qv_alpha < 1.0:
+                            if qv_student_full is None or qv_teacher_full is None:
+                                raise ValueError(
+                                    "teacher_qv with self_distillation.alpha < 1 requires "
+                                    "full-vocab log probs (gradient_mode='full_logit' or "
+                                    "baseline_type='ce', with full_logit_distillation=True)."
+                                )
+                            with torch.no_grad():
+                                p_teacher = qv_teacher_full.exp()
+                            fkl_per_token = (
+                                p_teacher * (qv_teacher_full - qv_student_full)
+                            ).sum(dim=-1)
+                            fkl_per_token = torch.where(
+                                loss_mask.bool() & torch.isfinite(fkl_per_token),
+                                fkl_per_token,
+                                torch.zeros_like(fkl_per_token),
+                            )
+                            fkl_loss = agg_loss(
+                                loss_mat=fkl_per_token,
+                                loss_mask=loss_mask,
+                                loss_agg_mode=loss_agg_mode,
+                            )
+                            pg_loss = qv_alpha * pg_loss + (1.0 - qv_alpha) * fkl_loss
+                            pg_metrics["actor/teacher_qv_fkl_loss"] = fkl_loss.detach().item()
+                            pg_metrics["actor/teacher_qv_alpha"] = qv_alpha
                         # ---- shared post-dispatch ----
                         if self_distillation_mask is not None:
                             pg_metrics["teacher_qv/empty_target_batch"] = (

@@ -105,6 +105,32 @@ class SelfDistillationConfig(BaseConfig):
     # cost in compute_self_distillation_loss but no extra backward.
     log_delta_w_stats: bool = False
 
+    # ── Reward-Bayes distillation ─────────────────────────────────────────
+    # Selects which loss family to apply when policy_loss.loss_mode == "sdpo".
+    #   "sdpo"           : legacy single-teacher (privileged-reference) self-distillation.
+    #   "vc_opsd_sign"   : v1 verdict-conditioned, R only flips PG sign — ablation baseline.
+    #   "opd_bayes"      : outcome-posterior distillation via KL(π* || π_θ) with
+    #                      π* ∝ π_θ · p̂(R|v) (vocab-level, requires full or topk).
+    #   "vec"            : per-token PG with credit ΔV^R_t = log p̂(R|s_≤t) - log p̂(R|s_<t)
+    #                      (sequence-level Bayes update, telescopes to log-evidence).
+    loss_method: str = "sdpo"
+    # Prior odds source for the Bayes inversion in OPD-Bayes / VEC.
+    #   "uniform"   : log P(right)/P(wrong) = 0
+    #   "logit"     : fixed scalar logit (verdict_prior_logit), allows static prior
+    #   "empirical" : per-batch mean R as base rate (logged to metrics)
+    verdict_prior_mode: str = "uniform"
+    verdict_prior_logit: float = 0.0
+    # Weight λ on the verifier-anchored calibration loss.
+    calibration_weight: float = 1.0
+    # KL direction for OPD-Bayes: "reverse" → KL(π* || π_θ) (mass-covering target),
+    # "forward" → KL(π_θ || π*) (mode-seeking target).
+    kl_direction: str = "reverse"
+    # Optional override of the prepended verdict markers used to build the
+    # dual-teacher prompts. When None, falls back to the shared defaults from
+    # verl/utils/verdict_markers.py.
+    verdict_right_marker: Optional[str] = None
+    verdict_wrong_marker: Optional[str] = None
+
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:
             raise ValueError(f"self_distillation.alpha must be in [0,1], got {self.alpha}")
@@ -124,6 +150,31 @@ class SelfDistillationConfig(BaseConfig):
             )
         if self.is_clip is not None and self.is_clip <= 0:
             raise ValueError(f"self_distillation.is_clip must be positive, got {self.is_clip}")
+
+        valid_loss_methods = {"sdpo", "vc_opsd_sign", "opd_bayes", "vec"}
+        if self.loss_method not in valid_loss_methods:
+            raise ValueError(
+                f"self_distillation.loss_method must be one of {sorted(valid_loss_methods)}, got {self.loss_method}"
+            )
+        valid_prior_modes = {"uniform", "logit", "empirical"}
+        if self.verdict_prior_mode not in valid_prior_modes:
+            raise ValueError(
+                f"self_distillation.verdict_prior_mode must be one of {sorted(valid_prior_modes)}, "
+                f"got {self.verdict_prior_mode}"
+            )
+        if self.kl_direction not in {"reverse", "forward"}:
+            raise ValueError(
+                f"self_distillation.kl_direction must be 'reverse' or 'forward', got {self.kl_direction}"
+            )
+        if self.calibration_weight < 0:
+            raise ValueError(
+                f"self_distillation.calibration_weight must be >= 0, got {self.calibration_weight}"
+            )
+        if self.loss_method == "opd_bayes" and not self.full_logit_distillation:
+            raise ValueError(
+                "self_distillation.loss_method='opd_bayes' requires full_logit_distillation=True "
+                "(provide either full vocab or distillation_topk)."
+            )
 
 
 @dataclass
