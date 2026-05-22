@@ -562,6 +562,7 @@ def compute_teacher_qv_advantage(
         elif baseline_type == "group_mean":
             Q_masked = Q * mask
             mean_q = Q_masked.sum() / valid
+            V = mean_q.expand_as(Q)  # Expand scalar to match tensor shape for metric computation
             adv = (Q - mean_q) * mask
             if norm_by_std:
                 var = ((Q - mean_q) ** 2 * mask).sum() / valid
@@ -601,6 +602,11 @@ def compute_teacher_qv_advantage(
             # Broadcast the seq-level z-score to all tokens of the seq.
             across_seq_term = seq_z.unsqueeze(-1) * mask
             adv = within_seq_z + across_seq_term
+            # For metrics, we need to reconstruct the effective V (Q - contribution_from_normalization)
+            # In group_hier, V corresponds to the normalization contributions (what was subtracted from Q)
+            V_within_seq = seq_mean * mask  # The per-sequence mean that was subtracted
+            V_across_seq = across_seq_term  # The per-group mean that was subtracted
+            V = V_within_seq + V_across_seq  # Total baseline contribution
 
         if clip_value is not None:
             adv = torch.clamp(adv, -clip_value, clip_value)
@@ -615,6 +621,8 @@ def compute_teacher_qv_advantage(
         adv = torch.where(mask.bool() & finite_mask, adv, torch.zeros_like(adv))
 
         non_finite_unmasked = ((~finite_mask) & mask.bool()).sum().item()
+
+        # Compute advantage statistics
         adv_sum = adv.sum()
         adv_abs_sum = adv.abs().sum()
         adv_sq_sum = (adv * adv).sum()
@@ -622,7 +630,29 @@ def compute_teacher_qv_advantage(
         mean_abs = (adv_abs_sum / valid).item()
         var = (adv_sq_sum / valid).item() - mean * mean
         std = (var if var > 0 else 0.0) ** 0.5
+
+        # Compute Q (teacher_log_prob) statistics for monitoring
+        Q_masked = Q * mask
+        Q_valid = Q_masked[mask.bool()]
+        if len(Q_valid) > 0:
+            q_mean = Q_valid.mean().item()
+            q_min = Q_valid.min().item()
+            q_max = Q_valid.max().item()
+        else:
+            q_mean, q_min, q_max = 0.0, 0.0, 0.0
+
+        # Compute V (baseline) statistics for monitoring
+        V_masked = V * mask
+        V_valid = V_masked[mask.bool()]
+        if len(V_valid) > 0:
+            v_mean = V_valid.mean().item()
+            v_min = V_valid.min().item()
+            v_max = V_valid.max().item()
+        else:
+            v_mean, v_min, v_max = 0.0, 0.0, 0.0
+
         metrics = {
+            # Original advantage metrics
             "actor/teacher_qv_adv_mean": mean,
             "actor/teacher_qv_adv_std": std,
             "actor/teacher_qv_adv_abs_mean": mean_abs,
@@ -635,6 +665,21 @@ def compute_teacher_qv_advantage(
             # Should be 0 in healthy runs; any non-zero means topk/add_tail or
             # group-stat division produced bad values.
             "actor/teacher_qv_non_finite_unmasked": float(non_finite_unmasked),
+
+            # New metrics: Q (teacher_log_prob) values
+            "critic/q_teacher_log_prob/mean": q_mean,
+            "critic/q_teacher_log_prob/min": q_min,
+            "critic/q_teacher_log_prob/max": q_max,
+
+            # New metrics: V (baseline) values
+            "critic/v_baseline/mean": v_mean,
+            "critic/v_baseline/min": v_min,
+            "critic/v_baseline/max": v_max,
+
+            # Additional: raw advantage before masking (for debugging)
+            "critic/adv_teacher_qv/raw_mean": q_mean - v_mean,  # Approximate since V may be computed differently
+            "critic/adv_teacher_qv/raw_min": q_min - v_max,    # Conservative estimate
+            "critic/adv_teacher_qv/raw_max": q_max - v_min,    # Conservative estimate
         }
 
     return adv, metrics
@@ -694,8 +739,36 @@ def compute_teacher_qv_full_logit_loss(
             # ce / group_mean / group_hier all collapse to the same gradient
             # because the V is scalar w.r.t. vocab and cancels under Σ p_s·∇log p_s.
             # We still subtract V for consistency / numerical hygiene (smaller A magnitudes).
-            V = (p_s * t_log).sum(-1, keepdim=True)
-            adv = t_log - V
+            V_vocab_scalar = (p_s * t_log).sum(-1, keepdim=True)  # (B, T, 1) - the scalar baseline per position
+            adv = t_log - V_vocab_scalar
+
+        # Compute statistics for Q (teacher log probs)
+        t_log_masked = t_log * response_mask.unsqueeze(-1)  # (B, T, V) masked
+        t_log_valid = t_log_masked[response_mask.bool()]  # (N_valid_positions, V)
+        if t_log_valid.numel() > 0:
+            q_mean = t_log_valid.mean().item()
+            q_min = t_log_valid.min().item()
+            q_max = t_log_valid.max().item()
+        else:
+            q_mean, q_min, q_max = 0.0, 0.0, 0.0
+
+        # Compute statistics for V (baseline) depending on baseline_type
+        if baseline_type == "student":
+            # For student baseline, V = student_log_probs
+            V_for_metrics = student_full_log_probs.detach()
+        else:
+            # For ce/group_mean/group_hier, V is the scalar per position computed above
+            V_for_metrics = V_vocab_scalar  # Shape: (B, T, 1)
+
+        V_masked = V_for_metrics * response_mask.unsqueeze(-1)
+        V_valid = V_masked[response_mask.bool()]  # This gets values at valid positions
+        if V_valid.numel() > 0:
+            v_mean = V_valid.mean().item()
+            v_min = V_valid.min().item()
+            v_max = V_valid.max().item()
+        else:
+            v_mean, v_min, v_max = 0.0, 0.0, 0.0
+
         adv = torch.nan_to_num(adv, nan=0.0, posinf=0.0, neginf=0.0)
 
     # Vocab-summed per-token loss. Gradient flows ONLY through student_full_log_probs;
@@ -723,6 +796,34 @@ def compute_teacher_qv_full_logit_loss(
     with torch.no_grad():
         valid = response_mask.float().sum().clamp(min=1.0)
         non_finite_unmasked = ((~finite_mask) & response_mask.bool()).sum().item()
+
+        # Compute statistics for Q (teacher log probs)
+        t_log_masked = t_log * response_mask.unsqueeze(-1)  # (B, T, V) masked
+        t_log_valid = t_log_masked[response_mask.bool()]  # (N_valid_positions, V)
+        if t_log_valid.numel() > 0:
+            q_mean = t_log_valid.mean().item()
+            q_min = t_log_valid.min().item()
+            q_max = t_log_valid.max().item()
+        else:
+            q_mean, q_min, q_max = 0.0, 0.0, 0.0
+
+        # Compute statistics for V (baseline) depending on baseline_type
+        if baseline_type == "student":
+            # For student baseline, V = student_log_probs
+            V = student_full_log_probs.detach()
+        else:
+            # For ce/group_mean/group_hier, V was computed as scalar per position
+            V = (p_s * t_log).sum(-1, keepdim=True)  # Shape: (B, T, 1)
+
+        V_masked = V * response_mask.unsqueeze(-1) if V.dim() == 3 else V * response_mask.unsqueeze(-1).squeeze(-1)
+        V_valid = V_masked[response_mask.bool()] if V.dim() == 3 else V[response_mask.bool()]
+        if V_valid.numel() > 0:
+            v_mean = V_valid.mean().item()
+            v_min = V_valid.min().item()
+            v_max = V_valid.max().item()
+        else:
+            v_mean, v_min, v_max = 0.0, 0.0, 0.0
+
         adv_abs_mean = (adv.abs().mean(-1) * response_mask).sum() / valid
         adv_max = adv.max().item()
         adv_min = adv.min().item()
@@ -739,6 +840,21 @@ def compute_teacher_qv_full_logit_loss(
                 {"student": 0, "ce": 1, "group_mean": 2, "group_hier": 3}[baseline_type]
             ),
             "actor/teacher_qv_gradient_mode_id": 1.0,  # 1 = full_logit, 0 = sampled
+
+            # New metrics: Q (teacher_log_prob) values
+            "critic/q_teacher_log_prob/mean": q_mean,
+            "critic/q_teacher_log_prob/min": q_min,
+            "critic/q_teacher_log_prob/max": q_max,
+
+            # New metrics: V (baseline) values
+            "critic/v_baseline/mean": v_mean,
+            "critic/v_baseline/min": v_min,
+            "critic/v_baseline/max": v_max,
+
+            # Additional: raw advantage statistics (before applying p_s weights in loss)
+            "critic/adv_teacher_qv/raw_mean": (q_mean - v_mean) if baseline_type == "student" else 0.0,
+            "critic/adv_teacher_qv/raw_min": (q_min - v_max) if baseline_type == "student" else 0.0,
+            "critic/adv_teacher_qv/raw_max": (q_max - v_min) if baseline_type == "student" else 0.0,
         }
     return loss, metrics
 
@@ -1583,6 +1699,48 @@ def compute_self_distillation_loss(
             kl_loss = torch.lerp(kl_student, kl_teacher, alpha)  # Compute the Generalized Jensen-Shannon Divergence
 
         per_token_loss = kl_loss.sum(-1)
+
+        # ===== ΔW signal-to-noise diagnostics (gated, no backward) =====
+        # ΔW(v) := log p_T(v|r,s_<t) - log p_s(v|s_<t)  is the Bayes factor
+        # "how much does inserting v raise log p(r as valid continuation)".
+        # SNR = (top-K |ΔW| mean) / (vocab |ΔW| std) — high SNR means the
+        # distillation signal is concentrated on a few high-ΔW tokens; low SNR
+        # means it's spread thin and likely just noise.
+        if getattr(self_distillation_config, "log_delta_w_stats", False):
+            with torch.no_grad():
+                # Shape (B, T, V_or_K[+1]) — uses whatever vocab dim is live.
+                delta_w = teacher_distill_log_probs - student_distill_log_probs
+                abs_dw = delta_w.abs()
+                vocab_dim = abs_dw.shape[-1]
+
+                per_tok_abs_mean = abs_dw.mean(dim=-1)                       # noise floor 1
+                per_tok_abs_std = abs_dw.std(dim=-1)                         # noise floor 2
+                per_tok_abs_max = abs_dw.max(dim=-1).values                  # signal ceiling
+                per_tok_signed_mean = delta_w.mean(dim=-1)                   # Jensen check
+
+                k = min(32, vocab_dim)
+                topk_abs = abs_dw.topk(k, dim=-1).values                     # (B, T, k)
+                per_tok_topk_signal = topk_abs.mean(dim=-1)                  # signal
+                per_tok_topk_mass = (
+                    topk_abs.sum(dim=-1) / abs_dw.sum(dim=-1).clamp(min=1e-8)
+                )
+                per_tok_snr = per_tok_topk_signal / per_tok_abs_std.clamp(min=1e-8)
+
+                m = loss_mask.float()
+                denom = m.sum().clamp(min=1.0)
+
+                def _masked_mean(x: torch.Tensor) -> float:
+                    return ((x * m).sum() / denom).item()
+
+                metrics["actor/delta_w_abs_mean"] = _masked_mean(per_tok_abs_mean)
+                metrics["actor/delta_w_abs_std"] = _masked_mean(per_tok_abs_std)
+                metrics["actor/delta_w_abs_max"] = _masked_mean(per_tok_abs_max)
+                metrics["actor/delta_w_signed_mean"] = _masked_mean(per_tok_signed_mean)
+                metrics["actor/delta_w_topk_signal"] = _masked_mean(per_tok_topk_signal)
+                metrics["actor/delta_w_topk_mass_frac"] = _masked_mean(per_tok_topk_mass)
+                metrics["actor/delta_w_snr"] = _masked_mean(per_tok_snr)
+                metrics["actor/delta_w_topk_k"] = float(k)
+                metrics["actor/delta_w_vocab_dim"] = float(vocab_dim)
     else:
         assert self_distillation_config.alpha == 1.0, "Only reverse KL is supported for non-full-logit distillation"
         log_ratio = student_log_probs - teacher_log_probs

@@ -100,6 +100,11 @@ class SelfDistillationConfig(BaseConfig):
     geodesic_trust_region: float = 5.0
     geodesic_beta_scale: float = 0.5
 
+    # Diagnostic: log per-step ΔW (= log p_T - log p_s) signal-to-noise stats.
+    # Only effective when full_logit_distillation=True. Adds ~3x the KL forward
+    # cost in compute_self_distillation_loss but no extra backward.
+    log_delta_w_stats: bool = False
+
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:
             raise ValueError(f"self_distillation.alpha must be in [0,1], got {self.alpha}")
@@ -184,6 +189,14 @@ class TeacherQVConfig(BaseConfig):
               For ce/group_*, V is scalar in vocab, so it drops out and the gradient reduces
               to ∇ E_{v~p_s}[log p_t(v)] (forward cross-entropy gradient).
               Requires full vocab or topk+tail log probs on both student and teacher.
+
+    Note on anti-collapse mixing:
+        teacher_qv honours ``self_distillation.alpha`` exactly like SDPO does. When
+        ``alpha == 1`` (default), the loss is pure reverse-KL / forward-CE PG and is
+        prone to entropy collapse. When ``alpha < 1``, the loss is automatically
+        scaled to ``alpha * PG_loss + (1 - alpha) * KL(p_teacher || p_student)``,
+        adding a forward-KL (mass-covering) floor — same knob, same semantics as
+        SDPO's JSD. No additional teacher_qv-specific hyperparameter is needed.
     """
 
     baseline_type: str = "student"

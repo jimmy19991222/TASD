@@ -24,6 +24,16 @@ USE_GEODESIC="${USE_GEODESIC:-False}"
 GEODESIC_TRUST_REGION="${GEODESIC_TRUST_REGION:-5.0}"
 GEODESIC_BETA_SCALE="${GEODESIC_BETA_SCALE:-0.5}"
 
+# Loss-variant 参数（可选,默认保持历史行为: full-logit + 不打 SNR）
+FULL_LOGIT_DISTILLATION="${FULL_LOGIT_DISTILLATION:-True}"
+LOG_DELTA_W_STATS="${LOG_DELTA_W_STATS:-False}"
+# token-level (full_logit=False) 时禁用 topk(走 token-PG 分支,不需要)
+if [ "${FULL_LOGIT_DISTILLATION}" = "False" ]; then
+    DISTILLATION_TOPK="${DISTILLATION_TOPK:-null}"
+else
+    DISTILLATION_TOPK="${DISTILLATION_TOPK:-100}"
+fi
+
 # 数据集路径
 train_data_path="${OSS_ROOT}/datasets/${DATASET}/train.parquet"
 val_data_path="${OSS_ROOT}/datasets/${DATASET}/test.parquet"
@@ -57,13 +67,15 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.lr=${LR} \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     actor_rollout_ref.actor.ppo_mini_batch_size=32 \
-    actor_rollout_ref.actor.self_distillation.distillation_topk=100 \
+    actor_rollout_ref.actor.self_distillation.full_logit_distillation=${FULL_LOGIT_DISTILLATION} \
+    actor_rollout_ref.actor.self_distillation.distillation_topk=${DISTILLATION_TOPK} \
     actor_rollout_ref.actor.self_distillation.alpha=${ALPHA} \
     actor_rollout_ref.actor.self_distillation.dont_reprompt_on_self_success=${DONT_REPROMPT_ON_SELF_SUCCESS} \
     actor_rollout_ref.actor.self_distillation.include_environment_feedback=False \
     actor_rollout_ref.actor.self_distillation.use_geodesic=${USE_GEODESIC} \
     actor_rollout_ref.actor.self_distillation.geodesic_trust_region=${GEODESIC_TRUST_REGION} \
     actor_rollout_ref.actor.self_distillation.geodesic_beta_scale=${GEODESIC_BETA_SCALE} \
+    actor_rollout_ref.actor.self_distillation.log_delta_w_stats=${LOG_DELTA_W_STATS} \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.rollout.n=${ROLLOUT_N} \
     actor_rollout_ref.rollout.val_kwargs.n=16 \
