@@ -151,6 +151,19 @@ self_distillation:
   # Only effective when full_logit_distillation=True. Adds ~3x the KL forward cost.
   log_delta_w_stats: False
 
+  # Teacher context construction mode:
+  #   "ref"            : classic SDPO, teacher reads reference solution via reprompt
+  #   "marker"         : pure self-distill, teacher = student prompt + marker on assistant turn
+  #   "ref_and_marker" : combined, teacher gets both ref and marker
+  teacher_context_mode: ref
+
+  # Marker prepended on the assistant turn for "marker" / "ref_and_marker" modes
+  self_verified_marker: "This answer is verified correct."
+
+  # ΔH overconfidence damping: w_t = exp(-max(0, H_s - H_T) / overconfidence_damping)
+  # 0.0 disables. Only effective when full_logit_distillation=True. Sensible range 0.5~2.0.
+  overconfidence_damping: 0.0
+
   # IS clip for loss; null disables IS weighting
   is_clip: 2
 

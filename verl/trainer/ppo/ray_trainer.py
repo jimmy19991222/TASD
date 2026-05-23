@@ -698,28 +698,47 @@ class RayPPOTrainer:
         prompt_texts = [msgs[-1]["content"] for msgs in batch.non_tensor_batch["raw_prompt"]]
         batch_size = batch.batch.batch_size[0]
 
-        # Extract feedback if available and include_environment_feedback is enabled
-        feedback_list = self._collect_feedback(
-            include_environment_feedback=self_distillation_cfg.include_environment_feedback,
-            reward_extra_infos_dict=reward_extra_infos_dict,
-            batch_size=batch_size,
-        )
+        teacher_context_mode = self_distillation_cfg.get("teacher_context_mode", "ref")
+        use_marker = teacher_context_mode in ("marker", "ref_and_marker")
+        use_ref = teacher_context_mode in ("ref", "ref_and_marker")
 
-        success_by_uid = self._collect_solutions_by_uid(batch, reward_tensor, success_reward_threshold=self_distillation_cfg.success_reward_threshold)
-        solution_strs = [
-            self._get_solution(
-                i,
-                success_by_uid,
-                batch.non_tensor_batch["uid"],
-                response_texts,
-                self_distillation_cfg.dont_reprompt_on_self_success,
-                self_distillation_cfg.get("remove_thinking_from_demonstration", False),
+        # Extract feedback if available and include_environment_feedback is enabled
+        # (only used when teacher reads the privileged reference solution).
+        if use_ref:
+            feedback_list = self._collect_feedback(
+                include_environment_feedback=self_distillation_cfg.include_environment_feedback,
+                reward_extra_infos_dict=reward_extra_infos_dict,
+                batch_size=batch_size,
             )
-            for i in range(batch_size)
-        ]
+            success_by_uid = self._collect_solutions_by_uid(
+                batch, reward_tensor,
+                success_reward_threshold=self_distillation_cfg.success_reward_threshold,
+            )
+            solution_strs = [
+                self._get_solution(
+                    i,
+                    success_by_uid,
+                    batch.non_tensor_batch["uid"],
+                    response_texts,
+                    self_distillation_cfg.dont_reprompt_on_self_success,
+                    self_distillation_cfg.get("remove_thinking_from_demonstration", False),
+                )
+                for i in range(batch_size)
+            ]
+        else:
+            feedback_list = [None] * batch_size
+            success_by_uid = {}
+            solution_strs = [None] * batch_size
 
         def _build_teacher_message(i: int) -> list[dict]:
             system_messages = batch.non_tensor_batch["raw_prompt"][i][:-1]
+
+            if not use_ref:
+                # Pure marker mode: teacher prompt is identical to student prompt.
+                return system_messages + [
+                    {"role": "user", "content": prompt_texts[i]},
+                ]
+
             has_solution = solution_strs[i] is not None
             has_feedback = feedback_list[i] is not None
             feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
@@ -770,8 +789,27 @@ class RayPPOTrainer:
             padding=True,
             truncation=True,
         )
-        teacher_input_ids = torch.cat([teacher_prompt["input_ids"].to(device), responses], dim=1)
-        teacher_attention_mask = torch.cat([teacher_prompt["attention_mask"].to(device), response_mask], dim=1)
+        teacher_prompt_ids = teacher_prompt["input_ids"].to(device)
+        teacher_prompt_mask = teacher_prompt["attention_mask"].to(device)
+
+        if use_marker:
+            # Tokenize the self-verified marker text without special tokens; the
+            # assistant header has already been emitted by add_generation_prompt.
+            # The trailing "\n\n" gives a clean separator between marker and the
+            # actual response tokens.
+            marker_text = self_distillation_cfg.self_verified_marker
+            if not marker_text.endswith("\n\n"):
+                marker_text = marker_text + "\n\n"
+            marker_ids_1d = self.tokenizer.encode(marker_text, add_special_tokens=False)
+            marker_ids_1d = torch.tensor(marker_ids_1d, dtype=teacher_prompt_ids.dtype, device=device)
+            marker_len = marker_ids_1d.numel()
+            marker_ids = marker_ids_1d.unsqueeze(0).expand(batch_size, marker_len)
+            marker_mask = torch.ones(batch_size, marker_len, dtype=teacher_prompt_mask.dtype, device=device)
+            teacher_input_ids = torch.cat([teacher_prompt_ids, marker_ids, responses], dim=1)
+            teacher_attention_mask = torch.cat([teacher_prompt_mask, marker_mask, response_mask], dim=1)
+        else:
+            teacher_input_ids = torch.cat([teacher_prompt_ids, responses], dim=1)
+            teacher_attention_mask = torch.cat([teacher_prompt_mask, response_mask], dim=1)
         teacher_position_ids = compute_position_id_with_mask(teacher_attention_mask)
 
         # Compute which samples actually use feedback (accounting for environment_feedback_only_without_solution)
@@ -781,23 +819,35 @@ class RayPPOTrainer:
             for i in range(batch_size)
         ]
 
-        # self_distillation_mask is True if sample has a solution OR feedback is used (i.e., will get a reprompted message)
-        self_distillation_mask = torch.tensor(
-            [solution_strs[i] is not None or feedback_used[i] for i in range(batch_size)],
-            dtype=torch.float32,
-            device=device
-        )
+        if use_marker:
+            # Marker provides an unconditional self-distillation signal for every
+            # sample; no sibling success or feedback required.
+            self_distillation_mask = torch.ones(batch_size, dtype=torch.float32, device=device)
+        else:
+            # self_distillation_mask is True if sample has a solution OR feedback is used (i.e., will get a reprompted message)
+            self_distillation_mask = torch.tensor(
+                [solution_strs[i] is not None or feedback_used[i] for i in range(batch_size)],
+                dtype=torch.float32,
+                device=device
+            )
 
         uids = set(batch.non_tensor_batch["uid"])
         num_with_feedback_available = sum(1 for f in feedback_list if f is not None)
         num_with_feedback_used = sum(1 for f in feedback_used if f)
         num_with_solution = sum(1 for s in solution_strs if s is not None)
+        if use_ref:
+            success_group_fraction = (
+                len([uid for uid in uids if len(success_by_uid[uid]) > 0]) / len(uids)
+            )
+        else:
+            success_group_fraction = 0.0
         metrics = {
-            "self_distillation/success_group_fraction": len([uid for uid in uids if len(success_by_uid[uid]) > 0]) / len(uids),
+            "self_distillation/success_group_fraction": success_group_fraction,
             "self_distillation/success_sample_fraction": num_with_solution / batch_size,
             "self_distillation/feedback_available_fraction": num_with_feedback_available / batch_size,
             "self_distillation/feedback_used_fraction": num_with_feedback_used / batch_size,
             "self_distillation/reprompt_sample_fraction": self_distillation_mask.float().mean().item(),
+            "self_distillation/marker_active_fraction": float(use_marker),
         }
         return DataProto.from_dict(tensors={
             "teacher_input_ids": teacher_input_ids,

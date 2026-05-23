@@ -1954,6 +1954,37 @@ def compute_self_distillation_loss(
                 metrics["actor/delta_w_snr"] = _masked_mean(per_tok_snr)
                 metrics["actor/delta_w_topk_k"] = float(k)
                 metrics["actor/delta_w_vocab_dim"] = float(vocab_dim)
+
+        # ===== ΔH overconfidence damping (marker-driven self-distill) =====
+        # w_t = exp(-max(0, H_s - H_T) / τ).
+        # Kicks in only when teacher is MORE confident than student (marker
+        # collapsed teacher entropy). When student is already as confident or
+        # more, w = 1 (no damping). Detached: just a soft mask, no gradient.
+        overconfidence_damping = float(
+            getattr(self_distillation_config, "overconfidence_damping", 0.0)
+        )
+        if overconfidence_damping > 0:
+            with torch.no_grad():
+                student_entropy = -(
+                    torch.exp(student_distill_log_probs) * student_distill_log_probs
+                ).sum(-1)  # (B, T)
+                teacher_entropy = -(
+                    torch.exp(teacher_distill_log_probs) * teacher_distill_log_probs
+                ).sum(-1)
+                gap = (student_entropy - teacher_entropy).clamp(min=0.0)
+                damping_weight = torch.exp(-gap / overconfidence_damping)
+            per_token_loss = per_token_loss * damping_weight
+            with torch.no_grad():
+                m = loss_mask.float()
+                denom = m.sum().clamp(min=1.0)
+                metrics["actor/damp_weight_mean"] = ((damping_weight * m).sum() / denom).item()
+                metrics["actor/damp_weight_min"] = (
+                    damping_weight.masked_fill(m == 0, 1.0).min().item()
+                )
+                metrics["actor/damp_gap_mean"] = ((gap * m).sum() / denom).item()
+                metrics["actor/damp_H_student_mean"] = ((student_entropy * m).sum() / denom).item()
+                metrics["actor/damp_H_teacher_mean"] = ((teacher_entropy * m).sum() / denom).item()
+                metrics["actor/damp_tau"] = overconfidence_damping
     else:
         assert self_distillation_config.alpha == 1.0, "Only reverse KL is supported for non-full-logit distillation"
         log_ratio = student_log_probs - teacher_log_probs

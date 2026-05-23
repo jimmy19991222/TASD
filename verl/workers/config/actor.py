@@ -131,6 +131,24 @@ class SelfDistillationConfig(BaseConfig):
     verdict_right_marker: Optional[str] = None
     verdict_wrong_marker: Optional[str] = None
 
+    # ── Self-verified marker SDPO ────────────────────────────────────────
+    # Teacher context construction mode:
+    #   "ref"            : classic SDPO; teacher reads reference solution via reprompt machinery.
+    #   "marker"         : pure self-distill; teacher = student prompt + `self_verified_marker`
+    #                      prepended on the assistant turn (no ref, no R). Decouples distill
+    #                      signal from sibling rollouts.
+    #   "ref_and_marker" : combined; teacher gets BOTH ref (via reprompt) AND marker
+    #                      prepended on the assistant turn — joint conditioning, one teacher
+    #                      forward.
+    teacher_context_mode: str = "ref"
+    # Marker prepended to the assistant turn for "marker" and "ref_and_marker" modes.
+    self_verified_marker: str = "This answer is verified correct."
+    # ΔH overconfidence damping: w_t = exp(-max(0, H_s - H_T) / overconfidence_damping)
+    # Down-weights tokens where the marker collapses teacher entropy below student entropy
+    # (marker-induced spurious confidence). 0.0 disables. Sensible range: 0.5 ~ 2.0.
+    # Only effective when full_logit_distillation=True.
+    overconfidence_damping: float = 0.0
+
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:
             raise ValueError(f"self_distillation.alpha must be in [0,1], got {self.alpha}")
@@ -174,6 +192,22 @@ class SelfDistillationConfig(BaseConfig):
             raise ValueError(
                 "self_distillation.loss_method='opd_bayes' requires full_logit_distillation=True "
                 "(provide either full vocab or distillation_topk)."
+            )
+
+        valid_teacher_ctx_modes = {"ref", "marker", "ref_and_marker"}
+        if self.teacher_context_mode not in valid_teacher_ctx_modes:
+            raise ValueError(
+                f"self_distillation.teacher_context_mode must be one of "
+                f"{sorted(valid_teacher_ctx_modes)}, got {self.teacher_context_mode}"
+            )
+        if self.overconfidence_damping < 0:
+            raise ValueError(
+                f"self_distillation.overconfidence_damping must be >= 0, got {self.overconfidence_damping}"
+            )
+        if self.overconfidence_damping > 0 and not self.full_logit_distillation:
+            raise ValueError(
+                "self_distillation.overconfidence_damping > 0 requires full_logit_distillation=True "
+                "(needs vocab-level entropy of both teacher and student)."
             )
 
 
