@@ -105,8 +105,8 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.self_distillation.calibration_weight=${CALIBRATION_WEIGHT} \
     actor_rollout_ref.actor.self_distillation.kl_direction=${KL_DIRECTION} \
     actor_rollout_ref.actor.self_distillation.teacher_context_mode=${TEACHER_CONTEXT_MODE} \
-    actor_rollout_ref.actor.self_distillation.self_verified_marker="${SELF_VERIFIED_MARKER}" \
-    actor_rollout_ref.actor.self_distillation.gt_marker_template="${GT_MARKER_TEMPLATE}" \
+    actor_rollout_ref.actor.self_distillation.self_verified_marker="'${SELF_VERIFIED_MARKER}'" \
+    actor_rollout_ref.actor.self_distillation.gt_marker_template="'${GT_MARKER_TEMPLATE}'" \
     actor_rollout_ref.actor.self_distillation.overconfidence_damping=${OVERCONFIDENCE_DAMPING} \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.rollout.n=${ROLLOUT_N} \
