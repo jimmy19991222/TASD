@@ -699,8 +699,9 @@ class RayPPOTrainer:
         batch_size = batch.batch.batch_size[0]
 
         teacher_context_mode = self_distillation_cfg.get("teacher_context_mode", "ref")
-        use_marker = teacher_context_mode in ("marker", "ref_and_marker")
+        use_marker = teacher_context_mode in ("marker", "ref_and_marker", "gt_marker")
         use_ref = teacher_context_mode in ("ref", "ref_and_marker")
+        use_gt_marker = teacher_context_mode == "gt_marker"
 
         # Extract feedback if available and include_environment_feedback is enabled
         # (only used when teacher reads the privileged reference solution).
@@ -792,19 +793,69 @@ class RayPPOTrainer:
         teacher_prompt_ids = teacher_prompt["input_ids"].to(device)
         teacher_prompt_mask = teacher_prompt["attention_mask"].to(device)
 
+        gt_available_fraction = 0.0
         if use_marker:
             # Tokenize the self-verified marker text without special tokens; the
             # assistant header has already been emitted by add_generation_prompt.
             # The trailing "\n\n" gives a clean separator between marker and the
             # actual response tokens.
-            marker_text = self_distillation_cfg.self_verified_marker
-            if not marker_text.endswith("\n\n"):
-                marker_text = marker_text + "\n\n"
-            marker_ids_1d = self.tokenizer.encode(marker_text, add_special_tokens=False)
-            marker_ids_1d = torch.tensor(marker_ids_1d, dtype=teacher_prompt_ids.dtype, device=device)
-            marker_len = marker_ids_1d.numel()
-            marker_ids = marker_ids_1d.unsqueeze(0).expand(batch_size, marker_len)
-            marker_mask = torch.ones(batch_size, marker_len, dtype=teacher_prompt_mask.dtype, device=device)
+            if use_gt_marker:
+                # Per-sample marker with {ground_truth} substitution. Variable
+                # length across batch → left-pad so actual marker tokens sit
+                # flush against the response block for every sample. Padded
+                # positions get attention_mask=0 so teacher ignores them.
+                template = self_distillation_cfg.gt_marker_template
+                fallback_text = self_distillation_cfg.self_verified_marker
+                reward_models = batch.non_tensor_batch.get("reward_model", None)
+                marker_texts: list[str] = []
+                gt_found = 0
+                for i in range(batch_size):
+                    gt = None
+                    if reward_models is not None:
+                        rm = reward_models[i]
+                        if isinstance(rm, dict):
+                            gt = rm.get("ground_truth", None)
+                    if gt is None or (isinstance(gt, str) and len(gt) == 0):
+                        text = fallback_text
+                    else:
+                        text = template.format(ground_truth=str(gt))
+                        gt_found += 1
+                    if not text.endswith("\n\n"):
+                        text = text + "\n\n"
+                    marker_texts.append(text)
+                gt_available_fraction = gt_found / max(batch_size, 1)
+
+                marker_token_lists = [
+                    self.tokenizer.encode(t, add_special_tokens=False) for t in marker_texts
+                ]
+                max_marker_len = max((len(t) for t in marker_token_lists), default=0)
+                pad_id = self.tokenizer.pad_token_id
+                if pad_id is None:
+                    pad_id = self.tokenizer.eos_token_id or 0
+                marker_ids = torch.full(
+                    (batch_size, max_marker_len), pad_id,
+                    dtype=teacher_prompt_ids.dtype, device=device,
+                )
+                marker_mask = torch.zeros(
+                    batch_size, max_marker_len,
+                    dtype=teacher_prompt_mask.dtype, device=device,
+                )
+                for i, ids in enumerate(marker_token_lists):
+                    L = len(ids)
+                    if L > 0:
+                        marker_ids[i, -L:] = torch.tensor(
+                            ids, dtype=teacher_prompt_ids.dtype, device=device,
+                        )
+                        marker_mask[i, -L:] = 1
+            else:
+                marker_text = self_distillation_cfg.self_verified_marker
+                if not marker_text.endswith("\n\n"):
+                    marker_text = marker_text + "\n\n"
+                marker_ids_1d = self.tokenizer.encode(marker_text, add_special_tokens=False)
+                marker_ids_1d = torch.tensor(marker_ids_1d, dtype=teacher_prompt_ids.dtype, device=device)
+                marker_len = marker_ids_1d.numel()
+                marker_ids = marker_ids_1d.unsqueeze(0).expand(batch_size, marker_len)
+                marker_mask = torch.ones(batch_size, marker_len, dtype=teacher_prompt_mask.dtype, device=device)
             teacher_input_ids = torch.cat([teacher_prompt_ids, marker_ids, responses], dim=1)
             teacher_attention_mask = torch.cat([teacher_prompt_mask, marker_mask, response_mask], dim=1)
         else:
@@ -848,6 +899,7 @@ class RayPPOTrainer:
             "self_distillation/feedback_used_fraction": num_with_feedback_used / batch_size,
             "self_distillation/reprompt_sample_fraction": self_distillation_mask.float().mean().item(),
             "self_distillation/marker_active_fraction": float(use_marker),
+            "self_distillation/gt_marker_gt_available_fraction": gt_available_fraction,
         }
         return DataProto.from_dict(tensors={
             "teacher_input_ids": teacher_input_ids,

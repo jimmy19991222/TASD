@@ -140,9 +140,17 @@ class SelfDistillationConfig(BaseConfig):
     #   "ref_and_marker" : combined; teacher gets BOTH ref (via reprompt) AND marker
     #                      prepended on the assistant turn — joint conditioning, one teacher
     #                      forward.
+    #   "gt_marker"      : per-sample marker built from `gt_marker_template`, substituting
+    #                      {ground_truth} from the dataset's reward_model.ground_truth field.
+    #                      Variable-length per sample; left-padded to batch max in the marker
+    #                      block. Falls back to `self_verified_marker` when GT is missing.
     teacher_context_mode: str = "ref"
     # Marker prepended to the assistant turn for "marker" and "ref_and_marker" modes.
     self_verified_marker: str = "This answer is verified correct."
+    # Template for "gt_marker" mode. {ground_truth} is substituted per sample.
+    gt_marker_template: str = (
+        "This answer is verified correct, correct answer is {ground_truth}."
+    )
     # ΔH overconfidence damping: w_t = exp(-max(0, H_s - H_T) / overconfidence_damping)
     # Down-weights tokens where the marker collapses teacher entropy below student entropy
     # (marker-induced spurious confidence). 0.0 disables. Sensible range: 0.5 ~ 2.0.
@@ -194,7 +202,7 @@ class SelfDistillationConfig(BaseConfig):
                 "(provide either full vocab or distillation_topk)."
             )
 
-        valid_teacher_ctx_modes = {"ref", "marker", "ref_and_marker"}
+        valid_teacher_ctx_modes = {"ref", "marker", "ref_and_marker", "gt_marker"}
         if self.teacher_context_mode not in valid_teacher_ctx_modes:
             raise ValueError(
                 f"self_distillation.teacher_context_mode must be one of "

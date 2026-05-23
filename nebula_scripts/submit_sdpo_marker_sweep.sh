@@ -7,7 +7,8 @@
 #   * marker        : pure self-distill, teacher reads marker only (no ref)
 #   * marker + damp : marker + ΔH overconfidence damping
 #                     w_t = exp(-max(0, H_s - H_T) / τ), τ=1.0
-#   * ref + marker  : combined, teacher reads both ref AND marker (joint)
+#   * gt_marker     : per-sample marker with ground-truth substituted:
+#                     "This answer is verified correct, correct answer is <gt>."
 # All share the JSD vocab-level SDPO baseline (alpha=0.5, full_logit, topk=100).
 #
 # Usage:
@@ -30,7 +31,7 @@ PROJECT_NAME="${PROJECT_NAME:-SDPO_Marker}"
 
 # ── 参数解析 ────────────────────────────────────────────────────────────
 DRY_RUN=false
-VARIANT_SELECT="all"   # all | marker | marker_damp | refmarker | comma-separated
+VARIANT_SELECT="all"   # all | marker | marker_damp | gt_marker | comma-separated
 
 for arg in "$@"; do
     case "$arg" in
@@ -62,7 +63,7 @@ LR_TAG=$(echo "$LR" | tr '-' '_')
 VARIANTS=(
     "marker:marker:0.0"
     "marker_damp:marker:1.0"
-    "refmarker:ref_and_marker:0.0"
+    "gt_marker:gt_marker:0.0"
 )
 
 _should_run() {

@@ -97,6 +97,26 @@ $$
 
 ⚠️ 注意:这个 calibration 只在 `p_T` 和 `p_s` 共享 weight(OPSD)时严格成立。传统 OPD(独立 teacher)下 `c_t` 是 teacher 网络的信念,与 student 行为脱钩,等价性不再 trivially 成立。这一点延续 [`verdict_credit_assignment.md` §3.4](verdict_credit_assignment.md#34) 的 framing。
 
+### 2.1 严格性 caveat:两条隐含假设
+
+上述推导依赖两条没有显式说出来的假设,有必要单独标出来:
+
+**(A) Shared-prefix 约定**。本节里 `s_<t` 指 teacher 和 student **共享**的 prefix `(x, y_<t)`,$m$ 是 teacher 独占的额外 conditioning。
+- 在 **marker mode** 下,这成立:student 看到 `(x, y_<t)`,teacher 看到 `(x, m, y_<t)`,差集恰好是 fixed marker $m$。
+- 在 **ref mode** 下,teacher prefix 实际是 `(x, "Correct solution:", ref, y_<t)`,直接套 §2 的拆解会把 $m := \text{ref}$。此时 $c_t = \log p(\text{ref} \mid x, y_{\le t})$ **不再是 "verdict 信念"**,而是 "在见过 student 的前 t 个 token 后,模型相信会出现这一整段 ref 文本的对数似然"。ref 是 answer-dependent(它本身就是另一条解答),pure value 解释**直接打破** —— 这正是 §0.3 论的事。
+
+**(B) Prefix-order invariance**。Bayes 翻转
+
+$$
+\pi_\theta(y_t \mid x, m, y_{<t}) = \pi_\theta(y_t \mid x, y_{<t}) \cdot \frac{p(m \mid x, y_{\le t})}{p(m \mid x, y_{<t})}
+$$
+
+要求 $\pi_\theta$ 隐式定义的 joint 对 $m$ 和 $y_<$ 的**出现顺序无关**。Left-to-right transformer + 位置编码让 `[x, m, y<]` 和 `[x, y<, m]` 严格不是同一个输入,所以这条**严格不成立**,只是经验近似。
+- $m$ 是 **短 fixed string**(marker)时,position offset 是常数,近似良好。
+- $m = \text{ref}$(上百 token 的另一段 answer)时,offset 大、内容长,近似很弱 —— 这是 ref mode 下 ΔW 会有 "风格漂移噪声" 的根本来源。
+
+结论:§2 的"ΔW = verdict 信念边际贡献"这条 clean 解释**只对 marker mode 严格**,对 ref mode 是 degrade 的近似。这恰好支撑 §0 的三条 motivation。
+
 ---
 
 ## 3. 与 VC-OPSD / OPD-Bayes 的关系
@@ -113,6 +133,36 @@ $$
 | 算力开销 | +1× teacher forward | 0 额外开销 |
 
 观察:**marker SDPO 是 VC-OPSD 单边化后并入 vanilla SDPO loss pipeline 的最小改动版本**。它的优势是工程成本接近 0(只改 conditioning,loss 完全复用),劣势是丢失了 contrastive 的对称性,可能受 marker 本身的 prior bias 影响。两条路径互补,不冲突。
+
+### 3.1 vs Zhao et al. 2026 (OPSD paper, arXiv:2601.18734)
+
+发现一篇直接同名的工作:**Self-Distilled Reasoner: On-Policy Self-Distillation for Large Language Models** (Zhao, Xie, Liu, Huang, Pang, Chen, Grover; UCLA + HKU + Meta; 2026年3月)。论文的 OPSD 框架与本 codebase 基本是同一回事:
+
+| 维度 | Zhao et al. 2026 OPSD | 本 codebase |
+| --- | --- | --- |
+| 同一 LLM 当 teacher/student | ✅ | ✅ |
+| Teacher 看到 y\*(GT 解答)作为 privileged info | ✅ | ✅ (`ref` mode) |
+| Student 只看 problem | ✅ | ✅ |
+| 在 student rollout 上算 per-token divergence | ✅ | ✅ |
+| 梯度只回流 student logits | ✅ | ✅ |
+| Full-vocab JSD/KL + 逐 token clipping | ✅ (Eq. 6-7, "Per-Token Pointwise Divergence Clipping") | ✅ (`full_logit + is_clip=2`) |
+| Sampled-token PG fallback $A_n = \log p_T - \log p_s$ | ✅ (Eq. 9) | ✅ (ΔW token-PG 分支) |
+| Teacher prompt 把 ref 放 user turn,要求"先理解再 rewrite" | ✅ (Figure 2) | ✅ (`"Correct solution: " + ref + prompt`) |
+
+**结论:本 codebase 的 `ref` mode 实质上是 OPSD paper 的实现。**
+
+论文**未覆盖**(本工作的增量)的部分:
+
+1. **`marker` mode(answer-independent 自验证标记)** — 论文必须有 y\* 才能 condition teacher,我们的 marker 模式**完全不用 GT**,只靠 fixed verdict string,把 ΔW 的 "verdict 信念边际贡献"解释推到最纯粹。这是论文框架直接缺失的一种 conditioning。
+2. **ΔW = c_t − c_{t-1} 的 Bayes 解释** — 论文把 OPSD 当 distillation 训练目标讲,**没有**把 per-token divergence 拆解成 "marker 信念的边际贡献" 这种 retrospective credit 视角。本文 §2 是新框架。
+3. **ΔH overconfidence damping** — 论文不涉及。
+4. **VC-OPSD sign-flip / verdict contrastive** — 论文不涉及(见 [`reward_bayes_distillation_v2.md`](reward_bayes_distillation_v2.md))。
+5. **gt_marker(assistant-turn 前置 GT)** — 论文精神上覆盖(都把 GT 喂给 teacher),但 prompt 位置不同(论文 user turn,我们 assistant turn 前缀)。这是工程层面变体,理论 novelty 弱,留作可选 ablation。
+
+实操意义:
+- **`ref` baseline 必须保留** — 这是 Zhao et al. 同等方法的基准,任何 claim 都要先回到这上面 anchor。
+- **`marker` / `marker_damp` / `refmarker` 三个变体都是论文未覆盖的方向**,sweep 数据出来可以直接 vs OPSD 作论文级 baseline 比较。
+- Research note 与论文的 framing 切口不同:论文从 "rationalization 角度" 讲(给 teacher 看 GT 是为了让它理解后 rewrite),本文从 "Bayes verdict-belief 角度" 讲(condition 是为了让 ΔW 折叠成 c_t − c_{t-1})。互补,不冲突。
 
 ---
 

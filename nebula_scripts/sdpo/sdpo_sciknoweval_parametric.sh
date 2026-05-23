@@ -47,8 +47,9 @@ if [ "${LOSS_METHOD}" = "opd_bayes" ]; then
 fi
 
 # Self-verified marker SDPO
-TEACHER_CONTEXT_MODE="${TEACHER_CONTEXT_MODE:-ref}"               # ref / marker / ref_and_marker
+TEACHER_CONTEXT_MODE="${TEACHER_CONTEXT_MODE:-ref}"               # ref / marker / ref_and_marker / gt_marker
 SELF_VERIFIED_MARKER="${SELF_VERIFIED_MARKER:-This answer is verified correct.}"
+GT_MARKER_TEMPLATE="${GT_MARKER_TEMPLATE:-This answer is verified correct, correct answer is {ground_truth}.}"
 OVERCONFIDENCE_DAMPING="${OVERCONFIDENCE_DAMPING:-0.0}"           # 0.0 disables; sensible 0.5~2.0
 # Marker modes require full-logit (for ΔH if damped; for clean signal anyway)
 if [ "${TEACHER_CONTEXT_MODE}" != "ref" ]; then
@@ -105,6 +106,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.self_distillation.kl_direction=${KL_DIRECTION} \
     actor_rollout_ref.actor.self_distillation.teacher_context_mode=${TEACHER_CONTEXT_MODE} \
     actor_rollout_ref.actor.self_distillation.self_verified_marker="${SELF_VERIFIED_MARKER}" \
+    actor_rollout_ref.actor.self_distillation.gt_marker_template="${GT_MARKER_TEMPLATE}" \
     actor_rollout_ref.actor.self_distillation.overconfidence_damping=${OVERCONFIDENCE_DAMPING} \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.rollout.n=${ROLLOUT_N} \
