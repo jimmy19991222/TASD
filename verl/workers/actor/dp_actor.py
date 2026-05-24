@@ -719,6 +719,13 @@ class DataParallelPPOActor(BasePPOActor):
             and self_distillation_cfg is not None
             and self_distillation_cfg.get("loss_method", "sdpo") in ("vc_opsd_sign", "opd_bayes", "vec")
         )
+        cdm_loss_active = (
+            self_distillation_enabled
+            and self_distillation_cfg is not None
+            and self_distillation_cfg.get("loss_method", "sdpo") == "cdm"
+        )
+        # Both families need the second (negative) teacher forward.
+        dual_teacher_active = verdict_loss_active or cdm_loss_active
         if teacher_forward_required:
             self_distillation_required_keys = {
                 "teacher_input_ids",
@@ -726,13 +733,15 @@ class DataParallelPPOActor(BasePPOActor):
                 "teacher_position_ids",
                 "self_distillation_mask",
             }
-            if verdict_loss_active:
+            if dual_teacher_active:
                 self_distillation_required_keys |= {
                     "teacher_input_ids_neg",
                     "teacher_attention_mask_neg",
                     "teacher_position_ids_neg",
-                    "verdict_R",
                 }
+            if verdict_loss_active:
+                # Verdict family also needs the sequence-level R label.
+                self_distillation_required_keys |= {"verdict_R"}
             assert self_distillation_required_keys.issubset(set(data.batch.keys())), f"Missing required keys: {self_distillation_required_keys - set(data.batch.keys())}"
 
         select_keys = [
@@ -912,7 +921,7 @@ class DataParallelPPOActor(BasePPOActor):
                         teacher_all_logps_neg = None
                         teacher_topk_logps_neg = None
                         verdict_R = None
-                        if verdict_loss_active:
+                        if dual_teacher_active:
                             teacher_inputs_neg = {
                                 "responses": model_inputs["responses"],
                                 "input_ids": model_inputs["teacher_input_ids_neg"],
@@ -932,7 +941,8 @@ class DataParallelPPOActor(BasePPOActor):
                             teacher_log_prob_neg = teacher_outputs_neg["log_probs"]
                             teacher_all_logps_neg = teacher_outputs_neg.get("all_logps") if return_all_logps else None
                             teacher_topk_logps_neg = teacher_outputs_neg.get("topk_logps") if distill_topk else None
-                            verdict_R = model_inputs["verdict_R"]
+                            if verdict_loss_active:
+                                verdict_R = model_inputs["verdict_R"]
 
                     if self_distillation_enabled:
                         pg_loss, pg_metrics = compute_self_distillation_loss(
@@ -948,9 +958,9 @@ class DataParallelPPOActor(BasePPOActor):
                             self_distillation_mask=self_distillation_mask,
                             loss_agg_mode=loss_agg_mode,
                             rollout_is_weights=rollout_is_weights,
-                            teacher_log_probs_neg=teacher_log_prob_neg if verdict_loss_active else None,
-                            teacher_all_log_probs_neg=teacher_all_logps_neg if verdict_loss_active else None,
-                            teacher_topk_log_probs_neg=teacher_topk_logps_neg if verdict_loss_active else None,
+                            teacher_log_probs_neg=teacher_log_prob_neg if dual_teacher_active else None,
+                            teacher_all_log_probs_neg=teacher_all_logps_neg if dual_teacher_active else None,
+                            teacher_topk_log_probs_neg=teacher_topk_logps_neg if dual_teacher_active else None,
                             verdict_R=verdict_R if verdict_loss_active else None,
                         )
 

@@ -1657,26 +1657,36 @@ def _compute_verdict_distillation_loss(
         loss_mask = loss_mask.to(student_log_probs.dtype)
 
     loss_method = self_distillation_config.loss_method
-    if teacher_log_probs_neg is None or verdict_R is None:
+    if teacher_log_probs_neg is None:
         raise ValueError(
-            f"loss_method={loss_method} requires teacher_log_probs_neg and verdict_R."
+            f"loss_method={loss_method} requires teacher_log_probs_neg (dual-teacher pipeline)."
+        )
+    if loss_method != "cdm" and verdict_R is None:
+        raise ValueError(
+            f"loss_method={loss_method} requires verdict_R (R-composed branch)."
         )
 
-    # Resolve prior
+    # Resolve prior (CDM does not consume the prior, but keep diagnostic for consistency)
     prior_mode = getattr(self_distillation_config, "verdict_prior_mode", "uniform")
     if prior_mode == "uniform":
         log_prior = 0.0
     elif prior_mode == "logit":
         log_prior = float(getattr(self_distillation_config, "verdict_prior_logit", 0.0))
     elif prior_mode == "empirical":
-        p_R = verdict_R.float().mean().clamp(min=1e-3, max=1.0 - 1e-3)
-        log_prior = float(torch.log(p_R / (1.0 - p_R)).item())
+        if verdict_R is None:
+            log_prior = 0.0
+        else:
+            p_R = verdict_R.float().mean().clamp(min=1e-3, max=1.0 - 1e-3)
+            log_prior = float(torch.log(p_R / (1.0 - p_R)).item())
     else:
         raise ValueError(f"unknown verdict_prior_mode={prior_mode}")
     metrics["self_distillation/verdict_log_prior"] = float(log_prior)
 
-    verdict_R = verdict_R.to(student_log_probs.dtype).view(-1, 1)  # (B, 1)
-    sgn_R = (2.0 * verdict_R - 1.0)  # (B, 1)
+    if verdict_R is not None:
+        verdict_R = verdict_R.to(student_log_probs.dtype).view(-1, 1)  # (B, 1)
+        sgn_R = (2.0 * verdict_R - 1.0)  # (B, 1)
+    else:
+        sgn_R = None
 
     if loss_method == "vc_opsd_sign":
         delta = (teacher_log_probs - teacher_log_probs_neg).detach()
@@ -1769,6 +1779,50 @@ def _compute_verdict_distillation_loss(
             denom = m.sum().clamp(min=1.0)
             metrics["self_distillation/opd_log_p_R_obs_mean"] = float(((log_p_R_obs.exp().mean(-1) * m).sum() / denom).item())
             metrics["self_distillation/opd_kl_mean"] = float(((per_token_loss * m).sum() / denom).item())
+
+    elif loss_method == "cdm":
+        # Counterfactual Discriminative Markers:
+        #   ΔW^discr_t(v) = log p_T(v | x, m^{+gt}) - log p_T(v | x, m^{-gt})
+        # The student minimises  E_{v~π_θ}[ -ΔW^discr_t(v) ] per token, which equals
+        # the reverse-KL gradient direction with the (positive-marker / negative-marker)
+        # log-Bayes-factor playing the role of negative reward.
+        # No verdict_R is consumed — the contrast is between two teacher contexts,
+        # both of which carry the GT reference (so GT-copy shortcut cancels).
+        if not self_distillation_config.full_logit_distillation:
+            raise ValueError("cdm requires self_distillation.full_logit_distillation=True")
+        use_topk = self_distillation_config.distillation_topk is not None
+        if use_topk:
+            if (
+                student_topk_log_probs is None
+                or teacher_topk_log_probs is None
+                or teacher_topk_log_probs_neg is None
+            ):
+                raise ValueError("cdm topk path requires student/teacher topk_log_probs (pos & neg).")
+            student_full = student_topk_log_probs
+            teacher_pos = teacher_topk_log_probs
+            teacher_neg = teacher_topk_log_probs_neg
+        else:
+            if (
+                student_all_log_probs is None
+                or teacher_all_log_probs is None
+                or teacher_all_log_probs_neg is None
+            ):
+                raise ValueError("cdm full-vocab path requires student/teacher all_log_probs (pos & neg).")
+            student_full = student_all_log_probs
+            teacher_pos = teacher_all_log_probs
+            teacher_neg = teacher_all_log_probs_neg
+
+        # Bayes factor evidence at the vocab level
+        log_lr = (teacher_pos - teacher_neg).detach()  # (B, T, V_or_K)
+        # Student expectation of the negative log-ratio (reverse-KL direction)
+        per_token_loss = -(student_full.exp() * log_lr).sum(-1)  # (B, T)
+
+        with torch.no_grad():
+            m = loss_mask
+            denom = m.sum().clamp(min=1.0)
+            metrics["self_distillation/cdm_log_lr_abs_mean"] = float(((log_lr.abs().mean(-1) * m).sum() / denom).item())
+            metrics["self_distillation/cdm_log_lr_signed_mean"] = float(((log_lr.mean(-1) * m).sum() / denom).item())
+            metrics["self_distillation/cdm_loss_per_token_mean"] = float(((per_token_loss * m).sum() / denom).item())
     else:
         raise ValueError(f"unknown loss_method={loss_method}")
 
@@ -1804,7 +1858,12 @@ def _compute_verdict_distillation_loss(
         metrics["self_distillation/calibration_loss"] = float(cal.item())
         loss = loss + cal_weight * cal
 
-    metrics["self_distillation/loss_method_id"] = {"vc_opsd_sign": 1, "vec": 2, "opd_bayes": 3}[loss_method]
+    metrics["self_distillation/loss_method_id"] = {
+        "vc_opsd_sign": 1,
+        "vec": 2,
+        "opd_bayes": 3,
+        "cdm": 4,
+    }[loss_method]
     return loss, metrics
 
 

@@ -144,12 +144,26 @@ class SelfDistillationConfig(BaseConfig):
     #                      {ground_truth} from the dataset's reward_model.ground_truth field.
     #                      Variable-length per sample; left-padded to batch max in the marker
     #                      block. Falls back to `self_verified_marker` when GT is missing.
+    #   "cdm"            : Counterfactual Discriminative Markers (see research §3.7).
+    #                      Per sample builds TWO assistant-turn markers from
+    #                      cdm_positive_template / cdm_negative_template (both substituting
+    #                      {ground_truth}). Drives a dual teacher forward; the loss is the
+    #                      log-ratio of the two teacher distributions detached × student
+    #                      expectation. Requires loss_method="cdm" and full_logit_distillation.
     teacher_context_mode: str = "ref"
     # Marker prepended to the assistant turn for "marker" and "ref_and_marker" modes.
     self_verified_marker: str = "This answer is verified correct."
     # Template for "gt_marker" mode. {ground_truth} is substituted per sample.
     gt_marker_template: str = (
         "This answer is verified correct, correct answer is {ground_truth}."
+    )
+    # Templates for "cdm" mode. Both substitute {ground_truth}; both are prepended on the
+    # assistant turn (parallel to gt_marker), differing only in the verdict adjective.
+    cdm_positive_template: str = (
+        "This answer is verified correct, reference answer is {ground_truth}."
+    )
+    cdm_negative_template: str = (
+        "This answer is verified incorrect, reference answer is {ground_truth}."
     )
     # ΔH overconfidence damping: w_t = exp(-max(0, H_s - H_T) / overconfidence_damping)
     # Down-weights tokens where the marker collapses teacher entropy below student entropy
@@ -177,7 +191,7 @@ class SelfDistillationConfig(BaseConfig):
         if self.is_clip is not None and self.is_clip <= 0:
             raise ValueError(f"self_distillation.is_clip must be positive, got {self.is_clip}")
 
-        valid_loss_methods = {"sdpo", "vc_opsd_sign", "opd_bayes", "vec"}
+        valid_loss_methods = {"sdpo", "vc_opsd_sign", "opd_bayes", "vec", "cdm"}
         if self.loss_method not in valid_loss_methods:
             raise ValueError(
                 f"self_distillation.loss_method must be one of {sorted(valid_loss_methods)}, got {self.loss_method}"
@@ -201,12 +215,28 @@ class SelfDistillationConfig(BaseConfig):
                 "self_distillation.loss_method='opd_bayes' requires full_logit_distillation=True "
                 "(provide either full vocab or distillation_topk)."
             )
+        if self.loss_method == "cdm" and not self.full_logit_distillation:
+            raise ValueError(
+                "self_distillation.loss_method='cdm' requires full_logit_distillation=True "
+                "(needs vocab-level log-ratio between the two counterfactual teachers)."
+            )
 
-        valid_teacher_ctx_modes = {"ref", "marker", "ref_and_marker", "gt_marker"}
+        valid_teacher_ctx_modes = {"ref", "marker", "ref_and_marker", "gt_marker", "cdm"}
         if self.teacher_context_mode not in valid_teacher_ctx_modes:
             raise ValueError(
                 f"self_distillation.teacher_context_mode must be one of "
                 f"{sorted(valid_teacher_ctx_modes)}, got {self.teacher_context_mode}"
+            )
+        # cdm context mode pairs with cdm loss method; warn if mismatched
+        if self.teacher_context_mode == "cdm" and self.loss_method != "cdm":
+            raise ValueError(
+                "self_distillation.teacher_context_mode='cdm' requires loss_method='cdm' "
+                "(the dual-teacher batch is only consumed by the cdm loss branch)."
+            )
+        if self.loss_method == "cdm" and self.teacher_context_mode != "cdm":
+            raise ValueError(
+                "self_distillation.loss_method='cdm' requires teacher_context_mode='cdm' "
+                "(the loss reads dual teacher_input_ids_pos/neg produced by the cdm builder)."
             )
         if self.overconfidence_damping < 0:
             raise ValueError(

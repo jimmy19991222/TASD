@@ -47,12 +47,27 @@ if [ "${LOSS_METHOD}" = "opd_bayes" ]; then
 fi
 
 # Self-verified marker SDPO
-TEACHER_CONTEXT_MODE="${TEACHER_CONTEXT_MODE:-ref}"               # ref / marker / ref_and_marker / gt_marker
+TEACHER_CONTEXT_MODE="${TEACHER_CONTEXT_MODE:-ref}"               # ref / marker / ref_and_marker / gt_marker / cdm
 SELF_VERIFIED_MARKER="${SELF_VERIFIED_MARKER:-This answer is verified correct.}"
-GT_MARKER_TEMPLATE="${GT_MARKER_TEMPLATE:-This answer is verified correct, correct answer is {ground_truth}.}"
+# NOTE: 不能直接把 `{ground_truth}` 写进 ${VAR:-...} 默认值,bash 会把第一个 `}`
+# 当作参数展开的结束符,模板被吞成 `{ground_truth.}` —— Python .format() 看到
+# `{name.}` 会抛 "Empty attribute in format string"。改用中间变量绕开。
+_DEFAULT_GT_MARKER_TEMPLATE='This answer is verified correct, correct answer is {ground_truth}.'
+GT_MARKER_TEMPLATE="${GT_MARKER_TEMPLATE:-$_DEFAULT_GT_MARKER_TEMPLATE}"
+# CDM dual-GT markers (see §3.7 in research/self_verified_marker_sdpo.md)
+_DEFAULT_CDM_POS_TEMPLATE='This answer is verified correct, reference answer is {ground_truth}.'
+_DEFAULT_CDM_NEG_TEMPLATE='This answer is verified incorrect, reference answer is {ground_truth}.'
+CDM_POSITIVE_TEMPLATE="${CDM_POSITIVE_TEMPLATE:-$_DEFAULT_CDM_POS_TEMPLATE}"
+CDM_NEGATIVE_TEMPLATE="${CDM_NEGATIVE_TEMPLATE:-$_DEFAULT_CDM_NEG_TEMPLATE}"
 OVERCONFIDENCE_DAMPING="${OVERCONFIDENCE_DAMPING:-0.0}"           # 0.0 disables; sensible 0.5~2.0
-# Marker modes require full-logit (for ΔH if damped; for clean signal anyway)
+# Marker / CDM modes require full-logit (for ΔH if damped; for clean signal anyway)
 if [ "${TEACHER_CONTEXT_MODE}" != "ref" ]; then
+    FULL_LOGIT_DISTILLATION="True"
+    DISTILLATION_TOPK="${DISTILLATION_TOPK:-100}"
+fi
+# CDM loss requires teacher_context_mode=cdm and vice-versa
+if [ "${LOSS_METHOD}" = "cdm" ]; then
+    TEACHER_CONTEXT_MODE="cdm"
     FULL_LOGIT_DISTILLATION="True"
     DISTILLATION_TOPK="${DISTILLATION_TOPK:-100}"
 fi
@@ -107,6 +122,8 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.self_distillation.teacher_context_mode=${TEACHER_CONTEXT_MODE} \
     actor_rollout_ref.actor.self_distillation.self_verified_marker="'${SELF_VERIFIED_MARKER}'" \
     actor_rollout_ref.actor.self_distillation.gt_marker_template="'${GT_MARKER_TEMPLATE}'" \
+    actor_rollout_ref.actor.self_distillation.cdm_positive_template="'${CDM_POSITIVE_TEMPLATE}'" \
+    actor_rollout_ref.actor.self_distillation.cdm_negative_template="'${CDM_NEGATIVE_TEMPLATE}'" \
     actor_rollout_ref.actor.self_distillation.overconfidence_damping=${OVERCONFIDENCE_DAMPING} \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.rollout.n=${ROLLOUT_N} \

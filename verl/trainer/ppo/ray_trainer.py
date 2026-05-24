@@ -690,6 +690,14 @@ class RayPPOTrainer:
                 reward_tensor=reward_tensor,
                 self_distillation_cfg=self_distillation_cfg,
             )
+        # CDM (§3.7 self_verified_marker_sdpo): per-sample dual assistant-turn
+        # markers (correct/incorrect, both with GT) drive a two-teacher forward;
+        # log-ratio is the token credit. See research/self_verified_marker_sdpo.md.
+        if loss_method == "cdm":
+            return self._build_cdm_self_distillation_batch(
+                batch=batch,
+                self_distillation_cfg=self_distillation_cfg,
+            )
 
         device = batch.batch["input_ids"].device
         response_mask = batch.batch["response_mask"]
@@ -996,6 +1004,150 @@ class RayPPOTrainer:
         metrics = {
             "self_distillation/verdict_R_mean": float(verdict_R.mean().item()),
             "self_distillation/reprompt_sample_fraction": 1.0,
+        }
+        return DataProto.from_dict(tensors=tensors), metrics
+
+    def _build_cdm_self_distillation_batch(
+        self,
+        batch: DataProto,
+        self_distillation_cfg: Any,
+    ) -> tuple[DataProto, dict[str, float]]:
+        """Build counterfactual discriminative-marker dual teacher prompts.
+
+        Per-sample marker (with {ground_truth} substitution) is prepended on the
+        assistant turn — same injection point as `gt_marker` — but for BOTH a
+        positive-verdict marker (`cdm_positive_template`) and a negative-verdict
+        marker (`cdm_negative_template`). The loss branch (`loss_method='cdm'`)
+        then takes log p_T^+ - log p_T^- on student-aligned topk indices.
+
+        See research/self_verified_marker_sdpo.md §3.7.
+        """
+        device = batch.batch["input_ids"].device
+        response_mask = batch.batch["response_mask"]
+        responses = batch.batch["responses"]
+        prompt_texts = [msgs[-1]["content"] for msgs in batch.non_tensor_batch["raw_prompt"]]
+        batch_size = batch.batch.batch_size[0]
+
+        pos_template = self_distillation_cfg.cdm_positive_template
+        neg_template = self_distillation_cfg.cdm_negative_template
+        fallback_text = self_distillation_cfg.self_verified_marker
+
+        # Build the teacher prompt once (no marker, no ref) — same prompt for
+        # both pos/neg teacher forwards; only the assistant-turn marker differs.
+        messages = []
+        for i in range(batch_size):
+            system_messages = batch.non_tensor_batch["raw_prompt"][i][:-1]
+            messages.append(system_messages + [{"role": "user", "content": prompt_texts[i]}])
+
+        enable_thinking = (
+            self.config.data.apply_chat_template_kwargs.get("enable_thinking", True)
+            if self.config.data.apply_chat_template_kwargs
+            else True
+        )
+        teacher_prompt = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            return_tensors="pt",
+            return_dict=True,
+            continue_final_message=False,
+            add_generation_prompt=True,
+            enable_thinking=enable_thinking,
+            max_length=self_distillation_cfg.max_reprompt_len,
+            padding=True,
+            truncation=True,
+        )
+        teacher_prompt_ids = teacher_prompt["input_ids"].to(device)
+        teacher_prompt_mask = teacher_prompt["attention_mask"].to(device)
+
+        reward_models = batch.non_tensor_batch.get("reward_model", None)
+
+        def _format_per_sample(template: str) -> list[str]:
+            texts: list[str] = []
+            for i in range(batch_size):
+                gt = None
+                if reward_models is not None:
+                    rm = reward_models[i]
+                    if isinstance(rm, dict):
+                        gt = rm.get("ground_truth", None)
+                if gt is None or (isinstance(gt, str) and len(gt) == 0):
+                    text = fallback_text
+                else:
+                    text = template.format(ground_truth=str(gt))
+                if not text.endswith("\n\n"):
+                    text = text + "\n\n"
+                texts.append(text)
+            return texts
+
+        pos_texts = _format_per_sample(pos_template)
+        neg_texts = _format_per_sample(neg_template)
+
+        gt_found = 0
+        for i in range(batch_size):
+            gt = None
+            if reward_models is not None:
+                rm = reward_models[i]
+                if isinstance(rm, dict):
+                    gt = rm.get("ground_truth", None)
+            if gt is not None and not (isinstance(gt, str) and len(gt) == 0):
+                gt_found += 1
+        gt_available_fraction = gt_found / max(batch_size, 1)
+
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = self.tokenizer.eos_token_id or 0
+
+        def _left_pad_marker_block(texts: list[str]) -> tuple[torch.Tensor, torch.Tensor, int]:
+            token_lists = [self.tokenizer.encode(t, add_special_tokens=False) for t in texts]
+            max_len = max((len(t) for t in token_lists), default=0)
+            ids = torch.full(
+                (batch_size, max_len), pad_id,
+                dtype=teacher_prompt_ids.dtype, device=device,
+            )
+            mask = torch.zeros(
+                batch_size, max_len,
+                dtype=teacher_prompt_mask.dtype, device=device,
+            )
+            for i, t in enumerate(token_lists):
+                L = len(t)
+                if L > 0:
+                    ids[i, -L:] = torch.tensor(t, dtype=teacher_prompt_ids.dtype, device=device)
+                    mask[i, -L:] = 1
+            return ids, mask, max_len
+
+        pos_marker_ids, pos_marker_mask, pos_marker_len = _left_pad_marker_block(pos_texts)
+        neg_marker_ids, neg_marker_mask, neg_marker_len = _left_pad_marker_block(neg_texts)
+
+        pos_ids = torch.cat([teacher_prompt_ids, pos_marker_ids, responses], dim=1)
+        pos_mask = torch.cat([teacher_prompt_mask, pos_marker_mask, response_mask], dim=1)
+        pos_pos = compute_position_id_with_mask(pos_mask)
+
+        neg_ids = torch.cat([teacher_prompt_ids, neg_marker_ids, responses], dim=1)
+        neg_mask = torch.cat([teacher_prompt_mask, neg_marker_mask, response_mask], dim=1)
+        neg_pos = compute_position_id_with_mask(neg_mask)
+
+        self_distillation_mask = torch.ones(batch_size, dtype=torch.float32, device=device)
+
+        # Alias pos under the legacy `teacher_input_ids` so the existing
+        # "teacher_forward_required" gate stays true and the actor finds the
+        # _neg tensors and dispatches the cdm verdict-style dual forward.
+        tensors = {
+            "teacher_input_ids": pos_ids,
+            "teacher_attention_mask": pos_mask,
+            "teacher_position_ids": pos_pos,
+            "teacher_input_ids_pos": pos_ids,
+            "teacher_attention_mask_pos": pos_mask,
+            "teacher_position_ids_pos": pos_pos,
+            "teacher_input_ids_neg": neg_ids,
+            "teacher_attention_mask_neg": neg_mask,
+            "teacher_position_ids_neg": neg_pos,
+            "self_distillation_mask": self_distillation_mask,
+        }
+        metrics = {
+            "self_distillation/cdm_gt_available_fraction": gt_available_fraction,
+            "self_distillation/cdm_pos_marker_len_max": float(pos_marker_len),
+            "self_distillation/cdm_neg_marker_len_max": float(neg_marker_len),
+            "self_distillation/reprompt_sample_fraction": 1.0,
+            "self_distillation/marker_active_fraction": 1.0,
         }
         return DataProto.from_dict(tensors=tensors), metrics
 
