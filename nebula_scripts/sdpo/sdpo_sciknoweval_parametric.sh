@@ -60,6 +60,40 @@ _DEFAULT_CDM_NEG_TEMPLATE='This answer is verified incorrect, reference answer i
 CDM_POSITIVE_TEMPLATE="${CDM_POSITIVE_TEMPLATE:-$_DEFAULT_CDM_POS_TEMPLATE}"
 CDM_NEGATIVE_TEMPLATE="${CDM_NEGATIVE_TEMPLATE:-$_DEFAULT_CDM_NEG_TEMPLATE}"
 CDM_NEG_WEIGHT="${CDM_NEG_WEIGHT:-1.0}"
+# CDM template variants — preset asymmetry shapes mimicking SDPO teacher_context_mode.
+# Done via a single no-whitespace flag because nebula --user_params splits on
+# whitespace and template strings contain spaces.
+#   default : keep CDM_POSITIVE_TEMPLATE / CDM_NEGATIVE_TEMPLATE as set above
+#             (full "verified <verdict>, reference answer is <gt>" pair — Δ_copy cancels)
+#   null    : identical templates both sides (math sanity, JSD_diff ≈ noise floor)
+#   mkonly  : verdict-only, no GT — mimics SDPO `marker` mode, tests deployability
+#             without GT leakage; Δ_copy cancellation is moot (no GT to copy)
+#   bare    : strip "verified" lexical anchor — mimics SDPO `ref_and_marker` minimal
+#             form, tests whether the verdict signal needs the explicit "verified" cue
+case "${CDM_TEMPLATE_VARIANT:-default}" in
+    null)
+        _CDM_NULL_TEMPLATE='Reference answer is {ground_truth}.'
+        CDM_POSITIVE_TEMPLATE="$_CDM_NULL_TEMPLATE"
+        CDM_NEGATIVE_TEMPLATE="$_CDM_NULL_TEMPLATE"
+        ;;
+    mkonly)
+        CDM_POSITIVE_TEMPLATE='This answer is verified correct.'
+        CDM_NEGATIVE_TEMPLATE='This answer is verified incorrect.'
+        ;;
+    bare)
+        CDM_POSITIVE_TEMPLATE='This answer is correct.'
+        CDM_NEGATIVE_TEMPLATE='This answer is incorrect.'
+        ;;
+    default) : ;;
+    *) echo "WARNING: unknown CDM_TEMPLATE_VARIANT=${CDM_TEMPLATE_VARIANT}, falling back to default" ;;
+esac
+
+# Backward-compat shim: CDM_NULL_MODE=True overrides templates regardless of variant.
+if [ "${CDM_NULL_MODE:-False}" = "True" ]; then
+    _CDM_NULL_TEMPLATE='Reference answer is {ground_truth}.'
+    CDM_POSITIVE_TEMPLATE="$_CDM_NULL_TEMPLATE"
+    CDM_NEGATIVE_TEMPLATE="$_CDM_NULL_TEMPLATE"
+fi
 OVERCONFIDENCE_DAMPING="${OVERCONFIDENCE_DAMPING:-0.0}"           # 0.0 disables; sensible 0.5~2.0
 # Marker / CDM modes require full-logit (for ΔH if damped; for clean signal anyway)
 if [ "${TEACHER_CONTEXT_MODE}" != "ref" ]; then

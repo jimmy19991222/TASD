@@ -3,7 +3,65 @@
 **日期**：2026-05-24
 **关联代码**：[verl/trainer/ppo/core_algos.py](../verl/trainer/ppo/core_algos.py) `_compute_verdict_distillation_loss` 中的 `loss_method == "cdm"` 分支
 **关联实验**：`awesome_jimmy/SDPO_CDM`（runs `cdm`、`cdm_topk_off`，均为 Qwen3-8B + sciknoweval/biology）
-**关联记忆**：[[feedback-reverse-kl-entropy-term]]、[[research-verdict-credit-assignment]]、[[project-opsd-shared-params]]
+**关联记忆**：[[feedback-reverse-kl-entropy-term]]、[[research-verdict-credit-assignment]]、[[project-opsd-shared-params]]、[[feedback-contrastive-push-fluency-risk]]
+
+## 0. 直觉先行:作弊玩家、教练与火星文
+
+数学推导在 §1–§5。先用「师生」比喻把整件事的物理图像理一遍 —— 信息论(JSD/MI)、RL 工程坑(reward hacking / 模式坍缩)、LLM 语言流形(fluency)三层逻辑交叠在一起,直觉容易打结,所以读完 §0 再回头看 §1 起的公式,会发现公式里每一项都在比喻里有对应物。
+
+把 student 想成一个**想拿高分的作弊玩家**,两个教师是**带着标准答案打分的教练**。
+
+### 0.1 V1 为什么塌:卡 Bug 而不是答题
+
+V1 的规则:「对每个 token,看好教练打分 `log p_T^+` 和坏教练打分 `log p_T^-`,差值 `log_lr` 越大就越说那个词」(`per_token_loss = −Σ p_s · log_lr`)。
+
+Student 不去学推理,**它去暴力搜词表找 Bug**:某个生僻 token 上,好教练给 0.1 分(怪但勉强),坏教练给 1e-4 分(根本不会说),`log_lr` 直接顶到 +7。Student 把所有概率倾倒到这个 token,**loss 一阶刷掉,熵清零**。这是 §1.2 表里 step 13–17 熵从 0.30 → 0.01、`log_lr_abs_mean` 0.4 → 1.5 的物理原因。
+
+数学根因(§1.3):V1 缺了反向 KL 的 `-H(p_s)` 项 —— 那一项相当于「不许只押一个 token」的硬约束,被偷工减料省掉了,所以 student 可以塌成 delta。
+
+### 0.2 JSD 是怎么补救的:换成一根橡皮筋
+
+V2 把规则换成「**整个分布**要贴近好教练、远离坏教练」 —— $L = \mathrm{JSD}_\alpha(\pi_T^+,\pi_s) - \lambda\,\mathrm{JSD}_\alpha(\pi_T^-,\pi_s)$。
+
+JSD 是分布间的距离 ∈ [0, ln 2],它像一根**橡皮筋**:student 想再去钻 V1 那个 Bug —— 把 99% 概率堆一个乱码词 —— 它跟好教练的 JSD 立刻顶到 ln 2 上限,**第一项 `JSD_pos` 直接吃满**,损失反而变大。橡皮筋强迫 student 保持分布的形状(=语言多样性 + 合理的 token 覆盖)。
+
+数学上对应的就是 JSD 展开里**自带的 `H(p_s)` / `H(m_α)` 项**(§1.3 V1 缺的那一半,§3.2 用 MI 重写为 $I_\alpha(V;C)$),不需要额外加熵正则。
+
+### 0.3 为什么要用两个教练相减:堵抄 GT 的捷径
+
+只用好教练有个致命问题:好教练手里有 GT,它指导时不可避免**「念答案」**(把 GT 字符串本身的 token 打高分)。Student 学到的最优捷径不是推理,**是直接抄 GT**。
+
+CDM 的精妙在于坏教练**也拿着同一份 GT**(只是 verdict 反过来)—— 它念答案的程度跟好教练一模一样。
+
+| Student 行为 | 靠近 +gt 教练 | 靠近 −gt 教练 |
+|---|---|---|
+| 抄 GT | ✅ 得分 | ✅ 也得分 → 被 −λ 抵消 |
+| 真推理 | ✅ 得分 | ❌ −gt 推理是错的,不靠近 |
+
+差分把抄 GT 这块 marker-confound 项 $\Delta_\text{copy}$ 干掉了(§3.4 给出严谨证明:λ=1 时第二项归零),**只剩「正确性」这条 student 能学的轴**。
+
+### 0.4 λ 为什么不能太大:咆哮过度逼出火星文
+
+把 λ 设成 2.0 等于对 student 喊:「**无论如何不要像坏教练那样说话!**」
+
+Student 听了一下:坏教练虽然推理错,但说的是**人话**(语法、词序都正常)。最快的「不像坏教练」方案是 —— **改说火星文**。乱码 token 在 $\pi_T^-$ 上几乎为零,student 把质量挪过去,$\mathrm{JSD}(\pi_T^-,\pi_s)$ 直接到 ln 2,推力项被刷满。
+
+代价是 $\pi_T^+$ 也在人话流形上,所以 student 跟好教练的 JSD **同时**爆掉。但 λ 大、推力主导,净 loss 还在降 —— 这就是 §4.1 的 fluency destruction:loss 数值在跌,行为在崩。
+
+§4.3 雷达表的「**两个 JSD 同时↗ + 熵反弹**」就是抓这个走火入魔。λ=0.5 的工程理由:让拉力比推力强 2:1,student 不敢在「让两个 JSD 同时变大」的方向上下注 —— 牺牲掉一点 λ=1 的理论 GT-copy 完美抵消,换取「先说人话、再在人话流形里找正确推理」的稳定性。
+
+### 0.5 比喻 ↔ 公式对照表
+
+| 比喻 | 数学对应物 | 文档位置 |
+|---|---|---|
+| 教练打分差 = `log_lr` | log Bayes factor of verdict | §3.1 |
+| 「卡 Bug 找局部峰」 | REINFORCE 梯度只指向 argmax(log_lr) | §1.1 |
+| 「橡皮筋」 | JSD ∈ [0, ln 2] + 自带 `H(p_s)` | §1.3 / §3.2 |
+| 「抄 GT 在两个教练上对称」 | $\Delta_\text{copy}$ 在 (1−λ) 系数下消去 | §3.4 |
+| 「火星文」 | $\pi_s$ 偏离自然语言流形,push 项一阶刷损失 | §4.1 |
+| 「先说人话再推理」 | λ ≤ 0.5,拉力主导 | §4.2 |
+
+读完 §0 后续的公式就只是把这些直觉**钉死成可计算的量** + **可监控的 metric**。
 
 ## 1. 问题：CDM 第一版触发熵崩溃
 
