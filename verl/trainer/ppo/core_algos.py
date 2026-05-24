@@ -1812,17 +1812,78 @@ def _compute_verdict_distillation_loss(
             teacher_pos = teacher_all_log_probs
             teacher_neg = teacher_all_log_probs_neg
 
-        # Bayes factor evidence at the vocab level
-        log_lr = (teacher_pos - teacher_neg).detach()  # (B, T, V_or_K)
-        # Student expectation of the negative log-ratio (reverse-KL direction)
-        per_token_loss = -(student_full.exp() * log_lr).sum(-1)  # (B, T)
+        # CDM JSD-combination form (preferred over the raw log-Bayes-factor projection):
+        #   L_t = JSD_α(π_T^+, π_s)  −  λ · JSD_α(π_T^-, π_s)
+        # — pull student toward the positive-marker teacher, push it away from the
+        # negative-marker teacher, both via the existing alpha-blended JSD machinery
+        # (matches the SDPO branch above so behaviour stays consistent with α=0.5
+        # JSD baselines).  GT-copy / format-mirror modes that are equally present in
+        # both teachers cancel structurally because they contribute the same JSD
+        # magnitude to both terms.
+        #
+        # JSD is bounded by ln 2, so the subtraction is bounded — the loss cannot
+        # run away to −∞ even with λ=1.
+        if use_topk:
+            add_tail_flag = self_distillation_config.distillation_add_tail
+        else:
+            add_tail_flag = False  # full vocab is already a proper distribution
+
+        def _prep_log_probs(lp: torch.Tensor) -> torch.Tensor:
+            if not use_topk:
+                return lp
+            if add_tail_flag:
+                log_s = torch.logsumexp(lp, dim=-1, keepdim=True).clamp(max=-1e-7)
+                tail_log = torch.log(-torch.expm1(log_s))
+                return torch.cat([lp, tail_log], dim=-1)
+            else:
+                return lp - torch.logsumexp(lp, dim=-1, keepdim=True)
+
+        # Teacher tensors are already produced under torch.no_grad() upstream
+        # (dp_actor.py), but we detach explicitly here to (a) match the sibling
+        # branches in this function and (b) make the OPSD asymmetry local: the
+        # student fits the teacher, not the other way around — gradient must
+        # flow through s_lp only.
+        s_lp = _prep_log_probs(student_full)
+        tpos_lp = _prep_log_probs(teacher_pos.detach())
+        tneg_lp = _prep_log_probs(teacher_neg.detach())
+
+        alpha_v = float(self_distillation_config.alpha)
+
+        def _alpha_jsd(student_lp: torch.Tensor, teacher_lp: torch.Tensor) -> torch.Tensor:
+            # Returns per-token JSD_α (sum over vocab axis): identical to the
+            # SDPO branch above, just factored.
+            if alpha_v == 0.0:
+                kl = F.kl_div(student_lp, teacher_lp, reduction="none", log_target=True)
+            elif alpha_v == 1.0:
+                kl = F.kl_div(teacher_lp, student_lp, reduction="none", log_target=True)
+            else:
+                a = torch.tensor(alpha_v, dtype=student_lp.dtype, device=student_lp.device)
+                mixture_lp = torch.logsumexp(
+                    torch.stack([student_lp + torch.log(1 - a), teacher_lp + torch.log(a)]),
+                    dim=0,
+                )
+                kl_t = F.kl_div(mixture_lp, teacher_lp, reduction="none", log_target=True)
+                kl_s = F.kl_div(mixture_lp, student_lp, reduction="none", log_target=True)
+                kl = torch.lerp(kl_s, kl_t, a)
+            return kl.sum(-1)  # (B, T)
+
+        jsd_pos = _alpha_jsd(s_lp, tpos_lp)
+        jsd_neg = _alpha_jsd(s_lp, tneg_lp)
+
+        cdm_neg_weight = float(getattr(self_distillation_config, "cdm_neg_weight", 1.0))
+        per_token_loss = jsd_pos - cdm_neg_weight * jsd_neg  # (B, T)
 
         with torch.no_grad():
             m = loss_mask
             denom = m.sum().clamp(min=1.0)
+            log_lr = (teacher_pos - teacher_neg).detach()  # diagnostic only
+            metrics["self_distillation/cdm_jsd_pos_mean"] = float(((jsd_pos * m).sum() / denom).item())
+            metrics["self_distillation/cdm_jsd_neg_mean"] = float(((jsd_neg * m).sum() / denom).item())
+            metrics["self_distillation/cdm_jsd_diff_mean"] = float((((jsd_pos - jsd_neg) * m).sum() / denom).item())
+            metrics["self_distillation/cdm_loss_per_token_mean"] = float(((per_token_loss * m).sum() / denom).item())
             metrics["self_distillation/cdm_log_lr_abs_mean"] = float(((log_lr.abs().mean(-1) * m).sum() / denom).item())
             metrics["self_distillation/cdm_log_lr_signed_mean"] = float(((log_lr.mean(-1) * m).sum() / denom).item())
-            metrics["self_distillation/cdm_loss_per_token_mean"] = float(((per_token_loss * m).sum() / denom).item())
+            metrics["self_distillation/cdm_neg_weight"] = cdm_neg_weight
     else:
         raise ValueError(f"unknown loss_method={loss_method}")
 

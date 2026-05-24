@@ -1,23 +1,31 @@
 #!/bin/bash
 # =============================================================================
-# SDPO Counterfactual Discriminative Markers (CDM) Sweep
+# SDPO Counterfactual Discriminative Markers (CDM) Sweep — JSD-combination form
 #
 # CDM = teacher reads two privileged contexts on the same trajectory:
 #   m^+gt = "This answer is verified correct, reference answer is <gt>."
 #   m^-gt = "This answer is verified incorrect, reference answer is <gt>."
-# Loss: per-token KL projection of  log p_T(v|x,m^+gt) - log p_T(v|x,m^-gt)
-# onto the student.  GT-copy / format-mirror shortcuts cancel structurally.
 #
-# Pure loss replacement (NOT R-composed), so we do NOT trip the §3.5 sign trap.
+# Loss (v2, JSD-combination — see research/cdm_jsd_combination.md):
+#   L_t = JSD_α(π_T^+gt, π_s)  −  λ · JSD_α(π_T^-gt, π_s)
 #
-# Variants (vs same JSD baseline grid):
-#   * cdm          : default templates, full_logit topk=100
-#   * cdm_topk_off : full_logit no-topk (full vocab)
+# v1 (-Σ p_s · log_lr REINFORCE) was retired after entropy collapse on
+# 2026-05-24; this sweep tests v2's λ axis.  Per §4.2 of the research note,
+# λ ∈ [0.1, 0.5] is the safe zone (avoids fluency destruction); λ=1.0 is a
+# stress-test value (symmetric pull/push).
+#
+# topk=100 only — full-vocab path was retired (Qwen3 V=152K wastes ~1500×
+# teacher-logit memory; the v1 cdm_topk_off run hit OOM-like throughput).
+#
+# Variants:
+#   * l05  : λ = 0.5  (primary — fluency-safe, recommended starting point)
+#   * l03  : λ = 0.3  (conservative backup)
+#   * l10  : λ = 1.0  (stress test — checks fluency destruction)
 #
 # Usage:
 #   bash nebula_scripts/submit_sdpo_cdm_sweep.sh [--dry-run]
-#   bash nebula_scripts/submit_sdpo_cdm_sweep.sh --variant cdm
-#   bash nebula_scripts/submit_sdpo_cdm_sweep.sh --variant cdm,cdm_topk_off
+#   bash nebula_scripts/submit_sdpo_cdm_sweep.sh --variant l05
+#   bash nebula_scripts/submit_sdpo_cdm_sweep.sh --variant l05,l10
 # =============================================================================
 
 # ── Nebula 账号配置 ──────────────────────────────────────────────────────
@@ -34,7 +42,7 @@ PROJECT_NAME="${PROJECT_NAME:-SDPO_CDM}"
 
 # ── 参数解析 ────────────────────────────────────────────────────────────
 DRY_RUN=false
-VARIANT_SELECT="all"   # all | cdm | cdm_topk_off | comma-separated
+VARIANT_SELECT="all"   # all | l05 | l03 | l10 | comma-separated
 
 for arg in "$@"; do
     case "$arg" in
@@ -60,12 +68,15 @@ SCRIPT_PATH="nebula_scripts/sdpo/sdpo_sciknoweval_parametric.sh"
 DATASET_SHORT=$(echo "$DATASET" | tr '/' '-')
 LR_TAG=$(echo "$LR" | tr '-' '_')
 
-# ── CDM 配置矩阵 ───────────────────────────────────────────────────────
-# tag : distillation_topk
+# ── CDM λ 配置矩阵 ─────────────────────────────────────────────────────
+# tag : cdm_neg_weight (λ)
+# topk 全部固定为 100 (full-vocab 路径已退役,见 header)
 VARIANTS=(
-    "cdm:100"
-    "cdm_topk_off:null"
+    "l05:0.5"
+    "l03:0.3"
+    "l10:1.0"
 )
+DISTILLATION_TOPK=100
 
 _should_run() {
     local tag="$1"
@@ -122,7 +133,7 @@ _submit_job() {
 
 # ── 主循环 ──────────────────────────────────────────────────────────────
 for spec in "${VARIANTS[@]}"; do
-    IFS=':' read -r TAG TOPK <<< "$spec"
+    IFS=':' read -r TAG LAMBDA <<< "$spec"
     _should_run "$TAG" || continue
 
     CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
@@ -135,9 +146,10 @@ for spec in "${VARIANTS[@]}"; do
 --env=LR=${LR} \
 --env=ALPHA=${ALPHA} \
 --env=FULL_LOGIT_DISTILLATION=${FULL_LOGIT} \
---env=DISTILLATION_TOPK=${TOPK} \
+--env=DISTILLATION_TOPK=${DISTILLATION_TOPK} \
 --env=LOSS_METHOD=cdm \
 --env=TEACHER_CONTEXT_MODE=cdm \
+--env=CDM_NEG_WEIGHT=${LAMBDA} \
 --env=LOG_DELTA_W_STATS=True \
 --env=DONT_REPROMPT_ON_SELF_SUCCESS=${DONT_REPROMPT_ON_SELF_SUCCESS} \
 --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} \

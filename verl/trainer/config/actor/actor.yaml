@@ -167,10 +167,15 @@ self_distillation:
   # Template for "gt_marker" mode; {ground_truth} is substituted per sample.
   gt_marker_template: "This answer is verified correct, correct answer is {ground_truth}."
 
-  # Templates for "cdm" mode. Both substitute {ground_truth}; the loss reads
-  # log p_T(v|x, m^+gt) - log p_T(v|x, m^-gt) on student-aligned topk.
+  # Templates for "cdm" mode. Both substitute {ground_truth}; the loss is
+  #   L = JSD_α(π_T^+gt, π_s) − cdm_neg_weight · JSD_α(π_T^-gt, π_s)
+  # using the same alpha as the regular SDPO branch.
   cdm_positive_template: "This answer is verified correct, reference answer is {ground_truth}."
   cdm_negative_template: "This answer is verified incorrect, reference answer is {ground_truth}."
+
+  # Weight on the negative-teacher JSD term in CDM loss. 1.0 = symmetric pull/push;
+  # smaller values (e.g. 0.5) keep the positive teacher dominant.
+  cdm_neg_weight: 1.0
 
   # ΔH overconfidence damping: w_t = exp(-max(0, H_s - H_T) / overconfidence_damping)
   # 0.0 disables. Only effective when full_logit_distillation=True. Sensible range 0.5~2.0.

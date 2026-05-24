@@ -165,6 +165,10 @@ class SelfDistillationConfig(BaseConfig):
     cdm_negative_template: str = (
         "This answer is verified incorrect, reference answer is {ground_truth}."
     )
+    # Weight λ on the negative-teacher JSD term in the CDM loss
+    #     L = JSD_α(π_T^+gt, π_s) − λ · JSD_α(π_T^-gt, π_s)
+    # 1.0 = symmetric pull/push; <1.0 keeps the positive teacher dominant.
+    cdm_neg_weight: float = 1.0
     # ΔH overconfidence damping: w_t = exp(-max(0, H_s - H_T) / overconfidence_damping)
     # Down-weights tokens where the marker collapses teacher entropy below student entropy
     # (marker-induced spurious confidence). 0.0 disables. Sensible range: 0.5 ~ 2.0.

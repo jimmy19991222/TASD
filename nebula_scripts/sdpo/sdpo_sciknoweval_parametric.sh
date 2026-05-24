@@ -59,6 +59,7 @@ _DEFAULT_CDM_POS_TEMPLATE='This answer is verified correct, reference answer is 
 _DEFAULT_CDM_NEG_TEMPLATE='This answer is verified incorrect, reference answer is {ground_truth}.'
 CDM_POSITIVE_TEMPLATE="${CDM_POSITIVE_TEMPLATE:-$_DEFAULT_CDM_POS_TEMPLATE}"
 CDM_NEGATIVE_TEMPLATE="${CDM_NEGATIVE_TEMPLATE:-$_DEFAULT_CDM_NEG_TEMPLATE}"
+CDM_NEG_WEIGHT="${CDM_NEG_WEIGHT:-1.0}"
 OVERCONFIDENCE_DAMPING="${OVERCONFIDENCE_DAMPING:-0.0}"           # 0.0 disables; sensible 0.5~2.0
 # Marker / CDM modes require full-logit (for ΔH if damped; for clean signal anyway)
 if [ "${TEACHER_CONTEXT_MODE}" != "ref" ]; then
@@ -124,6 +125,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.self_distillation.gt_marker_template="'${GT_MARKER_TEMPLATE}'" \
     actor_rollout_ref.actor.self_distillation.cdm_positive_template="'${CDM_POSITIVE_TEMPLATE}'" \
     actor_rollout_ref.actor.self_distillation.cdm_negative_template="'${CDM_NEGATIVE_TEMPLATE}'" \
+    actor_rollout_ref.actor.self_distillation.cdm_neg_weight=${CDM_NEG_WEIGHT} \
     actor_rollout_ref.actor.self_distillation.overconfidence_damping=${OVERCONFIDENCE_DAMPING} \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.rollout.n=${ROLLOUT_N} \
