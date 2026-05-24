@@ -156,6 +156,9 @@ self_distillation:
   #   "marker"         : pure self-distill, teacher = student prompt + marker on assistant turn
   #   "ref_and_marker" : combined, teacher gets both ref and marker
   #   "gt_marker"      : per-sample marker with {ground_truth} substituted from reward_model
+  #   "cdm"            : Counterfactual Discriminative Markers — dual GT-bearing
+  #                      teacher contexts (positive / negative verdict). Pairs with
+  #                      loss_method="cdm". See research/self_verified_marker_sdpo.md §3.7.
   teacher_context_mode: ref
 
   # Marker prepended on the assistant turn for "marker" / "ref_and_marker" modes
@@ -163,6 +166,11 @@ self_distillation:
 
   # Template for "gt_marker" mode; {ground_truth} is substituted per sample.
   gt_marker_template: "This answer is verified correct, correct answer is {ground_truth}."
+
+  # Templates for "cdm" mode. Both substitute {ground_truth}; the loss reads
+  # log p_T(v|x, m^+gt) - log p_T(v|x, m^-gt) on student-aligned topk.
+  cdm_positive_template: "This answer is verified correct, reference answer is {ground_truth}."
+  cdm_negative_template: "This answer is verified incorrect, reference answer is {ground_truth}."
 
   # ΔH overconfidence damping: w_t = exp(-max(0, H_s - H_T) / overconfidence_damping)
   # 0.0 disables. Only effective when full_logit_distillation=True. Sensible range 0.5~2.0.

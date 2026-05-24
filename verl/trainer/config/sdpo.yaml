@@ -26,7 +26,9 @@ actor_rollout_ref:
       geodesic_trust_region: 5.0  # Trust Region 阈值（几何 Huber 裁剪，比 clamp 更平滑）
       geodesic_beta_scale: 0.5    # β 缩放因子（补偿 manifold weight 的梯度放大效应）
       # Verdict-conditioned self-distillation (see research/reward_bayes_distillation_v2.md)
-      # loss_method: sdpo | vc_opsd_sign | opd_bayes | vec
+      # loss_method: sdpo | vc_opsd_sign | opd_bayes | vec | cdm
+      # cdm = Counterfactual Discriminative Markers (research §3.7) — pairs with
+      #       teacher_context_mode=cdm and consumes cdm_positive/negative_template
       loss_method: sdpo
       verdict_prior_mode: uniform   # uniform / logit / empirical
       verdict_prior_logit: 0.0
