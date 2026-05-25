@@ -169,11 +169,68 @@ class SelfDistillationConfig(BaseConfig):
     #     L = JSD_α(π_T^+gt, π_s) − λ · JSD_α(π_T^-gt, π_s)
     # 1.0 = symmetric pull/push; <1.0 keeps the positive teacher dominant.
     cdm_neg_weight: float = 1.0
+    # SR-substitution support: when cdm_positive_template / cdm_negative_template contain
+    # `{sr_full}` or `{sr_thinking}`, a successful rollout from the same prompt-group
+    # supplies the reference instead of the dataset's `{ground_truth}`. Per-group: pick the
+    # first row with verdict=1 (sum of token-level scores > 0); broadcast its decoded text
+    # to all rollouts in the group. `sr_thinking` extracts the `<think>...</think>` block;
+    # `sr_full` uses the entire decoded response. If no rollout in the group succeeds, the
+    # sample falls back to `self_verified_marker`. Asymmetric SR refs (pos=full, neg=think)
+    # break the structural Δ_copy cancellation w.r.t. SR — kept for the deployment-friendly
+    # variant the user requested. Length cap below prevents OOM on long thinking traces.
+    cdm_sr_max_chars: int = 2048
+    # When True, both CDM teachers (pos/neg) use the SDPO `ref` user-side reprompt
+    # (sibling-success rollout injected via `reprompt_template` / `solution_template`).
+    # The two teachers share an identical reprompted user message and differ ONLY in
+    # the assistant-side verdict marker — so any LM lexical-copy bias from the sibling
+    # token cancels structurally in the JSD differential, while the verdict-conditional
+    # semantic following signal survives. Pairs naturally with mkonly templates
+    # (no {ground_truth}) for a deployment-friendly variant that needs no train-time GT.
+    cdm_use_ref: bool = False
     # ΔH overconfidence damping: w_t = exp(-max(0, H_s - H_T) / overconfidence_damping)
     # Down-weights tokens where the marker collapses teacher entropy below student entropy
     # (marker-induced spurious confidence). 0.0 disables. Sensible range: 0.5 ~ 2.0.
     # Only effective when full_logit_distillation=True.
     overconfidence_damping: float = 0.0
+
+    # ── Stop-token masking (thinking-bypass / length-collapse fix) ──────
+    # The teacher's view of the assistant turn (reprompt with sibling rollout,
+    # verdict marker, or GT in marker) biases p(EOS|prefix) upward. The student
+    # JSD/KL-pulls toward this elevated EOS edge → response length collapses
+    # decoupled from per-token entropy (see research §3.7.7).
+    #
+    # mask_stop_tokens_in_vocab: drop stop-token coordinates from BOTH student
+    #     and teacher distributions before computing D_α, then renormalize over
+    #     non-stop vocab. The student's p(EOS|prefix) is then governed only by
+    #     pretrained prior + PG/reward, not by teacher leakage. When True,
+    #     distillation_add_tail is forced off in the masked branch (the tail
+    #     bucket is no longer a meaningful residual after coord removal).
+    # mask_stop_tokens_in_position: zero the distillation loss at timesteps
+    #     where the response token *is* a stop token (one timestep per seq).
+    #     Strictly weaker than vocab-mask but useful as an ablation control.
+    # stop_token_ids: explicit list of token IDs to treat as stop. For Qwen3
+    #     pass [151643, 151645] = [<|endoftext|>, <|im_end|>]. When empty,
+    #     both mask flags become no-ops.
+    mask_stop_tokens_in_vocab: bool = False
+    mask_stop_tokens_in_position: bool = False
+    stop_token_ids: Optional[list[int]] = None
+
+    # ── Decision-token mask (fluency-stream suppression) ────────────────
+    # Per-sequence quantile mask on student entropy. Keep only the top
+    # `decision_token_top_p` fraction of response positions (by H(π_s)) in
+    # the distillation loss; the low-entropy "fluency" tail (punctuation,
+    # connectives, EOS) does not receive distillation gradient.
+    #
+    # Targets the length-collapse failure mode: teacher's elevated p(EOS)
+    # cannot flow into student through positions that are masked out, and
+    # EOS positions are typically low-entropy under student so they fall
+    # outside the kept set automatically.
+    #
+    # decision_token_top_p = 1.0 → disabled (full SDPO behaviour).
+    # Sensible exploration range: 0.1 ~ 0.5.
+    # Only effective when full_logit_distillation=True (entropy needs the
+    # vocab distribution; sampled-log-prob mode has no closed-form H).
+    decision_token_top_p: float = 1.0
 
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:
@@ -246,10 +303,28 @@ class SelfDistillationConfig(BaseConfig):
             raise ValueError(
                 f"self_distillation.overconfidence_damping must be >= 0, got {self.overconfidence_damping}"
             )
+        if not 0.0 < self.decision_token_top_p <= 1.0:
+            raise ValueError(
+                "self_distillation.decision_token_top_p must be in (0, 1], "
+                f"got {self.decision_token_top_p}"
+            )
         if self.overconfidence_damping > 0 and not self.full_logit_distillation:
             raise ValueError(
                 "self_distillation.overconfidence_damping > 0 requires full_logit_distillation=True "
                 "(needs vocab-level entropy of both teacher and student)."
+            )
+        if (self.mask_stop_tokens_in_vocab or self.mask_stop_tokens_in_position) and (
+            self.stop_token_ids is None or len(self.stop_token_ids) == 0
+        ):
+            raise ValueError(
+                "self_distillation.stop_token_ids must be a non-empty list when "
+                "mask_stop_tokens_in_vocab or mask_stop_tokens_in_position is True "
+                "(e.g. [151643, 151645] for Qwen3 = [<|endoftext|>, <|im_end|>])."
+            )
+        if self.mask_stop_tokens_in_vocab and not self.full_logit_distillation:
+            raise ValueError(
+                "self_distillation.mask_stop_tokens_in_vocab requires full_logit_distillation=True "
+                "(needs vocab-level distribution to mask coordinates)."
             )
 
 
@@ -356,13 +431,27 @@ class PolicyLossConfig(BaseConfig):
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
 
     Args:
-        loss_mode (str): Loss function mode. Options: 'vanilla', 'clip-cov', 'kl-cov', 'gpg', 'sdpo', 'teacher_qv'.
+        loss_mode (str): Loss function mode. Options: 'vanilla', 'clip-cov', 'kl-cov', 'gpg', 'sdpo', 'teacher_qv', 'vcac'.
         clip_cov_ratio (float): Ratio of tokens to be clipped for clip-cov loss.
         clip_cov_lb (float): Lower bound for clip-cov loss.
         clip_cov_ub (float): Upper bound for clip-cov loss.
         kl_cov_ratio (float): Ratio of tokens to be applied KL penalty for kl-cov loss.
         ppo_kl_coef (float): KL divergence penalty coefficient.
         teacher_qv (TeacherQVConfig): Configuration for the teacher_qv loss.
+        vcac_lambda (float): VCAC mixing coefficient. Advantage becomes
+            A_t = A_GRPO + vcac_lambda · δ_t where δ_t = log π_T^+ − log π_T^-
+            is the per-token verdict log-odds shift from a CDM dual-teacher
+            forward. Only used when loss_mode == "vcac".
+        vcac_clip (Optional[float]): Per-token clip on δ_t before mixing into
+            the advantage. None disables. Sensible range: 5.0 ~ 10.0.
+        vcac_normalize (bool): If True, standardize δ_t per-batch (subtract
+            mean of valid tokens, divide by std + 1e-6) before scaling by
+            vcac_lambda. Keeps δ contribution on a comparable scale to A_GRPO.
+        vcac_use_grpo_advantage (bool): If True (default), advantage is
+            A_t = A_GRPO + vcac_lambda · δ_t (additive shaping). If False,
+            advantage is purely A_t = vcac_lambda · δ_t (pure verdict-credit
+            ablation — drops the GRPO baseline term). PPO clip mechanics are
+            preserved either way.
     """
 
     loss_mode: str = "vanilla"
@@ -372,6 +461,10 @@ class PolicyLossConfig(BaseConfig):
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
     teacher_qv: TeacherQVConfig = field(default_factory=TeacherQVConfig)
+    vcac_lambda: float = 0.3
+    vcac_clip: Optional[float] = None
+    vcac_normalize: bool = False
+    vcac_use_grpo_advantage: bool = True
 
 
 @dataclass

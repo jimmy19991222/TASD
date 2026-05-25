@@ -1938,6 +1938,7 @@ def compute_self_distillation_loss(
     teacher_all_log_probs: Optional[torch.Tensor] = None,
     student_topk_log_probs: Optional[torch.Tensor] = None,
     teacher_topk_log_probs: Optional[torch.Tensor] = None,
+    student_topk_indices: Optional[torch.Tensor] = None,
     self_distillation_mask: Optional[torch.Tensor] = None,
     loss_agg_mode: str = "token-mean",
     rollout_is_weights: Optional[torch.Tensor] = None,
@@ -1945,6 +1946,7 @@ def compute_self_distillation_loss(
     teacher_all_log_probs_neg: Optional[torch.Tensor] = None,
     teacher_topk_log_probs_neg: Optional[torch.Tensor] = None,
     verdict_R: Optional[torch.Tensor] = None,
+    response_ids: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
 
     metrics = {}
@@ -1952,6 +1954,24 @@ def compute_self_distillation_loss(
     loss_mask = response_mask
     if self_distillation_mask is not None:
         loss_mask = loss_mask * self_distillation_mask.unsqueeze(1)
+
+    # ── Stop-token POSITION mask (zero loss at timesteps where response token is EOS-like).
+    # Strictly weaker than vocab mask but available as an ablation control. See
+    # SelfDistillationConfig.mask_stop_tokens_in_position docstring for the why.
+    mask_pos = bool(getattr(self_distillation_config, "mask_stop_tokens_in_position", False))
+    stop_ids_cfg = getattr(self_distillation_config, "stop_token_ids", None) or []
+    if mask_pos and response_ids is not None and len(stop_ids_cfg) > 0:
+        stop_tensor_pos = torch.tensor(
+            list(stop_ids_cfg), device=response_ids.device, dtype=response_ids.dtype
+        )
+        pos_keep = ~torch.isin(response_ids, stop_tensor_pos)
+        loss_mask = loss_mask * pos_keep.to(loss_mask.dtype)
+        with torch.no_grad():
+            m_full = response_mask
+            denom = m_full.sum().clamp(min=1.0)
+            metrics["self_distillation/stop_pos_mask_kept_frac"] = float(
+                ((pos_keep.to(m_full.dtype) * m_full).sum() / denom).item()
+            )
 
     loss_method = getattr(self_distillation_config, "loss_method", "sdpo")
     if loss_method != "sdpo":
@@ -1977,9 +1997,20 @@ def compute_self_distillation_loss(
 
     if self_distillation_config.full_logit_distillation:
         use_topk = self_distillation_config.distillation_topk is not None
+        mask_vocab = bool(getattr(self_distillation_config, "mask_stop_tokens_in_vocab", False))
+        # Tail-bucket residual is not meaningful after we delete coordinates from
+        # the vocab axis (would still pool EOS mass into "rest of vocab"). Force
+        # plain renorm when vocab mask is active. The `mask_vocab` flag is the
+        # source of truth; we override add_tail at use-time.
+        _NEG_INF = -1e30  # safer than float('-inf') for downstream ops
         if use_topk:
             if student_topk_log_probs is None or teacher_topk_log_probs is None:
                 raise ValueError("top-k distillation requires student_topk_log_probs and teacher_topk_log_probs.")
+            if mask_vocab and student_topk_indices is None:
+                raise ValueError(
+                    "mask_stop_tokens_in_vocab=True with top-k distillation requires student_topk_indices "
+                    "to identify which top-k coordinates map to stop tokens."
+                )
 
             def add_tail(log_probs: torch.Tensor) -> torch.Tensor:
                 # Compute tail log-probability using logsumexp for numerical stability
@@ -1995,7 +2026,36 @@ def compute_self_distillation_loss(
 
             student_distill_log_probs = student_topk_log_probs
             teacher_distill_log_probs = teacher_topk_log_probs
-            if self_distillation_config.distillation_add_tail:
+
+            if mask_vocab and len(stop_ids_cfg) > 0:
+                # Student and teacher share the same top-k indices (teacher forward
+                # called with topk_indices=student_topk_indices in dp_actor), so a
+                # single (B,T,K) bool mask applies to both sides identically.
+                stop_tensor_v = torch.tensor(
+                    list(stop_ids_cfg),
+                    device=student_topk_indices.device,
+                    dtype=student_topk_indices.dtype,
+                )
+                eos_in_topk = torch.isin(student_topk_indices, stop_tensor_v)  # (B,T,K) bool
+                student_distill_log_probs = student_distill_log_probs.masked_fill(eos_in_topk, _NEG_INF)
+                teacher_distill_log_probs = teacher_distill_log_probs.masked_fill(eos_in_topk, _NEG_INF)
+                # Force plain renorm (add_tail residual is meaningless after coord delete).
+                student_distill_log_probs = renorm_topk_log_probs(student_distill_log_probs)
+                teacher_distill_log_probs = renorm_topk_log_probs(teacher_distill_log_probs)
+                with torch.no_grad():
+                    m = loss_mask.float()
+                    denom = m.sum().clamp(min=1.0)
+                    # Fraction of timesteps where any stop token appears in the top-k.
+                    any_stop_per_tok = eos_in_topk.any(dim=-1).to(m.dtype)
+                    metrics["self_distillation/stop_vocab_in_topk_frac"] = float(
+                        ((any_stop_per_tok * m).sum() / denom).item()
+                    )
+                    # Average #stop coords removed per top-k slot (1-3 expected).
+                    metrics["self_distillation/stop_vocab_removed_per_tok_mean"] = float(
+                        ((eos_in_topk.sum(dim=-1).to(m.dtype) * m).sum() / denom).item()
+                    )
+                    metrics["self_distillation/stop_vocab_mask_active"] = 1.0
+            elif self_distillation_config.distillation_add_tail:
                 student_distill_log_probs = add_tail(student_distill_log_probs)
                 teacher_distill_log_probs = add_tail(teacher_distill_log_probs)
             else:
@@ -2006,6 +2066,29 @@ def compute_self_distillation_loss(
                 raise ValueError("full_logit_distillation requires student_all_log_probs and teacher_all_log_probs.")
             student_distill_log_probs = student_all_log_probs
             teacher_distill_log_probs = teacher_all_log_probs
+
+            if mask_vocab and len(stop_ids_cfg) > 0:
+                # Full-vocab path: zero out the stop-token coordinates in both sides
+                # and renormalize. Slow-path index assignment via scatter is fine here
+                # (call site is once per micro-batch).
+                stop_tensor_v = torch.tensor(
+                    list(stop_ids_cfg),
+                    device=student_distill_log_probs.device,
+                    dtype=torch.long,
+                )
+                student_distill_log_probs = student_distill_log_probs.clone()
+                teacher_distill_log_probs = teacher_distill_log_probs.clone()
+                student_distill_log_probs.index_fill_(-1, stop_tensor_v, _NEG_INF)
+                teacher_distill_log_probs.index_fill_(-1, stop_tensor_v, _NEG_INF)
+                # Renormalize over the remaining vocab.
+                student_distill_log_probs = student_distill_log_probs - torch.logsumexp(
+                    student_distill_log_probs, dim=-1, keepdim=True
+                )
+                teacher_distill_log_probs = teacher_distill_log_probs - torch.logsumexp(
+                    teacher_distill_log_probs, dim=-1, keepdim=True
+                )
+                metrics["self_distillation/stop_vocab_mask_active"] = 1.0
+                metrics["self_distillation/stop_vocab_removed_per_tok_mean"] = float(len(stop_ids_cfg))
 
         if self_distillation_config.alpha == 0.0:
             kl_loss = F.kl_div(
@@ -2032,6 +2115,88 @@ def compute_self_distillation_loss(
             kl_loss = torch.lerp(kl_student, kl_teacher, alpha)  # Compute the Generalized Jensen-Shannon Divergence
 
         per_token_loss = kl_loss.sum(-1)
+
+        # ===== Decision-token mask (suppress fluency-stream distillation) =====
+        # Drop the low-entropy "fluency" positions (punctuation, common connectives,
+        # EOS) from the distillation loss. Only the top-p fraction of positions
+        # ranked by student entropy is kept — these are the tokens where the
+        # student is uncertain and therefore where the teacher's signal is most
+        # useful. Per-sequence quantile thresholding (vs absolute) keeps the kept
+        # fraction stable across difficulty / length / training progress.
+        #
+        # Primary motivation: teacher's elevated p(EOS|prefix) (due to ref/marker
+        # leakage) flows into the student via JSD on fluency tokens, causing
+        # response-length collapse. Restricting distillation to decision tokens
+        # (high student entropy) keeps the teacher away from the EOS edge by
+        # construction — EOS positions are typically low-entropy under student.
+        decision_top_p = float(
+            getattr(self_distillation_config, "decision_token_top_p", 1.0)
+        )
+        if 0.0 < decision_top_p < 1.0:
+            with torch.no_grad():
+                # Per-position entropy on the SAME vocab axis used by KL/JSD
+                # (top-k post-renorm, or full vocab). No grad.
+                p_s = torch.exp(student_distill_log_probs)
+                H = -(p_s * student_distill_log_probs).sum(-1)  # (B, T)
+                m_resp = response_mask.to(H.dtype)               # (B, T)
+                # Non-response positions must not compete in the ranking.
+                H_for_rank = H.masked_fill(m_resp == 0, float("-inf"))
+
+                n_valid = m_resp.sum(dim=-1).clamp(min=1.0)      # (B,)
+                k_keep = (n_valid * decision_top_p).long().clamp(min=1)  # (B,)
+                T_len = H.shape[-1]
+                # Threshold per-seq = the k-th largest H (descending sort, idx k-1).
+                H_sorted, _ = H_for_rank.sort(dim=-1, descending=True)
+                idx = (k_keep - 1).clamp(max=T_len - 1).unsqueeze(-1)  # (B,1)
+                thresholds = H_sorted.gather(-1, idx)                  # (B,1)
+                decision_mask = ((H >= thresholds) & (m_resp > 0)).to(loss_mask.dtype)
+
+            # Shrink BOTH the loss field and the divisor. agg_loss uses
+            # batch_num_tokens=loss_mask.sum() so dividing through the kept set
+            # gives the correct mean over decision tokens (not diluted by zeros).
+            loss_mask = loss_mask * decision_mask
+
+            with torch.no_grad():
+                m_resp_f = response_mask.float()
+                denom_full = m_resp_f.sum().clamp(min=1.0)
+                kept = (decision_mask.float() * m_resp_f).sum()
+                kept_safe = kept.clamp(min=1.0)
+                out_mask = (1.0 - decision_mask.float()) * m_resp_f
+                out_safe = out_mask.sum().clamp(min=1.0)
+
+                metrics["self_distillation/decision_top_p"] = decision_top_p
+                metrics["self_distillation/decision_mask_ratio"] = float(
+                    (kept / denom_full).item()
+                )
+                metrics["self_distillation/decision_H_in_mean"] = float(
+                    ((H * decision_mask.float()).sum() / kept_safe).item()
+                )
+                metrics["self_distillation/decision_H_out_mean"] = float(
+                    ((H * out_mask).sum() / out_safe).item()
+                )
+                # Marker-quality check: |ΔW|_max inside vs outside the mask.
+                # Inside should be larger if decision tokens really ARE the
+                # positions where teacher disagrees most.
+                dw_abs = (teacher_distill_log_probs - student_distill_log_probs).abs()
+                dw_max = dw_abs.max(dim=-1).values  # (B, T)
+                metrics["self_distillation/decision_dw_max_in_mean"] = float(
+                    ((dw_max * decision_mask.float()).sum() / kept_safe).item()
+                )
+                metrics["self_distillation/decision_dw_max_out_mean"] = float(
+                    ((dw_max * out_mask).sum() / out_safe).item()
+                )
+                # Overlap with stop tokens — expect LOW if H ranking does its job.
+                if response_ids is not None and len(stop_ids_cfg) > 0:
+                    stop_tensor_d = torch.tensor(
+                        list(stop_ids_cfg),
+                        device=response_ids.device,
+                        dtype=response_ids.dtype,
+                    )
+                    is_stop = torch.isin(response_ids, stop_tensor_d).float() * m_resp_f
+                    stop_in_mask = (is_stop * decision_mask.float()).sum()
+                    metrics["self_distillation/decision_stop_in_mask_frac"] = float(
+                        (stop_in_mask / is_stop.sum().clamp(min=1.0)).item()
+                    )
 
         # ===== ΔW signal-to-noise diagnostics (gated, no backward) =====
         # ΔW(v) := log p_T(v|r,s_<t) - log p_s(v|s_<t)  is the Bayes factor

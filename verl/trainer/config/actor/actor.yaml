@@ -57,7 +57,7 @@ policy_loss:
   # # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: verl.workers.config.PolicyLossConfig
 
-  # Loss function mode: vanilla / clip-cov / kl-cov / gpg / sdpo / teacher_qv
+  # Loss function mode: vanilla / clip-cov / kl-cov / gpg / sdpo / teacher_qv / vcac
   loss_mode: "vanilla"
 
   # Ratio of tokens to be clipped for clip-cov loss
@@ -87,6 +87,28 @@ policy_loss:
     # "sampled" = -A(y_t)·log p_s(y_t) (MC, high variance)
     # "full_logit" = -Σ_v p_s(v)·A(v)·log p_s(v) (vocab-summed, lower variance)
     gradient_mode: "sampled"
+
+  # VCAC (Verdict-Conditioned Advantage Correction): GRPO PG loss with
+  # per-token credit shaping. Active only when loss_mode == "vcac" AND
+  # self_distillation.teacher_context_mode == "cdm". Uses the CDM dual-teacher
+  # forward to compute δ_t = log π_T^+(y_t|x,y_<t) − log π_T^-(y_t|x,y_<t)
+  # (sampled-token log-prob differential), then sets advantage to
+  #     A_t = A_GRPO + vcac_lambda · δ_t
+  # and feeds it into compute_policy_loss_vanilla (GRPO PG with PPO clip).
+  # vcac_lambda: mixing weight on δ_t. Sensible range 0.1 ~ 1.0.
+  vcac_lambda: 0.3
+  # Optional per-token clip on δ_t before mixing (null disables).
+  vcac_clip: null
+  # If true, standardize δ_t (subtract batch mean, divide by std + 1e-6)
+  # before the λ scale. Keeps the δ contribution on a comparable scale to
+  # A_GRPO when teacher confidence gaps vary across batches.
+  vcac_normalize: False
+
+  # If True (default), advantage is A_t = A_GRPO + vcac_lambda · δ_t.
+  # If False, advantage is purely A_t = vcac_lambda · δ_t (drops the GRPO
+  # baseline term — pure verdict-credit ablation). PPO clip mechanics are
+  # preserved either way (still goes through compute_policy_loss_vanilla).
+  vcac_use_grpo_advantage: True
 
 # self-distillation config
 self_distillation:
@@ -177,9 +199,34 @@ self_distillation:
   # smaller values (e.g. 0.5) keep the positive teacher dominant.
   cdm_neg_weight: 1.0
 
+  # When True, both CDM teachers (pos/neg) share the SDPO `ref` user-side reprompt
+  # (sibling-success rollout). User message is identical across pos/neg teachers; only
+  # the assistant-side verdict marker differs. Pairs naturally with mkonly templates
+  # (no {ground_truth}) for a no-GT, deployment-friendly variant.
+  cdm_use_ref: False
+
   # ΔH overconfidence damping: w_t = exp(-max(0, H_s - H_T) / overconfidence_damping)
   # 0.0 disables. Only effective when full_logit_distillation=True. Sensible range 0.5~2.0.
   overconfidence_damping: 0.0
+
+  # Stop-token masking (thinking-bypass / length-collapse fix; see research/cdm_running_experiments.md §3.7.7)
+  #   mask_stop_tokens_in_vocab : drop stop-token coords from BOTH π_T and π_s before D_α
+  #                                (primary fix — removes EOS-edge pull from JSD geometry)
+  #   mask_stop_tokens_in_position : zero loss at timesteps where the response token IS a
+  #                                stop token (control — kills 1 step/seq only)
+  #   stop_token_ids : explicit list of token IDs. Qwen3 default: [151643, 151645]
+  #                    (= <|endoftext|>, <|im_end|>). MUST be non-empty when either flag is True.
+  mask_stop_tokens_in_vocab: False
+  mask_stop_tokens_in_position: False
+  stop_token_ids: null
+
+  # Decision-token mask (fluency-stream suppression, length-collapse fix)
+  #   Per-sequence quantile on student entropy H(π_s). Only the top fraction
+  #   of response positions enters the distillation loss; low-entropy fluency
+  #   tokens (punctuation, connectives, EOS) are dropped.
+  #   1.0 = disabled (full SDPO). Explore 0.1 ~ 0.5.
+  #   Only effective when full_logit_distillation=True.
+  decision_token_top_p: 1.0
 
   # IS clip for loss; null disables IS weighting
   is_clip: 2

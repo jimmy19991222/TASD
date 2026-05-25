@@ -711,7 +711,11 @@ class DataParallelPPOActor(BasePPOActor):
 
         self_distillation_enabled = loss_mode == "sdpo"
         teacher_qv_enabled = loss_mode == "teacher_qv"
-        teacher_forward_required = self_distillation_enabled or teacher_qv_enabled
+        # VCAC: GRPO PG loss with per-token advantage shaped by CDM dual-teacher
+        # δ_t = log π_T^+(y_t) − log π_T^-(y_t). Requires teacher_context_mode='cdm'
+        # so the dual teacher batch (teacher_input_ids_{pos,neg}) is built.
+        vcac_enabled = loss_mode == "vcac"
+        teacher_forward_required = self_distillation_enabled or teacher_qv_enabled or vcac_enabled
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
         teacher_qv_cfg = self.config.policy_loss.get("teacher_qv", None) if teacher_qv_enabled else None
         verdict_loss_active = (
@@ -725,7 +729,15 @@ class DataParallelPPOActor(BasePPOActor):
             and self_distillation_cfg.get("loss_method", "sdpo") == "cdm"
         )
         # Both families need the second (negative) teacher forward.
-        dual_teacher_active = verdict_loss_active or cdm_loss_active
+        dual_teacher_active = verdict_loss_active or cdm_loss_active or vcac_enabled
+        if vcac_enabled:
+            if self_distillation_cfg is None:
+                raise ValueError("loss_mode='vcac' requires self_distillation config to be present.")
+            if self_distillation_cfg.get("teacher_context_mode", "ref") != "cdm":
+                raise ValueError(
+                    "loss_mode='vcac' requires self_distillation.teacher_context_mode='cdm' "
+                    "so the dual (positive/negative verdict) teacher inputs are built."
+                )
         if teacher_forward_required:
             self_distillation_required_keys = {
                 "teacher_input_ids",
@@ -955,6 +967,7 @@ class DataParallelPPOActor(BasePPOActor):
                             teacher_all_log_probs=teacher_all_logps,
                             student_topk_log_probs=student_topk_logps,
                             teacher_topk_log_probs=teacher_topk_logps,
+                            student_topk_indices=student_topk_indices,
                             self_distillation_mask=self_distillation_mask,
                             loss_agg_mode=loss_agg_mode,
                             rollout_is_weights=rollout_is_weights,
@@ -962,6 +975,7 @@ class DataParallelPPOActor(BasePPOActor):
                             teacher_all_log_probs_neg=teacher_all_logps_neg if dual_teacher_active else None,
                             teacher_topk_log_probs_neg=teacher_topk_logps_neg if dual_teacher_active else None,
                             verdict_R=verdict_R if verdict_loss_active else None,
+                            response_ids=model_inputs.get("responses"),
                         )
 
                         pg_metrics["self_distillation/empty_target_batch"] = self_distillation_mask.sum().item() == 0
@@ -1094,6 +1108,121 @@ class DataParallelPPOActor(BasePPOActor):
                             pg_metrics["teacher_qv/empty_target_batch"] = (
                                 self_distillation_mask.sum().item() == 0
                             )
+                        micro_batch_metrics.update(pg_metrics)
+                    elif vcac_enabled:
+                        # VCAC: GRPO PG loss with per-token credit shaping.
+                        #   δ_t = log π_T^+(y_t|x,y_<t) − log π_T^-(y_t|x,y_<t)
+                        # is the Bayes-clean verdict log-odds shift from the CDM
+                        # dual-teacher forward (sampled-token log-probs). Mixed
+                        # into the GRPO advantage and fed into the standard
+                        # vanilla PG loss with PPO clip.
+                        assert teacher_log_prob_neg is not None, (
+                            "VCAC requires the negative-teacher forward (dual_teacher_active)."
+                        )
+                        from verl.trainer.ppo.core_algos import compute_policy_loss_vanilla
+
+                        delta_t = (teacher_log_prob - teacher_log_prob_neg).detach()
+                        # δ_t is only defined on response positions; zero elsewhere.
+                        delta_t = delta_t * response_mask
+                        vcac_lambda = float(self.config.policy_loss.get("vcac_lambda", 0.3))
+                        vcac_clip_val = self.config.policy_loss.get("vcac_clip", None)
+                        vcac_normalize = bool(self.config.policy_loss.get("vcac_normalize", False))
+                        vcac_use_grpo = bool(
+                            self.config.policy_loss.get("vcac_use_grpo_advantage", True)
+                        )
+
+                        # All VCAC δ-metrics are initialized up-front with NaN so every
+                        # micro-batch contributes the same key set. Otherwise conditional
+                        # appends (R0/R1 partition, normalize-only, empty-target) make
+                        # reduce_metrics see inhomogeneous lists across ranks and crash on
+                        # np.mean(val).
+                        delta_metrics = {
+                            "vcac/delta_norm_mean_pre": float("nan"),
+                            "vcac/delta_norm_std_pre": float("nan"),
+                            "vcac/delta_mean_R0": float("nan"),
+                            "vcac/delta_abs_mean_R0": float("nan"),
+                            "vcac/delta_mean_R1": float("nan"),
+                            "vcac/delta_abs_mean_R1": float("nan"),
+                        }
+                        mask_bool = response_mask.bool()
+                        valid_count = mask_bool.sum().clamp_min(1)
+
+                        if vcac_normalize:
+                            delta_sum = delta_t.sum()
+                            delta_mean = (delta_sum / valid_count).detach()
+                            delta_centered = (delta_t - delta_mean) * response_mask
+                            delta_var = ((delta_centered ** 2).sum() / valid_count).detach()
+                            delta_std = (delta_var.clamp_min(1e-12).sqrt() + 1e-6)
+                            delta_t = delta_centered / delta_std
+                            delta_metrics["vcac/delta_norm_mean_pre"] = delta_mean.item()
+                            delta_metrics["vcac/delta_norm_std_pre"] = delta_std.item()
+
+                        if vcac_clip_val is not None and float(vcac_clip_val) > 0:
+                            cv = float(vcac_clip_val)
+                            delta_t = torch.clamp(delta_t, min=-cv, max=cv)
+
+                        # δ-distribution diagnostics on valid response tokens.
+                        with torch.no_grad():
+                            d_valid = delta_t[mask_bool]
+                            if d_valid.numel() > 0:
+                                delta_metrics["vcac/delta_mean"] = d_valid.mean().item()
+                                delta_metrics["vcac/delta_std"] = d_valid.std().item() if d_valid.numel() > 1 else 0.0
+                                delta_metrics["vcac/delta_abs_mean"] = d_valid.abs().mean().item()
+                                delta_metrics["vcac/delta_pos_frac"] = (d_valid > 0).float().mean().item()
+                                delta_metrics["vcac/delta_neg_frac"] = (d_valid < 0).float().mean().item()
+                            else:
+                                delta_metrics["vcac/delta_mean"] = 0.0
+                                delta_metrics["vcac/delta_std"] = 0.0
+
+                            # Sign-check on R=0 subset (see feedback_belief_pg_sign_check):
+                            # when GRPO advantage is non-positive on these rows, δ adding
+                            # mass back to teacher-pos tokens should not contradict R.
+                            a_seq = advantages.sum(dim=-1) if advantages.dim() == 2 else advantages
+                            # Use sample-level R proxy: GRPO advantage sum sign per sequence.
+                            r0_mask_seq = (a_seq < 0)
+                            r1_mask_seq = (a_seq > 0)
+                            if r0_mask_seq.any():
+                                d_r0 = delta_t[r0_mask_seq][response_mask[r0_mask_seq].bool()]
+                                if d_r0.numel() > 0:
+                                    delta_metrics["vcac/delta_mean_R0"] = d_r0.mean().item()
+                                    delta_metrics["vcac/delta_abs_mean_R0"] = d_r0.abs().mean().item()
+                            if r1_mask_seq.any():
+                                d_r1 = delta_t[r1_mask_seq][response_mask[r1_mask_seq].bool()]
+                                if d_r1.numel() > 0:
+                                    delta_metrics["vcac/delta_mean_R1"] = d_r1.mean().item()
+                                    delta_metrics["vcac/delta_abs_mean_R1"] = d_r1.abs().mean().item()
+
+                        if vcac_use_grpo:
+                            advantages_vcac = advantages + vcac_lambda * delta_t
+                        else:
+                            # Pure-δ ablation: drop the GRPO baseline term.
+                            advantages_vcac = (vcac_lambda * delta_t) * response_mask
+                        # Guard against NaN/inf from teacher forward.
+                        advantages_vcac = torch.where(
+                            torch.isfinite(advantages_vcac),
+                            advantages_vcac,
+                            advantages,
+                        )
+
+                        pg_loss, pg_metrics = compute_policy_loss_vanilla(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages_vcac,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                        )
+                        pg_metrics.update(delta_metrics)
+                        pg_metrics["vcac/lambda"] = vcac_lambda
+                        pg_metrics["vcac/use_grpo_advantage"] = float(vcac_use_grpo)
+                        # Always emit so reduce_metrics sees a uniform key set across
+                        # ranks / micro-batches (avoids inhomogeneous-list np.mean crash).
+                        pg_metrics["vcac/empty_target_batch"] = float(
+                            self_distillation_mask.sum().item() == 0
+                            if self_distillation_mask is not None
+                            else 0.0
+                        )
                         micro_batch_metrics.update(pg_metrics)
                     else:
                         # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
