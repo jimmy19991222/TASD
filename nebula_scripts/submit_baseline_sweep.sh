@@ -8,6 +8,7 @@
 #   bash nebula_scripts/submit_baseline_sweep.sh --algo sdpo [--dry-run]
 #   bash nebula_scripts/submit_baseline_sweep.sh --dataset lcb [--dry-run]
 #   bash nebula_scripts/submit_baseline_sweep.sh --dataset sciknoweval [--dry-run]
+#   bash nebula_scripts/submit_baseline_sweep.sh --dataset tooluse [--dry-run]
 #   bash nebula_scripts/submit_baseline_sweep.sh --dataset all [--dry-run]
 # =============================================================================
 
@@ -26,7 +27,7 @@ PROJECT_NAME="${PROJECT_NAME:-Baselines_clean}"
 # ── 命令行参数解析 ──────────────────────────────────────────────────────
 DRY_RUN=false
 ALGO="all"    # all | grpo | sdpo
-DATASET_GROUP="all"  # all | sciknoweval | lcb
+DATASET_GROUP="all"  # all | sciknoweval | lcb | tooluse
 
 for arg in "$@"; do
     case "$arg" in
@@ -129,7 +130,7 @@ if [[ "$ALGO" == "all" || "$ALGO" == "grpo" ]]; then
             CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
             JOB_NAME="GRPO-${DATASET_SHORT}-mbs${MINI_BATCH_SIZE}-lr${LR_TAG}-${MODEL_NAME}-${CURRENT_TIME}"
             _submit_job "$SCRIPT_PATH" "$JOB_NAME" \
-                "--env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=DATASET=${DATASET} --env=MODEL_NAME=${MODEL_NAME} --env=LR=${LR} --env=MINI_BATCH_SIZE=${MINI_BATCH_SIZE} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=SEED=${SEED}"
+                "--env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=DATASET=${DATASET} --env=MODEL_NAME=${MODEL_NAME} --env=LR=${LR} --env=MINI_BATCH_SIZE=${MINI_BATCH_SIZE} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=SEED=${SEED} --env=TEST_FREQ=${TEST_FREQ:-10} --env=SAVE_FREQ=${SAVE_FREQ:-10} --env=VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True} --env=SAVE_HF_ONLY=${SAVE_HF_ONLY:-True}"
         done; done; done; done
     fi
 
@@ -143,7 +144,21 @@ if [[ "$ALGO" == "all" || "$ALGO" == "grpo" ]]; then
             CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
             JOB_NAME="GRPO-lcb_v6-mbs${MINI_BATCH_SIZE}-lr${LR_TAG}-${MODEL_NAME}-${CURRENT_TIME}"
             _submit_job "$SCRIPT_PATH" "$JOB_NAME" \
-                "--env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=MODEL_NAME=${MODEL_NAME} --env=LR=${LR} --env=MINI_BATCH_SIZE=${MINI_BATCH_SIZE} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=SEED=${SEED}"
+                "--env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=MODEL_NAME=${MODEL_NAME} --env=LR=${LR} --env=MINI_BATCH_SIZE=${MINI_BATCH_SIZE} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=SEED=${SEED} --env=TEST_FREQ=${TEST_FREQ:-10} --env=SAVE_FREQ=${SAVE_FREQ:-10} --env=VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True} --env=SAVE_HF_ONLY=${SAVE_HF_ONLY:-True}"
+        done; done; done
+    fi
+
+    # tooluse
+    if [[ "$DATASET_GROUP" == "all" || "$DATASET_GROUP" == "tooluse" ]]; then
+        SCRIPT_PATH="nebula_scripts/grpo/grpo_tooluse_parametric.sh"
+        for MODEL_NAME in "${MODEL_NAMES[@]}"; do
+        for LR in "${GRPO_LRS[@]}"; do
+        for MINI_BATCH_SIZE in "${GRPO_MINI_BATCH_SIZES[@]}"; do
+            LR_TAG=$(echo "$LR" | tr '-' '_')
+            CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
+            JOB_NAME="GRPO-tooluse-mbs${MINI_BATCH_SIZE}-lr${LR_TAG}-${MODEL_NAME}-${CURRENT_TIME}"
+            _submit_job "$SCRIPT_PATH" "$JOB_NAME" \
+                "--env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=MODEL_NAME=${MODEL_NAME} --env=LR=${LR} --env=MINI_BATCH_SIZE=${MINI_BATCH_SIZE} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=SEED=${SEED} --env=TEST_FREQ=${TEST_FREQ:-10} --env=SAVE_FREQ=${SAVE_FREQ:-10} --env=VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True} --env=SAVE_HF_ONLY=${SAVE_HF_ONLY:-True}"
         done; done; done
     fi
 fi
@@ -168,7 +183,7 @@ if [[ "$ALGO" == "all" || "$ALGO" == "sdpo" ]]; then
             CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
             JOB_NAME="SDPO-${DATASET_SHORT}-alpha${ALPHA}-lr${LR_TAG}-${REPROMPT_TAG}-${MODEL_NAME}-${CURRENT_TIME}"
             _submit_job "$SCRIPT_PATH" "$JOB_NAME" \
-                "--env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=DATASET=${DATASET} --env=MODEL_NAME=${MODEL_NAME} --env=LR=${LR} --env=ALPHA=${ALPHA} --env=DONT_REPROMPT_ON_SELF_SUCCESS=${DONT_REPROMPT_ON_SELF_SUCCESS} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=SEED=${SEED}"
+                "--env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=DATASET=${DATASET} --env=MODEL_NAME=${MODEL_NAME} --env=LR=${LR} --env=ALPHA=${ALPHA} --env=DONT_REPROMPT_ON_SELF_SUCCESS=${DONT_REPROMPT_ON_SELF_SUCCESS} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=SEED=${SEED} --env=TEST_FREQ=${TEST_FREQ:-10} --env=SAVE_FREQ=${SAVE_FREQ:-10} --env=VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True} --env=SAVE_HF_ONLY=${SAVE_HF_ONLY:-True}"
         done; done; done; done; done
     fi
 
@@ -184,7 +199,23 @@ if [[ "$ALGO" == "all" || "$ALGO" == "sdpo" ]]; then
             CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
             JOB_NAME="SDPO-lcb_v6-alpha${ALPHA}-lr${LR_TAG}-${REPROMPT_TAG}-${MODEL_NAME}-${CURRENT_TIME}"
             _submit_job "$SCRIPT_PATH" "$JOB_NAME" \
-                "--env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=MODEL_NAME=${MODEL_NAME} --env=LR=${LR} --env=ALPHA=${ALPHA} --env=DONT_REPROMPT_ON_SELF_SUCCESS=${DONT_REPROMPT_ON_SELF_SUCCESS} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=SEED=${SEED}"
+                "--env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=MODEL_NAME=${MODEL_NAME} --env=LR=${LR} --env=ALPHA=${ALPHA} --env=DONT_REPROMPT_ON_SELF_SUCCESS=${DONT_REPROMPT_ON_SELF_SUCCESS} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=SEED=${SEED} --env=TEST_FREQ=${TEST_FREQ:-10} --env=SAVE_FREQ=${SAVE_FREQ:-10} --env=VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True} --env=SAVE_HF_ONLY=${SAVE_HF_ONLY:-True}"
+        done; done; done; done
+    fi
+
+    # tooluse
+    if [[ "$DATASET_GROUP" == "all" || "$DATASET_GROUP" == "tooluse" ]]; then
+        SCRIPT_PATH="nebula_scripts/sdpo/sdpo_tooluse_parametric.sh"
+        for MODEL_NAME in "${MODEL_NAMES[@]}"; do
+        for LR in "${SDPO_LRS[@]}"; do
+        for ALPHA in "${SDPO_ALPHAS[@]}"; do
+        for DONT_REPROMPT_ON_SELF_SUCCESS in "${SDPO_DONT_REPROMPT_LIST[@]}"; do
+            LR_TAG=$(echo "$LR" | tr '-' '_')
+            REPROMPT_TAG=$([ "$DONT_REPROMPT_ON_SELF_SUCCESS" = "True" ] && echo "noReprompt" || echo "reprompt")
+            CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
+            JOB_NAME="SDPO-tooluse-alpha${ALPHA}-lr${LR_TAG}-${REPROMPT_TAG}-${MODEL_NAME}-${CURRENT_TIME}"
+            _submit_job "$SCRIPT_PATH" "$JOB_NAME" \
+                "--env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=MODEL_NAME=${MODEL_NAME} --env=LR=${LR} --env=ALPHA=${ALPHA} --env=DONT_REPROMPT_ON_SELF_SUCCESS=${DONT_REPROMPT_ON_SELF_SUCCESS} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=SEED=${SEED} --env=TEST_FREQ=${TEST_FREQ:-10} --env=SAVE_FREQ=${SAVE_FREQ:-10} --env=VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True} --env=SAVE_HF_ONLY=${SAVE_HF_ONLY:-True}"
         done; done; done; done
     fi
 fi

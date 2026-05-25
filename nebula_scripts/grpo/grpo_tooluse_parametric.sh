@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# GRPO Baseline 参数化训练脚本（lcb_v6 数据集，供 Nebula sweep 调用）
+# GRPO Baseline 参数化训练脚本（tooluse 数据集，供 Nebula sweep 调用）
 # 所有超参通过 nebulactl --env 注入
 # =============================================================================
 set +xo pipefail
@@ -28,10 +28,11 @@ else
     SAVE_CONTENTS_HYDRA="[model,optimizer,extra,hf_model]"
 fi
 
-train_data_path="${OSS_ROOT}/datasets/lcb_v6/train.parquet"
-val_data_path="${OSS_ROOT}/datasets/lcb_v6/test.parquet"
+# 数据集路径（tooluse 数据集）
+train_data_path="${OSS_ROOT}/datasets/tooluse/train.parquet"
+val_data_path="${OSS_ROOT}/datasets/tooluse/test.parquet"
 model_path="${OSS_ROOT}/base_models/${MODEL_NAME}"
-save_path="${OSS_ROOT}/rl_models/${JOB_NAME:-grpo_lcb_sweep}"
+save_path="${OSS_ROOT}/rl_models/${JOB_NAME:-grpo_tooluse_sweep}"
 
 # ── 环境 ──────────────────────────────────────────────────────────────
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
@@ -71,11 +72,11 @@ python -m verl.trainer.main_ppo \
     trainer.total_training_steps=250 \
     trainer.save_freq=${SAVE_FREQ} \
     trainer.test_freq=${TEST_FREQ} \
-    trainer.save_best_metric="val-core/livecodebench/acc/mean@16" \
+    trainer.save_best_metric="val-core/tooluse/acc/mean@16" \
     trainer.n_gpus_per_node=4 \
     trainer.val_before_train=${VAL_BEFORE_TRAIN} \
     trainer.default_local_dir="${save_path}" \
     trainer.project_name="${PROJECT_NAME:-Baselines}" \
-    trainer.experiment_name="${JOB_NAME:-grpo_lcb_sweep}" \
-    trainer.group_name="GRPO-lcb" \
+    trainer.experiment_name="${JOB_NAME:-grpo_tooluse_sweep}" \
+    trainer.group_name="GRPO-tooluse" \
     "trainer.logger=[console,swanlab]"
