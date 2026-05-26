@@ -715,7 +715,12 @@ class DataParallelPPOActor(BasePPOActor):
         # δ_t = log π_T^+(y_t) − log π_T^-(y_t). Requires teacher_context_mode='cdm'
         # so the dual teacher batch (teacher_input_ids_{pos,neg}) is built.
         vcac_enabled = loss_mode == "vcac"
-        teacher_forward_required = self_distillation_enabled or teacher_qv_enabled or vcac_enabled
+        # Bayes-DR: A_t = R − σ(Σ_{s<t} δ_s + logit ḡ_GRPO).
+        # Cumulative δ_t is the Bayes-implied success log-odds shift; the per-token
+        # baseline b_t depends only on y_<t so subtraction is an unbiased control
+        # variate over the PG estimator. Requires the CDM dual-teacher forward.
+        bayes_dr_enabled = loss_mode == "bayes_dr"
+        teacher_forward_required = self_distillation_enabled or teacher_qv_enabled or vcac_enabled or bayes_dr_enabled
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
         teacher_qv_cfg = self.config.policy_loss.get("teacher_qv", None) if teacher_qv_enabled else None
         verdict_loss_active = (
@@ -729,13 +734,21 @@ class DataParallelPPOActor(BasePPOActor):
             and self_distillation_cfg.get("loss_method", "sdpo") == "cdm"
         )
         # Both families need the second (negative) teacher forward.
-        dual_teacher_active = verdict_loss_active or cdm_loss_active or vcac_enabled
+        dual_teacher_active = verdict_loss_active or cdm_loss_active or vcac_enabled or bayes_dr_enabled
         if vcac_enabled:
             if self_distillation_cfg is None:
                 raise ValueError("loss_mode='vcac' requires self_distillation config to be present.")
             if self_distillation_cfg.get("teacher_context_mode", "ref") != "cdm":
                 raise ValueError(
                     "loss_mode='vcac' requires self_distillation.teacher_context_mode='cdm' "
+                    "so the dual (positive/negative verdict) teacher inputs are built."
+                )
+        if bayes_dr_enabled:
+            if self_distillation_cfg is None:
+                raise ValueError("loss_mode='bayes_dr' requires self_distillation config to be present.")
+            if self_distillation_cfg.get("teacher_context_mode", "ref") != "cdm":
+                raise ValueError(
+                    "loss_mode='bayes_dr' requires self_distillation.teacher_context_mode='cdm' "
                     "so the dual (positive/negative verdict) teacher inputs are built."
                 )
         if teacher_forward_required:
@@ -771,6 +784,12 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("ref_log_prob")
         if teacher_forward_required:
             select_keys.extend(list(self_distillation_required_keys))
+        if bayes_dr_enabled:
+            # ray_trainer writes seq_R (per-sequence R) and grpo_group_mean
+            # (per-prompt mean R, used as the prior in logit space).
+            for _bdr_key in ("seq_R", "grpo_group_mean"):
+                if _bdr_key in data.batch.keys() and _bdr_key not in select_keys:
+                    select_keys.append(_bdr_key)
         # Include pre-computed IS weights if present in batch
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
@@ -1219,6 +1238,141 @@ class DataParallelPPOActor(BasePPOActor):
                         # Always emit so reduce_metrics sees a uniform key set across
                         # ranks / micro-batches (avoids inhomogeneous-list np.mean crash).
                         pg_metrics["vcac/empty_target_batch"] = float(
+                            self_distillation_mask.sum().item() == 0
+                            if self_distillation_mask is not None
+                            else 0.0
+                        )
+                        micro_batch_metrics.update(pg_metrics)
+                    elif bayes_dr_enabled:
+                        # Bayes-DR: A_t = R − σ(Σ_{s<t} δ_s + logit ḡ_GRPO).
+                        # The cumulative-δ baseline b_t depends only on y_<t, so
+                        # subtracting it from R is an unbiased Rao-Blackwell
+                        # control variate. With well-calibrated δ, b_t tracks the
+                        # current model's posterior success probability and A_t
+                        # concentrates credit on the verdict-shifting turn-tokens.
+                        assert teacher_log_prob_neg is not None, (
+                            "Bayes-DR requires the negative-teacher forward (dual_teacher_active)."
+                        )
+                        seq_R = model_inputs.get("seq_R", None)
+                        grpo_group_mean = model_inputs.get("grpo_group_mean", None)
+                        if seq_R is None or grpo_group_mean is None:
+                            raise ValueError(
+                                "loss_mode='bayes_dr' requires seq_R and grpo_group_mean in batch "
+                                "(written by ray_trainer GRPO advantage path)."
+                            )
+                        from verl.trainer.ppo.core_algos import compute_policy_loss_vanilla
+
+                        bdr_cfg = self.config.policy_loss
+                        bdr_delta_clip = bdr_cfg.get("bayes_dr_delta_clip", None)
+                        bdr_prior_floor = float(bdr_cfg.get("bayes_dr_prior_floor", 0.05))
+                        bdr_use_seq_anchor = bool(bdr_cfg.get("bayes_dr_use_seq_anchor", True))
+                        bdr_normalize_adv = bool(bdr_cfg.get("bayes_dr_normalize_adv", False))
+                        bdr_baseline_detach = bool(bdr_cfg.get("bayes_dr_baseline_detach", True))
+
+                        delta_t = (teacher_log_prob - teacher_log_prob_neg).detach()
+                        delta_t = delta_t * response_mask
+                        if bdr_delta_clip is not None and float(bdr_delta_clip) > 0:
+                            cv = float(bdr_delta_clip)
+                            delta_t = torch.clamp(delta_t, min=-cv, max=cv)
+
+                        # Cumulative δ shifted by one position: b_t depends only on y_<t.
+                        cum_delta = torch.cumsum(delta_t, dim=-1)
+                        cum_delta_prev = torch.cat(
+                            [torch.zeros_like(cum_delta[:, :1]), cum_delta[:, :-1]], dim=-1
+                        )
+
+                        # Prior in logit space, clamped away from {0, 1}.
+                        prior = grpo_group_mean.clamp(bdr_prior_floor, 1.0 - bdr_prior_floor)
+                        prior_logit = torch.log(prior / (1.0 - prior))
+                        # [B] -> [B, 1] broadcast over T.
+                        b_t = torch.sigmoid(cum_delta_prev + prior_logit[:, None])
+
+                        if bdr_use_seq_anchor:
+                            # A_t = R − b_t (R is per-sequence outcome reward).
+                            anchor = seq_R[:, None].to(b_t.dtype)
+                        else:
+                            # Ablation: use sign(per-sequence GRPO advantage) as anchor.
+                            a_seq = advantages.sum(dim=-1) if advantages.dim() == 2 else advantages
+                            anchor = torch.sign(a_seq)[:, None].to(b_t.dtype)
+                        advantages_bdr = (anchor - b_t) * response_mask
+                        if bdr_baseline_detach:
+                            advantages_bdr = advantages_bdr.detach()
+
+                        # Guard against NaN/inf from teacher forward.
+                        advantages_bdr = torch.where(
+                            torch.isfinite(advantages_bdr),
+                            advantages_bdr,
+                            advantages,
+                        )
+
+                        if bdr_normalize_adv:
+                            mask_bool = response_mask.bool()
+                            valid_count = mask_bool.sum().clamp_min(1)
+                            a_mean = (advantages_bdr.sum() / valid_count).detach()
+                            a_var = (((advantages_bdr - a_mean) ** 2 * response_mask).sum() / valid_count).detach()
+                            a_std = (a_var.clamp_min(1e-12).sqrt() + 1e-6)
+                            advantages_bdr = ((advantages_bdr - a_mean) / a_std) * response_mask
+
+                        # Diagnostics initialized as NaN up-front so reduce_metrics
+                        # sees a uniform key set across micro-batches/ranks.
+                        bdr_metrics = {
+                            "bayes_dr/cum_delta_T_mean": float("nan"),
+                            "bayes_dr/b_t_mean": float("nan"),
+                            "bayes_dr/b_t_std": float("nan"),
+                            "bayes_dr/A_t_mean": float("nan"),
+                            "bayes_dr/A_t_std": float("nan"),
+                            "bayes_dr/A_t_abs_mean": float("nan"),
+                            "bayes_dr/corr_cum_delta_R": float("nan"),
+                            "bayes_dr/delta_abs_mean": float("nan"),
+                        }
+                        with torch.no_grad():
+                            mask_b = response_mask.bool()
+                            if mask_b.any():
+                                d_valid = delta_t[mask_b]
+                                bdr_metrics["bayes_dr/delta_abs_mean"] = d_valid.abs().mean().item()
+                                b_valid = b_t[mask_b]
+                                bdr_metrics["bayes_dr/b_t_mean"] = b_valid.mean().item()
+                                bdr_metrics["bayes_dr/b_t_std"] = (
+                                    b_valid.std().item() if b_valid.numel() > 1 else 0.0
+                                )
+                                a_valid = advantages_bdr[mask_b]
+                                bdr_metrics["bayes_dr/A_t_mean"] = a_valid.mean().item()
+                                bdr_metrics["bayes_dr/A_t_std"] = (
+                                    a_valid.std().item() if a_valid.numel() > 1 else 0.0
+                                )
+                                bdr_metrics["bayes_dr/A_t_abs_mean"] = a_valid.abs().mean().item()
+
+                                # Per-sequence cumulative δ at the last response token
+                                # vs sequence-level R; high correlation ⇒ δ is
+                                # well-calibrated as a success-log-odds proxy.
+                                last_idx = response_mask.long().sum(dim=-1).clamp_min(1) - 1
+                                arange = torch.arange(cum_delta.shape[0], device=cum_delta.device)
+                                cum_delta_T = cum_delta[arange, last_idx]
+                                bdr_metrics["bayes_dr/cum_delta_T_mean"] = cum_delta_T.mean().item()
+                                if cum_delta_T.numel() > 1 and seq_R.numel() > 1:
+                                    a = cum_delta_T.float()
+                                    b = seq_R.float()
+                                    a_c = a - a.mean()
+                                    b_c = b - b.mean()
+                                    denom = (a_c.norm() * b_c.norm()).clamp_min(1e-8)
+                                    bdr_metrics["bayes_dr/corr_cum_delta_R"] = (
+                                        (a_c * b_c).sum() / denom
+                                    ).item()
+
+                        pg_loss, pg_metrics = compute_policy_loss_vanilla(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages_bdr,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                        )
+                        pg_metrics.update(bdr_metrics)
+                        pg_metrics["bayes_dr/prior_floor"] = bdr_prior_floor
+                        pg_metrics["bayes_dr/use_seq_anchor"] = float(bdr_use_seq_anchor)
+                        pg_metrics["bayes_dr/normalize_adv"] = float(bdr_normalize_adv)
+                        pg_metrics["bayes_dr/empty_target_batch"] = float(
                             self_distillation_mask.sum().item() == 0
                             if self_distillation_mask is not None
                             else 0.0

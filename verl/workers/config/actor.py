@@ -431,7 +431,7 @@ class PolicyLossConfig(BaseConfig):
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
 
     Args:
-        loss_mode (str): Loss function mode. Options: 'vanilla', 'clip-cov', 'kl-cov', 'gpg', 'sdpo', 'teacher_qv', 'vcac'.
+        loss_mode (str): Loss function mode. Options: 'vanilla', 'clip-cov', 'kl-cov', 'gpg', 'sdpo', 'teacher_qv', 'vcac', 'bayes_dr'.
         clip_cov_ratio (float): Ratio of tokens to be clipped for clip-cov loss.
         clip_cov_lb (float): Lower bound for clip-cov loss.
         clip_cov_ub (float): Upper bound for clip-cov loss.
@@ -452,6 +452,21 @@ class PolicyLossConfig(BaseConfig):
             advantage is purely A_t = vcac_lambda · δ_t (pure verdict-credit
             ablation — drops the GRPO baseline term). PPO clip mechanics are
             preserved either way.
+        bayes_dr_delta_clip (Optional[float]): Per-token clip on |δ_t| before
+            cumsum. None disables. Defends σ(Σδ) from teacher-logprob outliers.
+        bayes_dr_prior_floor (float): Clamp the per-prompt group mean R (used
+            as Bayes prior) to [floor, 1 - floor] before taking logit. Keeps
+            logit finite when a group is all-correct or all-wrong. 0.05 default.
+        bayes_dr_use_seq_anchor (bool): If True (default), A_t = R - b_t uses
+            raw per-sequence R in {0, 1}. If False, A_t = sign(A_GRPO) - b_t,
+            using the centered/standardized GRPO advantage's sign as a softer
+            anchor (useful when reward is noisy or graded).
+        bayes_dr_normalize_adv (bool): If True, divide A_t by its batch std
+            after construction. Default False since A_t = R - σ(·) is already
+            on a unit-scale.
+        bayes_dr_baseline_detach (bool): If True (default), b_t is detached
+            (control-variate role only — no gradient through the baseline).
+            False is unphysical for Bayes-DR; here only as a sanity ablation.
     """
 
     loss_mode: str = "vanilla"
@@ -465,6 +480,11 @@ class PolicyLossConfig(BaseConfig):
     vcac_clip: Optional[float] = None
     vcac_normalize: bool = False
     vcac_use_grpo_advantage: bool = True
+    bayes_dr_delta_clip: Optional[float] = None
+    bayes_dr_prior_floor: float = 0.05
+    bayes_dr_use_seq_anchor: bool = True
+    bayes_dr_normalize_adv: bool = False
+    bayes_dr_baseline_detach: bool = True
 
 
 @dataclass

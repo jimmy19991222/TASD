@@ -251,6 +251,25 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+
+        # Bayes-DR (loss_mode='bayes_dr') consumes per-sequence raw R and the
+        # per-prompt group mean as a Rao-Blackwell baseline anchor. These are
+        # cheap to compute and useful as diagnostics elsewhere, so we always
+        # write them when GRPO advantage is computed.
+        from collections import defaultdict as _dd
+        _seq_R = data.batch["token_level_rewards"].sum(dim=-1)  # [B]
+        _uids = data.non_tensor_batch["uid"]
+        _id2score = _dd(list)
+        for _i in range(_seq_R.shape[0]):
+            _id2score[_uids[_i]].append(_seq_R[_i].item())
+        _id2mean = {_k: float(np.mean(_v)) for _k, _v in _id2score.items()}
+        _grpo_group_mean = torch.tensor(
+            [_id2mean[_uids[_i]] for _i in range(_seq_R.shape[0])],
+            dtype=_seq_R.dtype,
+            device=_seq_R.device,
+        )
+        data.batch["seq_R"] = _seq_R.detach()
+        data.batch["grpo_group_mean"] = _grpo_group_mean.detach()
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -678,7 +697,7 @@ class RayPPOTrainer:
     ) -> Optional[tuple[DataProto, dict[str, float]]]:
         self_distillation_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
         loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
-        if self_distillation_cfg is None or loss_mode not in ("sdpo", "teacher_qv"):
+        if self_distillation_cfg is None or loss_mode not in ("sdpo", "teacher_qv", "vcac", "bayes_dr"):
             return None
 
         # Reward-Bayes branches build dual verdict-conditioned teacher prompts
@@ -697,6 +716,8 @@ class RayPPOTrainer:
             return self._build_cdm_self_distillation_batch(
                 batch=batch,
                 self_distillation_cfg=self_distillation_cfg,
+                reward_tensor=reward_tensor,
+                reward_extra_infos_dict=reward_extra_infos_dict,
             )
 
         device = batch.batch["input_ids"].device
@@ -1011,6 +1032,8 @@ class RayPPOTrainer:
         self,
         batch: DataProto,
         self_distillation_cfg: Any,
+        reward_tensor: Optional[torch.Tensor] = None,
+        reward_extra_infos_dict: Optional[dict[str, list]] = None,
     ) -> tuple[DataProto, dict[str, float]]:
         """Build counterfactual discriminative-marker dual teacher prompts.
 
@@ -1020,7 +1043,14 @@ class RayPPOTrainer:
         marker (`cdm_negative_template`). The loss branch (`loss_method='cdm'`)
         then takes log p_T^+ - log p_T^- on student-aligned topk indices.
 
-        See research/self_verified_marker_sdpo.md §3.7.
+        When `cdm_use_ref=True`, the user-side message is replaced by the SDPO
+        `ref` reprompt (sibling-success rollout via `reprompt_template` /
+        `solution_template`). Pos/neg teachers share an identical reprompted user
+        message; only the assistant-turn marker differs. Lexical copy bias from
+        the sibling cancels structurally in the JSD differential.
+
+        See research/self_verified_marker_sdpo.md §3.7 and
+        research/cdm_running_experiments.md §4.1.
         """
         device = batch.batch["input_ids"].device
         response_mask = batch.batch["response_mask"]
@@ -1031,13 +1061,79 @@ class RayPPOTrainer:
         pos_template = self_distillation_cfg.cdm_positive_template
         neg_template = self_distillation_cfg.cdm_negative_template
         fallback_text = self_distillation_cfg.self_verified_marker
+        use_ref = bool(self_distillation_cfg.get("cdm_use_ref", False))
 
-        # Build the teacher prompt once (no marker, no ref) — same prompt for
-        # both pos/neg teacher forwards; only the assistant-turn marker differs.
+        # Optional ref reprompt path: pos/neg teachers share the SAME reprompted
+        # user message (sibling success rollout). Verdict marker on the assistant
+        # turn is the only asymmetry → lexical copy of sibling cancels in the
+        # JSD differential, only verdict-conditional semantic following survives.
+        solution_strs: list[Optional[str]] = [None] * batch_size
+        feedback_list: list[Optional[str]] = [None] * batch_size
+        if use_ref:
+            if reward_tensor is None:
+                raise RuntimeError(
+                    "cdm_use_ref=True requires reward_tensor; ensure "
+                    "_maybe_build_self_distillation_batch passes it through."
+                )
+            response_texts = [
+                self.tokenizer.decode(ids, skip_special_tokens=True) for ids in responses
+            ]
+            feedback_list = self._collect_feedback(
+                include_environment_feedback=self_distillation_cfg.include_environment_feedback,
+                reward_extra_infos_dict=reward_extra_infos_dict,
+                batch_size=batch_size,
+            )
+            success_by_uid = self._collect_solutions_by_uid(
+                batch, reward_tensor,
+                success_reward_threshold=self_distillation_cfg.success_reward_threshold,
+            )
+            solution_strs = [
+                self._get_solution(
+                    i,
+                    success_by_uid,
+                    batch.non_tensor_batch["uid"],
+                    response_texts,
+                    self_distillation_cfg.dont_reprompt_on_self_success,
+                    self_distillation_cfg.get("remove_thinking_from_demonstration", False),
+                )
+                for i in range(batch_size)
+            ]
+
+        def _build_user_text(i: int) -> str:
+            if not use_ref:
+                return prompt_texts[i]
+            has_solution = solution_strs[i] is not None
+            has_feedback = feedback_list[i] is not None
+            feedback_only_without_solution = self_distillation_cfg.get(
+                "environment_feedback_only_without_solution", False
+            )
+            use_feedback = has_feedback and (
+                not feedback_only_without_solution or not has_solution
+            )
+            if not (has_solution or use_feedback):
+                return prompt_texts[i]
+            solution_section = ""
+            if has_solution:
+                solution_section = self_distillation_cfg.solution_template.format(
+                    successful_previous_attempt=solution_strs[i]
+                )
+            feedback_section = ""
+            if use_feedback:
+                feedback_section = self_distillation_cfg.feedback_template.format(
+                    feedback_raw=feedback_list[i]
+                )
+            return self_distillation_cfg.reprompt_template.format(
+                prompt=prompt_texts[i],
+                solution=solution_section,
+                feedback=feedback_section,
+            )
+
+        # Build the teacher prompt once — same prompt for both pos/neg teacher
+        # forwards (with optional ref reprompt); only the assistant-turn marker differs.
         messages = []
         for i in range(batch_size):
             system_messages = batch.non_tensor_batch["raw_prompt"][i][:-1]
-            messages.append(system_messages + [{"role": "user", "content": prompt_texts[i]}])
+            messages.append(system_messages + [{"role": "user", "content": _build_user_text(i)}])
 
         enable_thinking = (
             self.config.data.apply_chat_template_kwargs.get("enable_thinking", True)
@@ -1142,10 +1238,15 @@ class RayPPOTrainer:
             "teacher_position_ids_neg": neg_pos,
             "self_distillation_mask": self_distillation_mask,
         }
+        ref_solution_fraction = (
+            float(sum(s is not None for s in solution_strs)) / max(batch_size, 1)
+            if use_ref else 0.0
+        )
         metrics = {
             "self_distillation/cdm_gt_available_fraction": gt_available_fraction,
             "self_distillation/cdm_pos_marker_len_max": float(pos_marker_len),
             "self_distillation/cdm_neg_marker_len_max": float(neg_marker_len),
+            "self_distillation/cdm_ref_solution_fraction": ref_solution_fraction,
             "self_distillation/reprompt_sample_fraction": 1.0,
             "self_distillation/marker_active_fraction": 1.0,
         }
@@ -2036,6 +2137,9 @@ class RayPPOTrainer:
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
+            # Also save initial best (step 0) so OOD eval has a pre-training reference and
+            # the save-best pipeline is exercised before the first test_freq tick.
+            self._maybe_save_best_checkpoint(val_metrics)
             if self.config.trainer.get("val_only", False):
                 return
 
