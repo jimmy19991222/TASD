@@ -44,7 +44,7 @@ MAX_STEPS="${MAX_STEPS:-250}"  # 默认250步，smoke test可设为10
 train_data_path="${OSS_ROOT}/datasets/${DATASET}/train.parquet"
 val_data_path="${OSS_ROOT}/datasets/${DATASET}/test.parquet"
 model_path="${OSS_ROOT}/base_models/${MODEL_NAME}"
-save_path="${OSS_ROOT}/models/${JOB_NAME:-geodesic_vce_ablation}"
+save_path="${OSS_ROOT}/rl_models/${JOB_NAME:-geodesic_vce_ablation}"
 
 # ── 环境 ──────────────────────────────────────────────────────────────
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
@@ -87,6 +87,7 @@ HYDRA_ARGS=(
     trainer.total_epochs=30
     trainer.total_training_steps=${MAX_STEPS}
     trainer.save_freq=-1
+    trainer.max_actor_ckpt_to_keep=null
     trainer.save_best_metric="val-core/sciknoweval/acc/mean@16"
     trainer.n_gpus_per_node=4
     trainer.val_before_train=False

@@ -39,6 +39,18 @@ GEODESIC_TRUST_REGION="${GEODESIC_TRUST_REGION:-5.0}"
 # reverse-KL distillation; vocab-summed gradient has implicit exploration pressure.
 GRADIENT_MODE="${GRADIENT_MODE:-full_logit}"
 
+# ── Anti-collapse knobs (default values are no-ops, fully backwards compatible) ──
+#   ALPHA          : self_distillation.alpha — same knob SDPO uses for JSD mixing.
+#                    1.0 (default) = pure reverse-KL / forward-CE PG (legacy behaviour).
+#                    <1 mixes in (1-ALPHA) * KL(p_teacher || p_student) anti-collapse floor.
+#   ENTROPY_COEFF  : trainer-level entropy regularizer (already applied uniformly in dp_actor).
+#   USE_KL_LOSS    : KL-to-reference regularizer; needs KL_LOSS_COEF / KL_LOSS_TYPE.
+ALPHA="${ALPHA:-1.0}"
+ENTROPY_COEFF="${ENTROPY_COEFF:-0}"
+USE_KL_LOSS="${USE_KL_LOSS:-False}"
+KL_LOSS_COEF="${KL_LOSS_COEF:-0.001}"
+KL_LOSS_TYPE="${KL_LOSS_TYPE:-low_var_kl}"
+
 # full_logit gradient OR baseline_type='ce' both require vocab log probs on both sides.
 if [ "${GRADIENT_MODE}" = "full_logit" ] || [ "${BASELINE_TYPE}" = "ce" ]; then
     FULL_LOGIT="${FULL_LOGIT:-True}"
@@ -51,7 +63,7 @@ fi
 train_data_path="${OSS_ROOT}/datasets/${DATASET}/train.parquet"
 val_data_path="${OSS_ROOT}/datasets/${DATASET}/test.parquet"
 model_path="${OSS_ROOT}/base_models/${MODEL_NAME}"
-save_path="${OSS_ROOT}/models/${JOB_NAME:-teacher_qv_sweep}"
+save_path="${OSS_ROOT}/rl_models/${JOB_NAME:-teacher_qv_sweep}"
 
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
 unset VLLM_ATTENTION_BACKEND
@@ -79,12 +91,17 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.lr=${LR} \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     actor_rollout_ref.actor.ppo_mini_batch_size=32 \
+    actor_rollout_ref.actor.entropy_coeff=${ENTROPY_COEFF} \
+    actor_rollout_ref.actor.use_kl_loss=${USE_KL_LOSS} \
+    actor_rollout_ref.actor.kl_loss_coef=${KL_LOSS_COEF} \
+    actor_rollout_ref.actor.kl_loss_type=${KL_LOSS_TYPE} \
     actor_rollout_ref.actor.policy_loss.loss_mode=teacher_qv \
     actor_rollout_ref.actor.policy_loss.teacher_qv.baseline_type=${BASELINE_TYPE} \
     actor_rollout_ref.actor.policy_loss.teacher_qv.norm_by_std=${NORM_BY_STD} \
     actor_rollout_ref.actor.policy_loss.teacher_qv.clip_value=${CLIP_VALUE} \
     actor_rollout_ref.actor.policy_loss.teacher_qv.std_floor=${STD_FLOOR} \
     actor_rollout_ref.actor.policy_loss.teacher_qv.gradient_mode=${GRADIENT_MODE} \
+    actor_rollout_ref.actor.self_distillation.alpha=${ALPHA} \
     actor_rollout_ref.actor.self_distillation.full_logit_distillation=${FULL_LOGIT} \
     actor_rollout_ref.actor.self_distillation.distillation_topk=${DISTILL_TOPK} \
     actor_rollout_ref.actor.self_distillation.use_geodesic=${USE_GEODESIC} \
@@ -100,6 +117,7 @@ python -m verl.trainer.main_ppo \
     trainer.total_epochs=30 \
     trainer.total_training_steps=250 \
     trainer.save_freq=-1 \
+    trainer.max_actor_ckpt_to_keep=null \
     trainer.save_best_metric="val-core/sciknoweval/acc/mean@16" \
     trainer.n_gpus_per_node=4 \
     trainer.val_before_train=False \

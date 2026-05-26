@@ -60,6 +60,7 @@ _DEFAULT_CDM_NEG_TEMPLATE='This answer is verified incorrect, reference answer i
 CDM_POSITIVE_TEMPLATE="${CDM_POSITIVE_TEMPLATE:-$_DEFAULT_CDM_POS_TEMPLATE}"
 CDM_NEGATIVE_TEMPLATE="${CDM_NEGATIVE_TEMPLATE:-$_DEFAULT_CDM_NEG_TEMPLATE}"
 CDM_NEG_WEIGHT="${CDM_NEG_WEIGHT:-1.0}"
+CDM_USE_REF="${CDM_USE_REF:-False}"
 # CDM template variants — preset asymmetry shapes mimicking SDPO teacher_context_mode.
 # Done via a single no-whitespace flag because nebula --user_params splits on
 # whitespace and template strings contain spaces.
@@ -70,6 +71,10 @@ CDM_NEG_WEIGHT="${CDM_NEG_WEIGHT:-1.0}"
 #             without GT leakage; Δ_copy cancellation is moot (no GT to copy)
 #   bare    : strip "verified" lexical anchor — mimics SDPO `ref_and_marker` minimal
 #             form, tests whether the verdict signal needs the explicit "verified" cue
+#   ref_mk  : SDPO `ref` user-side reprompt + verdict-only assistant markers.
+#             Both teachers share an identical reprompted user message (carrying the
+#             sibling-success rollout); they differ ONLY in the assistant-side
+#             verdict marker. No GT required at training time.
 case "${CDM_TEMPLATE_VARIANT:-default}" in
     null)
         _CDM_NULL_TEMPLATE='Reference answer is {ground_truth}.'
@@ -84,6 +89,11 @@ case "${CDM_TEMPLATE_VARIANT:-default}" in
         CDM_POSITIVE_TEMPLATE='This answer is correct.'
         CDM_NEGATIVE_TEMPLATE='This answer is incorrect.'
         ;;
+    ref_mk)
+        CDM_POSITIVE_TEMPLATE='This answer is verified correct.'
+        CDM_NEGATIVE_TEMPLATE='This answer is verified incorrect.'
+        CDM_USE_REF="True"
+        ;;
     default) : ;;
     *) echo "WARNING: unknown CDM_TEMPLATE_VARIANT=${CDM_TEMPLATE_VARIANT}, falling back to default" ;;
 esac
@@ -95,6 +105,39 @@ if [ "${CDM_NULL_MODE:-False}" = "True" ]; then
     CDM_NEGATIVE_TEMPLATE="$_CDM_NULL_TEMPLATE"
 fi
 OVERCONFIDENCE_DAMPING="${OVERCONFIDENCE_DAMPING:-0.0}"           # 0.0 disables; sensible 0.5~2.0
+
+# Stop-token masking (thinking-bypass / length-collapse fix; see research/cdm_running_experiments.md §3.7.7)
+#   MASK_STOP_VOCAB=True : drop stop-token coords from D_α and renorm (primary fix)
+#   MASK_STOP_POS=True   : zero loss at timesteps where response token IS a stop token (control)
+#   STOP_TOKEN_IDS       : comma-separated token IDs. Qwen3 defaults: 151643,151645
+#                          (= <|endoftext|>, <|im_end|>). MUST be set non-empty when either
+#                          mask flag is True.
+MASK_STOP_VOCAB="${MASK_STOP_VOCAB:-False}"
+MASK_STOP_POS="${MASK_STOP_POS:-False}"
+STOP_TOKEN_IDS="${STOP_TOKEN_IDS:-151643,151645}"
+# Hydra list literal: turn 151643,151645 into [151643,151645]
+STOP_TOKEN_IDS_HYDRA="[${STOP_TOKEN_IDS}]"
+
+# Checkpoint / validation cadence
+#   TEST_FREQ : in-loop val frequency (steps). MUST be > 0 for _maybe_save_best_checkpoint
+#               to fire — otherwise save_best_metric is a no-op. Default 10 to capture
+#               early-peak dynamics (peaks often land at step 30-80 for this dataset).
+#   SAVE_FREQ : periodic ckpt save frequency (steps). -1 disables periodic save
+#               (best/ only). Default 10 produces 25 global_step_X/ ckpts over 250 steps
+#               for downstream trajectory analysis / per-step OOD probing.
+#   SAVE_HF_ONLY : if True, save_contents=[hf_model] only — drops FSDP shards
+#               (per-rank model + optimizer + extra). Saves ~3× disk (HF=16GB vs
+#               full=64GB per ckpt) but loses train-resume capability. Default True
+#               since downstream use is vLLM/AutoModel eval, not training resume.
+TEST_FREQ="${TEST_FREQ:-10}"
+SAVE_FREQ="${SAVE_FREQ:-10}"
+VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-True}"
+SAVE_HF_ONLY="${SAVE_HF_ONLY:-True}"
+if [ "${SAVE_HF_ONLY}" = "True" ]; then
+    SAVE_CONTENTS_HYDRA="[hf_model]"
+else
+    SAVE_CONTENTS_HYDRA="[model,optimizer,extra,hf_model]"
+fi
 # Marker / CDM modes require full-logit (for ΔH if damped; for clean signal anyway)
 if [ "${TEACHER_CONTEXT_MODE}" != "ref" ]; then
     FULL_LOGIT_DISTILLATION="True"
@@ -111,7 +154,7 @@ fi
 train_data_path="${OSS_ROOT}/datasets/${DATASET}/train.parquet"
 val_data_path="${OSS_ROOT}/datasets/${DATASET}/test.parquet"
 model_path="${OSS_ROOT}/base_models/${MODEL_NAME}"
-save_path="${OSS_ROOT}/models/${JOB_NAME:-sdpo_sweep}"
+save_path="${OSS_ROOT}/rl_models/${JOB_NAME:-sdpo_sweep}"
 
 # ── 环境 ──────────────────────────────────────────────────────────────
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
@@ -160,7 +203,12 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.self_distillation.cdm_positive_template="'${CDM_POSITIVE_TEMPLATE}'" \
     actor_rollout_ref.actor.self_distillation.cdm_negative_template="'${CDM_NEGATIVE_TEMPLATE}'" \
     actor_rollout_ref.actor.self_distillation.cdm_neg_weight=${CDM_NEG_WEIGHT} \
+    actor_rollout_ref.actor.self_distillation.cdm_use_ref=${CDM_USE_REF} \
     actor_rollout_ref.actor.self_distillation.overconfidence_damping=${OVERCONFIDENCE_DAMPING} \
+    actor_rollout_ref.actor.self_distillation.mask_stop_tokens_in_vocab=${MASK_STOP_VOCAB} \
+    actor_rollout_ref.actor.self_distillation.mask_stop_tokens_in_position=${MASK_STOP_POS} \
+    actor_rollout_ref.actor.self_distillation.stop_token_ids=${STOP_TOKEN_IDS_HYDRA} \
+    actor_rollout_ref.actor.checkpoint.save_contents=${SAVE_CONTENTS_HYDRA} \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.rollout.n=${ROLLOUT_N} \
     actor_rollout_ref.rollout.val_kwargs.n=16 \
@@ -169,10 +217,12 @@ python -m verl.trainer.main_ppo \
     algorithm.rollout_correction.rollout_is=token \
     trainer.total_epochs=30 \
     trainer.total_training_steps=250 \
-    trainer.save_freq=-1 \
+    trainer.save_freq=${SAVE_FREQ} \
+    trainer.max_actor_ckpt_to_keep=null \
+    trainer.test_freq=${TEST_FREQ} \
     trainer.save_best_metric="val-core/sciknoweval/acc/mean@16" \
     trainer.n_gpus_per_node=4 \
-    trainer.val_before_train=False \
+    trainer.val_before_train=${VAL_BEFORE_TRAIN} \
     trainer.default_local_dir="${save_path}" \
     trainer.project_name="${PROJECT_NAME:-Baselines}" \
     trainer.experiment_name="${JOB_NAME:-sdpo_sweep}" \

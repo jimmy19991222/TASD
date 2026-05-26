@@ -112,6 +112,7 @@ python -m verl.trainer.main_ppo \
     trainer.total_epochs=30 \
     trainer.total_training_steps=250 \
     trainer.save_freq=${SAVE_FREQ} \
+    trainer.max_actor_ckpt_to_keep=null \
     trainer.test_freq=${TEST_FREQ} \
     trainer.save_best_metric="val-core/livecodebench/acc/mean@16" \
     trainer.n_gpus_per_node=4 \

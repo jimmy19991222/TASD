@@ -17,6 +17,8 @@ check_env ROLLOUT_N
 check_env MODEL_NAME
 
 SEED="${SEED:-42}"
+# Decision-token mask top-p (1.0 = disabled, full SDPO)
+DECISION_TOP_P="${DECISION_TOP_P:-1.0}"
 
 # Checkpoint / validation cadence (mirrors sciknoweval parametric script)
 TEST_FREQ="${TEST_FREQ:-10}"
@@ -66,6 +68,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.self_distillation.alpha=${ALPHA} \
     actor_rollout_ref.actor.self_distillation.dont_reprompt_on_self_success=${DONT_REPROMPT_ON_SELF_SUCCESS} \
     actor_rollout_ref.actor.self_distillation.include_environment_feedback=False \
+    actor_rollout_ref.actor.self_distillation.decision_token_top_p=${DECISION_TOP_P} \
     actor_rollout_ref.actor.checkpoint.save_contents=${SAVE_CONTENTS_HYDRA} \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.rollout.n=${ROLLOUT_N} \
@@ -76,6 +79,7 @@ python -m verl.trainer.main_ppo \
     trainer.total_epochs=30 \
     trainer.total_training_steps=250 \
     trainer.save_freq=${SAVE_FREQ} \
+    trainer.max_actor_ckpt_to_keep=null \
     trainer.test_freq=${TEST_FREQ} \
     trainer.save_best_metric="val-core/livecodebench/acc/mean@16" \
     trainer.n_gpus_per_node=4 \

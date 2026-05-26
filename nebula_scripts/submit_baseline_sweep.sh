@@ -63,6 +63,9 @@ GRPO_MINI_BATCH_SIZES=("32")
 SDPO_LRS=("1e-5")
 SDPO_ALPHAS=("0.5")
 SDPO_DONT_REPROMPT_LIST=("False")
+# Decision-token mask top-p (1.0 = disabled, baseline). For ablation,
+# add values in (0,1) such as "0.3" or "0.5".
+SDPO_DECISION_TOP_P_LIST=("0.3")
 
 # =============================================================================
 TOTAL=0
@@ -177,14 +180,16 @@ if [[ "$ALGO" == "all" || "$ALGO" == "sdpo" ]]; then
         for LR in "${SDPO_LRS[@]}"; do
         for ALPHA in "${SDPO_ALPHAS[@]}"; do
         for DONT_REPROMPT_ON_SELF_SUCCESS in "${SDPO_DONT_REPROMPT_LIST[@]}"; do
+        for DECISION_TOP_P in "${SDPO_DECISION_TOP_P_LIST[@]}"; do
             DATASET_SHORT=$(echo "$DATASET" | tr '/' '-')
             LR_TAG=$(echo "$LR" | tr '-' '_')
             REPROMPT_TAG=$([ "$DONT_REPROMPT_ON_SELF_SUCCESS" = "True" ] && echo "noReprompt" || echo "reprompt")
+            DTP_TAG=$([ "$DECISION_TOP_P" = "1.0" ] && echo "" || echo "-dtp${DECISION_TOP_P}")
             CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
-            JOB_NAME="SDPO-${DATASET_SHORT}-alpha${ALPHA}-lr${LR_TAG}-${REPROMPT_TAG}-${MODEL_NAME}-${CURRENT_TIME}"
+            JOB_NAME="SDPO-${DATASET_SHORT}-alpha${ALPHA}-lr${LR_TAG}-${REPROMPT_TAG}${DTP_TAG}-${MODEL_NAME}-${CURRENT_TIME}"
             _submit_job "$SCRIPT_PATH" "$JOB_NAME" \
-                "--env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=DATASET=${DATASET} --env=MODEL_NAME=${MODEL_NAME} --env=LR=${LR} --env=ALPHA=${ALPHA} --env=DONT_REPROMPT_ON_SELF_SUCCESS=${DONT_REPROMPT_ON_SELF_SUCCESS} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=SEED=${SEED} --env=TEST_FREQ=${TEST_FREQ:-10} --env=SAVE_FREQ=${SAVE_FREQ:-10} --env=VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True} --env=SAVE_HF_ONLY=${SAVE_HF_ONLY:-True}"
-        done; done; done; done; done
+                "--env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=DATASET=${DATASET} --env=MODEL_NAME=${MODEL_NAME} --env=LR=${LR} --env=ALPHA=${ALPHA} --env=DONT_REPROMPT_ON_SELF_SUCCESS=${DONT_REPROMPT_ON_SELF_SUCCESS} --env=DECISION_TOP_P=${DECISION_TOP_P} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=SEED=${SEED} --env=TEST_FREQ=${TEST_FREQ:-10} --env=SAVE_FREQ=${SAVE_FREQ:-10} --env=VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True} --env=SAVE_HF_ONLY=${SAVE_HF_ONLY:-True}"
+        done; done; done; done; done; done
     fi
 
     # lcb_v6
@@ -194,13 +199,15 @@ if [[ "$ALGO" == "all" || "$ALGO" == "sdpo" ]]; then
         for LR in "${SDPO_LRS[@]}"; do
         for ALPHA in "${SDPO_ALPHAS[@]}"; do
         for DONT_REPROMPT_ON_SELF_SUCCESS in "${SDPO_DONT_REPROMPT_LIST[@]}"; do
+        for DECISION_TOP_P in "${SDPO_DECISION_TOP_P_LIST[@]}"; do
             LR_TAG=$(echo "$LR" | tr '-' '_')
             REPROMPT_TAG=$([ "$DONT_REPROMPT_ON_SELF_SUCCESS" = "True" ] && echo "noReprompt" || echo "reprompt")
+            DTP_TAG=$([ "$DECISION_TOP_P" = "1.0" ] && echo "" || echo "-dtp${DECISION_TOP_P}")
             CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
-            JOB_NAME="SDPO-lcb_v6-alpha${ALPHA}-lr${LR_TAG}-${REPROMPT_TAG}-${MODEL_NAME}-${CURRENT_TIME}"
+            JOB_NAME="SDPO-lcb_v6-alpha${ALPHA}-lr${LR_TAG}-${REPROMPT_TAG}${DTP_TAG}-${MODEL_NAME}-${CURRENT_TIME}"
             _submit_job "$SCRIPT_PATH" "$JOB_NAME" \
-                "--env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=MODEL_NAME=${MODEL_NAME} --env=LR=${LR} --env=ALPHA=${ALPHA} --env=DONT_REPROMPT_ON_SELF_SUCCESS=${DONT_REPROMPT_ON_SELF_SUCCESS} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=SEED=${SEED} --env=TEST_FREQ=${TEST_FREQ:-10} --env=SAVE_FREQ=${SAVE_FREQ:-10} --env=VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True} --env=SAVE_HF_ONLY=${SAVE_HF_ONLY:-True}"
-        done; done; done; done
+                "--env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=MODEL_NAME=${MODEL_NAME} --env=LR=${LR} --env=ALPHA=${ALPHA} --env=DONT_REPROMPT_ON_SELF_SUCCESS=${DONT_REPROMPT_ON_SELF_SUCCESS} --env=DECISION_TOP_P=${DECISION_TOP_P} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=SEED=${SEED} --env=TEST_FREQ=${TEST_FREQ:-10} --env=SAVE_FREQ=${SAVE_FREQ:-10} --env=VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True} --env=SAVE_HF_ONLY=${SAVE_HF_ONLY:-True}"
+        done; done; done; done; done
     fi
 
     # tooluse
@@ -210,13 +217,15 @@ if [[ "$ALGO" == "all" || "$ALGO" == "sdpo" ]]; then
         for LR in "${SDPO_LRS[@]}"; do
         for ALPHA in "${SDPO_ALPHAS[@]}"; do
         for DONT_REPROMPT_ON_SELF_SUCCESS in "${SDPO_DONT_REPROMPT_LIST[@]}"; do
+        for DECISION_TOP_P in "${SDPO_DECISION_TOP_P_LIST[@]}"; do
             LR_TAG=$(echo "$LR" | tr '-' '_')
             REPROMPT_TAG=$([ "$DONT_REPROMPT_ON_SELF_SUCCESS" = "True" ] && echo "noReprompt" || echo "reprompt")
+            DTP_TAG=$([ "$DECISION_TOP_P" = "1.0" ] && echo "" || echo "-dtp${DECISION_TOP_P}")
             CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
-            JOB_NAME="SDPO-tooluse-alpha${ALPHA}-lr${LR_TAG}-${REPROMPT_TAG}-${MODEL_NAME}-${CURRENT_TIME}"
+            JOB_NAME="SDPO-tooluse-alpha${ALPHA}-lr${LR_TAG}-${REPROMPT_TAG}${DTP_TAG}-${MODEL_NAME}-${CURRENT_TIME}"
             _submit_job "$SCRIPT_PATH" "$JOB_NAME" \
-                "--env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=MODEL_NAME=${MODEL_NAME} --env=LR=${LR} --env=ALPHA=${ALPHA} --env=DONT_REPROMPT_ON_SELF_SUCCESS=${DONT_REPROMPT_ON_SELF_SUCCESS} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=SEED=${SEED} --env=TEST_FREQ=${TEST_FREQ:-10} --env=SAVE_FREQ=${SAVE_FREQ:-10} --env=VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True} --env=SAVE_HF_ONLY=${SAVE_HF_ONLY:-True}"
-        done; done; done; done
+                "--env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=MODEL_NAME=${MODEL_NAME} --env=LR=${LR} --env=ALPHA=${ALPHA} --env=DONT_REPROMPT_ON_SELF_SUCCESS=${DONT_REPROMPT_ON_SELF_SUCCESS} --env=DECISION_TOP_P=${DECISION_TOP_P} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=SEED=${SEED} --env=TEST_FREQ=${TEST_FREQ:-10} --env=SAVE_FREQ=${SAVE_FREQ:-10} --env=VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True} --env=SAVE_HF_ONLY=${SAVE_HF_ONLY:-True}"
+        done; done; done; done; done
     fi
 fi
 
