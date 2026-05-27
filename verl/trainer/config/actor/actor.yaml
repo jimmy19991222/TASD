@@ -57,7 +57,7 @@ policy_loss:
   # # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: verl.workers.config.PolicyLossConfig
 
-  # Loss function mode: vanilla / clip-cov / kl-cov / gpg / sdpo / teacher_qv / vcac
+  # Loss function mode: vanilla / clip-cov / kl-cov / gpg / sdpo / teacher_qv / vcac / bayes_dr
   loss_mode: "vanilla"
 
   # Ratio of tokens to be clipped for clip-cov loss
@@ -109,6 +109,16 @@ policy_loss:
   # baseline term — pure verdict-credit ablation). PPO clip mechanics are
   # preserved either way (still goes through compute_policy_loss_vanilla).
   vcac_use_grpo_advantage: True
+
+  # Bayes-DR (Bayes Doubly-Robust): per-token Rao-Blackwell baseline from CDM
+  # dual-teacher δ_t. Active only when loss_mode == "bayes_dr".
+  #   b_t = σ( Σ_{s<t} δ_s + logit ḡ_GRPO(x) )
+  #   A_t = R − b_t
+  bayes_dr_delta_clip: null
+  bayes_dr_prior_floor: 0.05
+  bayes_dr_use_seq_anchor: True
+  bayes_dr_normalize_adv: False
+  bayes_dr_baseline_detach: True
 
 # self-distillation config
 self_distillation:
