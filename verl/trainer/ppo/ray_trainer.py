@@ -1678,8 +1678,11 @@ class RayPPOTrainer:
             if self.config.trainer.default_hdfs_dir is None
             else os.path.join(self.config.trainer.default_hdfs_dir, "best", "actor")
         )
+        # max_ckpt_to_keep=None: best always overwrites the same path, and the
+        # checkpoint manager's previous_saved_paths is shared with regular saves —
+        # using max_ckpt_to_keep=1 here would delete regular step checkpoints.
         self.actor_rollout_wg.save_checkpoint(
-            actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=1
+            actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=None
         )
         local_mkdir_safe(best_folder)
         best_meta_path = os.path.join(best_folder, "best_step.txt")
