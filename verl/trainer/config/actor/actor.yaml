@@ -75,6 +75,14 @@ policy_loss:
   # KL divergence penalty coefficient
   ppo_kl_coef: 0.1
 
+  # How the teacher-guided branching rollout's branch_token_mask weights
+  # the policy loss. One of {all, mask, only}.
+  #   all  : default — every response token contributes (mask is ignored).
+  #   mask : zero-out branch tokens before PG aggregation (response_mask AND NOT branch_token_mask).
+  #   only : only branch tokens contribute (response_mask AND branch_token_mask).
+  # No-op when branch_token_mask is absent from the data batch.
+  branch_token_loss_mode: "all"
+
 # self-distillation config
 self_distillation:
 

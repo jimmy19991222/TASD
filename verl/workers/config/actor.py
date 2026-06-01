@@ -175,6 +175,19 @@ class PolicyLossConfig(BaseConfig):
         clip_cov_ub (float): Upper bound for clip-cov loss.
         kl_cov_ratio (float): Ratio of tokens to be applied KL penalty for kl-cov loss.
         ppo_kl_coef (float): KL divergence penalty coefficient.
+        branch_token_loss_mode (str): How the teacher-guided branching rollout's
+            ``branch_token_mask`` weights the policy loss. Options:
+
+            - ``all`` (default): mask is ignored; every response token contributes
+              to the loss (response_mask only).
+            - ``mask``: zero-out the branch tokens before PG aggregation
+              (response_mask AND NOT branch_token_mask). Useful to remove
+              off-policy bias of teacher-injected tokens.
+            - ``only``: only branch tokens contribute (response_mask AND
+              branch_token_mask). The "decision-token-only" hypothesis ablation.
+
+            No-op when ``branch_token_mask`` is absent from the data batch
+            (i.e., branching rollout is disabled).
     """
 
     loss_mode: str = "vanilla"
@@ -183,6 +196,15 @@ class PolicyLossConfig(BaseConfig):
     clip_cov_ub: float = 5.0
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
+    branch_token_loss_mode: str = "all"
+
+    def __post_init__(self):
+        valid = {"all", "mask", "only"}
+        if self.branch_token_loss_mode not in valid:
+            raise ValueError(
+                f"policy_loss.branch_token_loss_mode must be one of {valid}, "
+                f"got {self.branch_token_loss_mode!r}"
+            )
 
 
 @dataclass

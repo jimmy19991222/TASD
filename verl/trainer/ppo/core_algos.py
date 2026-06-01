@@ -306,6 +306,12 @@ def compute_grpo_outcome_advantage(
     id2mean = {}
     id2std = {}
 
+    # Floor the per-group std denominator. Without this, sibling rows produced
+    # by the teacher-guided branching rollout — which share most of the
+    # response and often collapse to the same reward — drive id_std toward 0
+    # and the (score - mean) / (std + eps) advantage explodes.
+    adv_std_floor = float(getattr(config, "adv_std_floor", 0.0)) if config is not None else 0.0
+
     with torch.no_grad():
         bsz = scores.shape[0]
         for i in range(bsz):
@@ -318,6 +324,8 @@ def compute_grpo_outcome_advantage(
                 scores_tensor = torch.stack(id2score[idx])
                 id2mean[idx] = torch.mean(scores_tensor)
                 id2std[idx] = torch.std(scores_tensor)
+                if adv_std_floor > 0.0:
+                    id2std[idx] = torch.clamp(id2std[idx], min=adv_std_floor)
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
         for i in range(bsz):

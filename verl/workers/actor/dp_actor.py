@@ -856,12 +856,42 @@ class DataParallelPPOActor(BasePPOActor):
                         # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
                         policy_loss_fn = get_policy_loss_fn(loss_mode)
 
+                        # Teacher-guided branching: optionally re-mask the response
+                        # tokens by the teacher-injected branch_token_mask. Three
+                        # modes (default 'all' = unchanged):
+                        #   all  : no-op (every response token contributes).
+                        #   mask : zero-out branch tokens before PG aggregation.
+                        #   only : keep ONLY branch tokens (decision-token-only PG).
+                        effective_response_mask = response_mask
+                        branch_token_mask = model_inputs.get("branch_token_mask", None)
+                        branch_loss_mode = self.config.policy_loss.get("branch_token_loss_mode", "all")
+                        if branch_token_mask is not None and branch_loss_mode != "all":
+                            btm = branch_token_mask.to(response_mask.device).to(response_mask.dtype)
+                            if branch_loss_mode == "mask":
+                                effective_response_mask = response_mask * (1 - btm)
+                            elif branch_loss_mode == "only":
+                                effective_response_mask = response_mask * btm
+                            # Diagnostics so we can confirm the mask is doing
+                            # what we expect on a smoke run.
+                            with torch.no_grad():
+                                base_active = response_mask.sum().clamp_min(1.0)
+                                eff_active = effective_response_mask.sum()
+                                micro_batch_metrics["branching/loss_mode_id"] = float(
+                                    {"all": 0, "mask": 1, "only": 2}[branch_loss_mode]
+                                )
+                                micro_batch_metrics["branching/active_token_ratio"] = (
+                                    eff_active / base_active
+                                ).item()
+                                micro_batch_metrics["branching/branch_token_count"] = (
+                                    btm.sum().item()
+                                )
+
                         # Compute policy loss (any function is expected to return 2 values)
                         pg_loss, pg_metrics = policy_loss_fn(
                             old_log_prob=old_log_prob,
                             log_prob=log_prob,
                             advantages=advantages,
-                            response_mask=response_mask,
+                            response_mask=effective_response_mask,
                             loss_agg_mode=loss_agg_mode,
                             config=self.config,
                             rollout_is_weights=rollout_is_weights,

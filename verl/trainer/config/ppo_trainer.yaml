@@ -83,6 +83,13 @@ algorithm:
   # Whether to normalize advantages by std (specific to GRPO)
   norm_adv_by_std_in_grpo: True
 
+  # Lower bound on the GRPO group-std denominator. Without it, sibling rows
+  # produced by the teacher-guided branching rollout (which often share most
+  # of the response and sometimes collapse to the same reward) drive id_std
+  # toward 0, blowing up advantage = (score - mean) / (std + eps). 0.0
+  # preserves legacy behaviour; recommended 0.05 when branching is enabled.
+  adv_std_floor: 0.0
+
   # Whether to enable in-reward KL penalty
   use_kl_in_reward: False
 

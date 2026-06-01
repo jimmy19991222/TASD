@@ -612,3 +612,10 @@ class AlgoConfig(BaseConfig):
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None
+    # Lower bound on the GRPO group-std denominator. Without it, sibling rows
+    # produced by the teacher-guided branching rollout (which often share most
+    # of the response and sometimes collapse to the same reward) drive id_std
+    # toward 0, blowing up advantage = (score - mean) / (std + eps). Set to a
+    # small positive number (e.g. 0.05) to clip the denominator. 0.0 (default)
+    # preserves legacy behaviour.
+    adv_std_floor: float = 0.0
