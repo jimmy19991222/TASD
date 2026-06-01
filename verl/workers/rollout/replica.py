@@ -34,7 +34,12 @@ class TokenOutput(BaseModel):
     token_ids: list[int]
     """response token ids"""
     log_probs: Optional[list[float]] = None
-    """logprobs of response token ids"""
+    """logprobs of response token ids (realized token only)"""
+    top_logprobs: Optional[list[dict[int, float]]] = None
+    """Per-position top-K logprobs as token_id -> logprob dicts. Populated only when the
+    caller passes ``sampling_params['logprobs']`` as an int K >= 1 (vLLM Logprob API).
+    Used by the teacher-guided branching rollout to compute per-token entropy and to
+    score student top-K candidates against the teacher distribution."""
     routed_experts: Optional[Any] = None
     """routed experts of response token ids"""
     stop_reason: Optional[str] = None

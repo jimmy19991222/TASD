@@ -492,7 +492,18 @@ class vLLMHttpServer:
         assert max_tokens <= max_possible_tokens, (
             f"max_tokens {max_tokens} exceeds available context space {max_possible_tokens}"
         )
-        sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
+        # logprobs param normalisation:
+        #   - bool True / unset-True   -> 0   (just the realized token, legacy behaviour)
+        #   - bool False / not-supplied-> None (no logprobs)
+        #   - int K >= 1               -> K   (vLLM returns top-K logprobs per generated token,
+        #                                       used by the teacher-guided branching rollout)
+        _lp = sampling_params.pop("logprobs", False)
+        if isinstance(_lp, bool):
+            sampling_params["logprobs"] = 0 if _lp else None
+        elif isinstance(_lp, int):
+            sampling_params["logprobs"] = _lp if _lp >= 0 else None
+        else:
+            sampling_params["logprobs"] = None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
@@ -530,8 +541,19 @@ class vLLMHttpServer:
 
         token_ids = final_res.outputs[0].token_ids
         log_probs = None
+        top_logprobs = None
         if sampling_params.logprobs is not None:
-            log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
+            raw_logprobs = final_res.outputs[0].logprobs
+            log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(raw_logprobs)]
+            if sampling_params.logprobs >= 1:
+                # vLLM's logprobs[i] is a dict[token_id, Logprob(logprob=..., rank=..., decoded_token=...)]
+                # of length K+1 (the realized token plus its top-K alternatives, possibly overlapping).
+                # Surface as plain {token_id: float} dicts so downstream code (e.g. branching_utils
+                # entropy + teacher-pick) doesn't import vLLM's Logprob class.
+                top_logprobs = [
+                    {tok_id: lp.logprob for tok_id, lp in lp_dict.items()}
+                    for lp_dict in raw_logprobs
+                ]
 
         routed_experts = None
         if self.config.enable_rollout_routing_replay:
@@ -547,7 +569,11 @@ class vLLMHttpServer:
             stop_reason = finish_reason  # for more stop reason in the future
 
         return TokenOutput(
-            token_ids=token_ids, log_probs=log_probs, routed_experts=routed_experts, stop_reason=stop_reason
+            token_ids=token_ids,
+            log_probs=log_probs,
+            top_logprobs=top_logprobs,
+            routed_experts=routed_experts,
+            stop_reason=stop_reason,
         )
 
     async def wake_up(self):
