@@ -21,7 +21,17 @@ OSS_ENDPOINT="oss-cn-hangzhou-zmf.aliyuncs.com"
 OSS_BUCKET="lazada-ai-model"
 CLUSTER_FILE="nebula_scripts/cluster.json"
 CUSTOM_DOCKER_IMAGE="${CUSTOM_DOCKER_IMAGE:-hub.docker.alibaba-inc.com/mdl/notebook_saved:loujieming.ljm_yueqiu_sdpo_env_torch260_20260324155942}"
-PROJECT_NAME="Baselines_clean"
+PROJECT_NAME="${PROJECT_NAME:-Baselines_clean}"
+
+# Capture branch / commit so each Nebula job logs them into SwanLab
+GIT_BRANCH="${GIT_BRANCH:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)}"
+GIT_COMMIT="${GIT_COMMIT:-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)}"
+
+# Checkpoint / validation cadence env defaults forwarded into every job
+TEST_FREQ="${TEST_FREQ:-10}"
+SAVE_FREQ="${SAVE_FREQ:-10}"
+VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-True}"
+SAVE_HF_ONLY="${SAVE_HF_ONLY:-True}"
 
 # ── 命令行参数解析 ──────────────────────────────────────────────────────
 DRY_RUN=false
@@ -129,7 +139,7 @@ if [[ "$ALGO" == "all" || "$ALGO" == "grpo" ]]; then
             CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
             JOB_NAME="GRPO-${DATASET_SHORT}-mbs${MINI_BATCH_SIZE}-lr${LR_TAG}-${MODEL_NAME}-${CURRENT_TIME}"
             _submit_job "$SCRIPT_PATH" "$JOB_NAME" \
-                "--env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=DATASET=${DATASET} --env=MODEL_NAME=${MODEL_NAME} --env=LR=${LR} --env=MINI_BATCH_SIZE=${MINI_BATCH_SIZE} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=SEED=${SEED}"
+                "--env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=DATASET=${DATASET} --env=MODEL_NAME=${MODEL_NAME} --env=LR=${LR} --env=MINI_BATCH_SIZE=${MINI_BATCH_SIZE} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=SEED=${SEED} --env=TEST_FREQ=${TEST_FREQ} --env=SAVE_FREQ=${SAVE_FREQ} --env=VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN} --env=SAVE_HF_ONLY=${SAVE_HF_ONLY} --env=GIT_BRANCH=${GIT_BRANCH} --env=GIT_COMMIT=${GIT_COMMIT}"
         done; done; done; done
     fi
 
@@ -143,7 +153,7 @@ if [[ "$ALGO" == "all" || "$ALGO" == "grpo" ]]; then
             CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
             JOB_NAME="GRPO-lcb_v6-mbs${MINI_BATCH_SIZE}-lr${LR_TAG}-${MODEL_NAME}-${CURRENT_TIME}"
             _submit_job "$SCRIPT_PATH" "$JOB_NAME" \
-                "--env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=MODEL_NAME=${MODEL_NAME} --env=LR=${LR} --env=MINI_BATCH_SIZE=${MINI_BATCH_SIZE} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=SEED=${SEED}"
+                "--env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=MODEL_NAME=${MODEL_NAME} --env=LR=${LR} --env=MINI_BATCH_SIZE=${MINI_BATCH_SIZE} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=SEED=${SEED} --env=TEST_FREQ=${TEST_FREQ} --env=SAVE_FREQ=${SAVE_FREQ} --env=VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN} --env=SAVE_HF_ONLY=${SAVE_HF_ONLY} --env=GIT_BRANCH=${GIT_BRANCH} --env=GIT_COMMIT=${GIT_COMMIT}"
         done; done; done
     fi
 fi
@@ -168,7 +178,7 @@ if [[ "$ALGO" == "all" || "$ALGO" == "sdpo" ]]; then
             CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
             JOB_NAME="SDPO-${DATASET_SHORT}-alpha${ALPHA}-lr${LR_TAG}-${REPROMPT_TAG}-${MODEL_NAME}-${CURRENT_TIME}"
             _submit_job "$SCRIPT_PATH" "$JOB_NAME" \
-                "--env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=DATASET=${DATASET} --env=MODEL_NAME=${MODEL_NAME} --env=LR=${LR} --env=ALPHA=${ALPHA} --env=DONT_REPROMPT_ON_SELF_SUCCESS=${DONT_REPROMPT_ON_SELF_SUCCESS} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=SEED=${SEED}"
+                "--env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=DATASET=${DATASET} --env=MODEL_NAME=${MODEL_NAME} --env=LR=${LR} --env=ALPHA=${ALPHA} --env=DONT_REPROMPT_ON_SELF_SUCCESS=${DONT_REPROMPT_ON_SELF_SUCCESS} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=SEED=${SEED} --env=TEST_FREQ=${TEST_FREQ} --env=SAVE_FREQ=${SAVE_FREQ} --env=VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN} --env=SAVE_HF_ONLY=${SAVE_HF_ONLY} --env=GIT_BRANCH=${GIT_BRANCH} --env=GIT_COMMIT=${GIT_COMMIT}"
         done; done; done; done; done
     fi
 
@@ -184,7 +194,7 @@ if [[ "$ALGO" == "all" || "$ALGO" == "sdpo" ]]; then
             CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
             JOB_NAME="SDPO-lcb_v6-alpha${ALPHA}-lr${LR_TAG}-${REPROMPT_TAG}-${MODEL_NAME}-${CURRENT_TIME}"
             _submit_job "$SCRIPT_PATH" "$JOB_NAME" \
-                "--env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=MODEL_NAME=${MODEL_NAME} --env=LR=${LR} --env=ALPHA=${ALPHA} --env=DONT_REPROMPT_ON_SELF_SUCCESS=${DONT_REPROMPT_ON_SELF_SUCCESS} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=SEED=${SEED}"
+                "--env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=MODEL_NAME=${MODEL_NAME} --env=LR=${LR} --env=ALPHA=${ALPHA} --env=DONT_REPROMPT_ON_SELF_SUCCESS=${DONT_REPROMPT_ON_SELF_SUCCESS} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=SEED=${SEED} --env=TEST_FREQ=${TEST_FREQ} --env=SAVE_FREQ=${SAVE_FREQ} --env=VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN} --env=SAVE_HF_ONLY=${SAVE_HF_ONLY} --env=GIT_BRANCH=${GIT_BRANCH} --env=GIT_COMMIT=${GIT_COMMIT}"
         done; done; done; done
     fi
 fi
