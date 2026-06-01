@@ -147,6 +147,29 @@ self_distillation:
 
     {feedback_raw}
 
+  # How the teacher's privileged context is constructed.
+  # - "ref"       : peer-rollout response from same uid (legacy SDPO).
+  # - "ref_gt"    : same shape as "ref" but solution comes from parquet
+  #                 reward_model[i]["ground_truth"] instead of peer rollouts.
+  # - "marker"    : leave the user message untouched; prepend a static verdict
+  #                 marker between the assistant role-start and the response.
+  # - "gt_marker" : leave the user message untouched; prepend a per-sample
+  #                 marker derived from the parquet ground_truth via gt_marker_template.
+  teacher_context_mode: ref
+
+  # Optional override for the verified-correct marker text (default = constant in
+  # verl/utils/verdict_markers.py). Used by teacher_context_mode in {marker, gt_marker}.
+  verdict_right_marker: null
+
+  # Optional override for the verified-incorrect marker text. Currently unused on
+  # baseline; reserved for future contrastive teacher modes.
+  verdict_wrong_marker: null
+
+  # Template used by teacher_context_mode == "gt_marker". Available placeholders:
+  # {ground_truth}.
+  gt_marker_template: |-
+    [Meta: the assistant response below is verified to correctly answer the question. Reference answer: {ground_truth}]
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 

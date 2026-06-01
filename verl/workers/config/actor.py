@@ -60,6 +60,14 @@ class SelfDistillationConfig(BaseConfig):
         environment_feedback_only_without_solution (bool): If True, only use feedback when no solution is available (ignore feedback when solution exists).
         reprompt_template_feedback (str): Template for reprompting with feedback but no solution.
         reprompt_template_feedback_solution (str): Template for reprompting with both feedback and solution.
+        teacher_context_mode (str): How the teacher's privileged context is constructed.
+            - "ref": peer-rollout response from same uid (default; legacy SDPO behaviour).
+            - "marker": prepend a static verdict marker to the assistant response.
+            - "gt_marker": prepend a per-sample marker derived from the parquet ``ground_truth`` field.
+            - "ref_gt": use the parquet ``ground_truth`` field as the ref text (does not require peer rollouts).
+        verdict_right_marker (Optional[str]): Override for the verified-correct marker (default: VERDICT_RIGHT_MARKER).
+        verdict_wrong_marker (Optional[str]): Override for the verified-incorrect marker (default: VERDICT_WRONG_MARKER).
+        gt_marker_template (str): Template used by ``gt_marker`` mode. Available placeholders: ``{ground_truth}``.
     """
 
     full_logit_distillation: bool = True
@@ -90,6 +98,13 @@ class SelfDistillationConfig(BaseConfig):
     )
     include_environment_feedback: bool = False
     environment_feedback_only_without_solution: bool = False
+    teacher_context_mode: str = "ref"
+    verdict_right_marker: Optional[str] = None
+    verdict_wrong_marker: Optional[str] = None
+    gt_marker_template: str = (
+        "[Meta: the assistant response below is verified to correctly answer the question. "
+        "Reference answer: {ground_truth}]"
+    )
 
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:
@@ -110,6 +125,12 @@ class SelfDistillationConfig(BaseConfig):
             )
         if self.is_clip is not None and self.is_clip <= 0:
             raise ValueError(f"self_distillation.is_clip must be positive, got {self.is_clip}")
+        valid_teacher_context_modes = ["ref", "marker", "gt_marker", "ref_gt"]
+        if self.teacher_context_mode not in valid_teacher_context_modes:
+            raise ValueError(
+                "self_distillation.teacher_context_mode must be one of "
+                f"{valid_teacher_context_modes}, got {self.teacher_context_mode}"
+            )
 
 
 @dataclass
