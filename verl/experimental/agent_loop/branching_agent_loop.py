@@ -6,7 +6,7 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""Teacher-guided branching rollout — agent loop scaffold.
+"""Teacher-guided branching rollout — agent loop.
 
 For each prompt we generate a single student trajectory while tracking per-token
 entropy. At positions where the entropy spikes (rolling z-score > σ, with σ
@@ -24,9 +24,9 @@ deterministic id derived from the prompt; the first sibling row to start
 performs the full branching computation and stores 2^n_splits leaves; all
 subsequent rows simply await the cache and pluck their assigned leaf.
 
-Phase 1c.1 (this commit): scaffold + coordination layer + a STUB pipeline
-that mirrors SingleTurnAgentLoop behaviour when the cache is hot. The real
-generate→detect→branch logic ships in Phase 1c.2.
+Phase 1c.1 shipped the scaffold + coordination layer + a stub pipeline.
+Phase 1c.2 (this file post-edit) replaces the stub with the real
+generate → spike-detect → teacher-query → branch algorithm.
 
 See research/teacher_branching_rollout.md.
 """
@@ -48,9 +48,13 @@ from verl.experimental.agent_loop.agent_loop import (
 )
 from verl.tools.utils.tool_registry import initialize_tools_from_config
 from verl.utils.profiler import simple_timer
+from verl.utils.teacher_prompt import build_marker_text, build_ref_gt_messages
 from verl.workers.rollout.vllm_rollout.branching_utils import (
     BranchNode,
     collect_leaves,
+    entropy_from_topk_logprobs,
+    find_decision_positions_with_sigma_relaxation,
+    pick_teacher_branches,
 )
 
 logger = logging.getLogger(__file__)
@@ -165,6 +169,9 @@ class BranchingAgentLoop(AgentLoopBase):
         prompt_ids = await self.apply_chat_template(
             messages, tools=self.tool_schemas, images=images, videos=videos,
         )
+        # Stash the root prompt length so _query_teacher_topk can stitch
+        # priv_ctx + student_response_so_far without recomputing the boundary.
+        self._root_prompt_len = len(prompt_ids)
 
         # Cache key shared across the 2^n_splits sibling rows of this prompt.
         gen_step = int(kwargs.get("generation_step", 0))
@@ -220,6 +227,10 @@ class BranchingAgentLoop(AgentLoopBase):
         leaf.metrics = AgentLoopMetrics(**metrics) if am_owner else AgentLoopMetrics()
         return leaf
 
+    # ------------------------------------------------------------------
+    # Pipeline entry — owner row only (siblings await the cache).
+    # ------------------------------------------------------------------
+
     async def _run_branching_pipeline(
         self,
         *,
@@ -230,89 +241,417 @@ class BranchingAgentLoop(AgentLoopBase):
         multi_modal_data: dict[str, Any],
         kwargs: dict[str, Any],
     ) -> list[AgentLoopOutput]:
-        """Generate 2^n_splits leaves with shared prefixes. STUB in 1c.1.
+        """Generate 2^n_splits shared-prefix leaves via teacher-guided branching.
 
-        Phase 1c.1 fallback: until the real branching pipeline lands in 1c.2,
-        produce ``n_leaves`` independent rollouts (no branching, no shared
-        prefix). This keeps the pipeline shape compatible with downstream code
-        and lets us land 1c.1 incrementally. With branching.enabled=False at
-        the YAML level the regular SingleTurnAgentLoop is used instead, so
-        this fallback only fires when the user explicitly opted in.
+        Algorithm (see research/teacher_branching_rollout.md §4-§7):
+
+        1. Build privileged-context prompt ids once (mode dispatch in
+           ``_build_privileged_context``).
+        2. Run the student initial chain with ``logprobs=top_k`` so we get
+           per-position top-K dicts, used both for (truncated) entropy
+           estimation and for teacher branch-point scoring.
+        3. Recurse: at each segment find decision positions via σ-relaxation,
+           teacher-pick (argmax, argmin) within student top-K, branch into
+           two children, generate continuation per child, recurse. Fresh
+           detector per segment with adaptive protect_window.
+        4. Collect leaves; pad/truncate to exactly ``n_leaves`` so the per-
+           sibling claim is well-defined.
+
+        All vLLM calls share a single ``traj_id`` so AsyncLLMServerManager's
+        sticky LRU keeps them on the same replica → prefix cache hits.
         """
-        # Inject logprobs=top_k so when 1c.2 lands we already have the data the
-        # real pipeline needs.
-        sp = dict(sampling_params)
-        sp.setdefault("logprobs", int(self.branching_cfg.top_k))
+        cfg = self.branching_cfg
+        K = int(cfg.top_k)
+        n_splits = int(cfg.n_splits)
+        max_depth = int(cfg.effective_max_branch_depth)
+        traj_id = uuid4().hex
 
-        leaves: list[AgentLoopOutput] = []
-        for _ in range(self.n_leaves):
-            output = await self.server_manager.generate(
-                request_id=uuid4().hex,
-                prompt_ids=prompt_ids,
-                sampling_params=sp,
-                image_data=images,
-                video_data=videos,
+        priv_ctx_ids, priv_ctx_meta = await self._build_privileged_context(
+            prompt_ids=prompt_ids, kwargs=kwargs, images=images, videos=videos,
+        )
+
+        student_sp = self._student_sampling_params(sampling_params, max_tokens=None)
+
+        # 1. Student initial chain.
+        init_out = await self.server_manager.generate(
+            request_id=traj_id,
+            prompt_ids=prompt_ids,
+            sampling_params=student_sp,
+            image_data=images,
+            video_data=videos,
+        )
+        init_tokens = list(init_out.token_ids)
+        init_top = list(init_out.top_logprobs or [])
+        if not init_top:
+            return self._fallback_n_copies(
+                prompt_ids=prompt_ids, response_tokens=init_tokens,
+                response_logprobs=init_out.log_probs, multi_modal_data=multi_modal_data,
+                reason="no_top_logprobs",
             )
-            response_mask = [1] * len(output.token_ids)
-            leaves.append(
-                AgentLoopOutput(
-                    prompt_ids=prompt_ids,
-                    response_ids=output.token_ids[: self.response_length],
-                    response_mask=response_mask[: self.response_length],
-                    response_logprobs=(
-                        output.log_probs[: self.response_length] if output.log_probs else None
-                    ),
-                    routed_experts=(
-                        output.routed_experts[: len(prompt_ids) + self.response_length]
-                        if output.routed_experts is not None
-                        else None
-                    ),
-                    multi_modal_data=multi_modal_data,
-                    num_turns=2,
-                    metrics=AgentLoopMetrics(),
-                    extra_fields={
-                        "branching_phase": "1c.1_stub",
-                        "branching_top_k": int(self.branching_cfg.top_k),
-                    },
-                )
-            )
+        init_entropies = [entropy_from_topk_logprobs(d) for d in init_top]
+
+        # 2. Recursive split.
+        diag = {
+            "sigma_relaxations": 0,
+            "teacher_intersect_misses": 0,
+            "split_attempts": 0,
+            "splits_succeeded": 0,
+        }
+        root = await self._split_recursive(
+            prefix_ids=list(prompt_ids),
+            segment_tokens=init_tokens,
+            segment_entropies=init_entropies,
+            segment_top_logprobs=init_top,
+            segment_realized_logprobs=list(init_out.log_probs or [0.0] * len(init_tokens)),
+            depth=0,
+            target=n_splits,
+            traj_id=traj_id,
+            priv_ctx_ids=priv_ctx_ids,
+            student_sp=student_sp,
+            images=images,
+            videos=videos,
+            cfg=cfg,
+            max_depth=max_depth,
+            diag=diag,
+        )
+
+        # 3. Flatten + pad.
+        leaves = self._flatten_tree_to_leaves(
+            root=root, multi_modal_data=multi_modal_data, diag=diag, priv_ctx_meta=priv_ctx_meta,
+        )
+        leaves = self._pad_leaves_to_n(leaves, self.n_leaves)
         return leaves
 
     # ------------------------------------------------------------------
-    # Helpers (used by 1c.2 — kept here so tests can target them).
+    # Privileged context builder (mode dispatch).
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _build_branching_tree(prompt_ids: list[int]) -> BranchNode:
-        """Construct the root of the branching tree."""
-        return BranchNode(
-            prefix_tokens=list(prompt_ids),
-            segment_tokens=[],
-            segment_entropies=[],
-            segment_logprobs=[],
-            segment_branch_mask=[],
-            depth=0,
+    async def _build_privileged_context(
+        self,
+        *,
+        prompt_ids: list[int],
+        kwargs: dict[str, Any],
+        images: Optional[list[Any]],
+        videos: Optional[list[Any]],
+    ) -> tuple[list[int], dict[str, Any]]:
+        """Construct privileged-context prompt ids per ``teacher_context_mode``.
+
+        Returns (priv_ctx_ids, meta) where meta carries diagnostics (mode used,
+        gt_available, marker_len, etc).
+        """
+        cfg = self.branching_cfg
+        mode = str(cfg.teacher_context_mode)
+        rm = kwargs.get("reward_model") or {}
+        gt = rm.get("ground_truth") if isinstance(rm, dict) else None
+        if isinstance(gt, str) and not gt:
+            gt = None
+
+        if mode == "ref_gt":
+            messages = build_ref_gt_messages(
+                raw_prompt=list(kwargs.get("raw_prompt", [])),
+                ground_truth=gt,
+                self_distillation_cfg=cfg,
+            )
+            if not messages:
+                return list(prompt_ids), {"mode": mode, "gt_available": gt is not None, "marker_len": 0}
+            ref_ids = await self.apply_chat_template(
+                messages, tools=self.tool_schemas, images=images, videos=videos,
+            )
+            cap = int(cfg.max_reprompt_len)
+            if len(ref_ids) > cap:
+                # Trim from the LEFT of the user message — keeps the role-start /
+                # assistant boundary at the tail intact.
+                ref_ids = ref_ids[-cap:]
+            return list(ref_ids), {
+                "mode": mode,
+                "gt_available": gt is not None,
+                "marker_len": 0,
+                "ref_ids_len": len(ref_ids),
+            }
+
+        # marker / gt_marker
+        marker_text = build_marker_text(
+            mode=mode if mode in ("marker", "gt_marker") else "marker",
+            ground_truth=gt,
+            self_distillation_cfg=cfg,
+        )
+        marker_ids = self.tokenizer.encode(marker_text, add_special_tokens=False)
+        return list(prompt_ids) + list(marker_ids), {
+            "mode": mode,
+            "gt_available": gt is not None,
+            "marker_len": len(marker_ids),
+        }
+
+    def _student_sampling_params(
+        self,
+        sampling_params: dict[str, Any],
+        *,
+        max_tokens: Optional[int],
+    ) -> dict[str, Any]:
+        """Coerce sampling_params to the student-call shape: logprobs=K (int)
+        and (optionally) override max_tokens. Caller passes max_tokens=None to
+        let vllm_async_server compute the default from response_length."""
+        sp = dict(sampling_params)
+        sp["logprobs"] = int(self.branching_cfg.top_k)
+        if max_tokens is not None:
+            sp["max_tokens"] = max_tokens
+        return sp
+
+    def _teacher_sampling_params(self) -> dict[str, Any]:
+        """Sampling params for the teacher branch-point query: max_tokens=1,
+        logprobs=K. Temperature is forced to 0.0 — we are reading a
+        distribution, not sampling."""
+        return {
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "top_k": -1,
+            "logprobs": int(self.branching_cfg.top_k),
+            "max_tokens": int(self.branching_cfg.teacher_branch_query_max_tokens),
+            "repetition_penalty": 1.0,
+        }
+
+    # ------------------------------------------------------------------
+    # Recursive split.
+    # ------------------------------------------------------------------
+
+    async def _split_recursive(
+        self,
+        *,
+        prefix_ids: list[int],
+        segment_tokens: list[int],
+        segment_entropies: list[float],
+        segment_top_logprobs: list[dict[int, float]],
+        segment_realized_logprobs: list[float],
+        depth: int,
+        target: int,
+        traj_id: str,
+        priv_ctx_ids: list[int],
+        student_sp: dict[str, Any],
+        images: Optional[list[Any]],
+        videos: Optional[list[Any]],
+        cfg,
+        max_depth: int,
+        diag: dict[str, int],
+    ) -> BranchNode:
+        n = len(segment_tokens)
+        # Adaptive protect window: don't waste >25% of a short segment.
+        pw_default = int(cfg.effective_protect_window)
+        pw = min(pw_default, max(2, n // 4))
+
+        node = BranchNode(
+            prefix_tokens=list(prefix_ids),
+            segment_tokens=list(segment_tokens),
+            segment_entropies=list(segment_entropies),
+            segment_logprobs=list(segment_realized_logprobs),
+            segment_branch_mask=[0] * n,
+            depth=depth,
             is_leaf=True,
         )
 
-    def _flatten_tree_to_leaves(self, root: BranchNode) -> list[AgentLoopOutput]:
-        """Walk the tree and emit one AgentLoopOutput per leaf with shared prefix
-        token vectors assembled along the path. Used by 1c.2.
+        if depth >= max_depth or n < pw + 2:
+            return node
 
-        Each leaf's response_ids = (root prefix excluded) all segment_tokens
-        concatenated along the root → leaf path. The branch token chosen by
-        the teacher at each split is included in the next segment's first
-        position with a 1 in segment_branch_mask.
-        """
+        positions, sigma_used, relaxations = find_decision_positions_with_sigma_relaxation(
+            segment_entropies,
+            target_count=target,
+            window_size=int(cfg.entropy_window),
+            protect_window=pw,
+            sigma_start=float(cfg.entropy_sigma_start),
+            sigma_step=float(cfg.entropy_sigma_step),
+            sigma_floor=float(cfg.entropy_sigma_floor),
+        )
+        diag["sigma_relaxations"] += int(relaxations)
+        if not positions:
+            # Argmax fallback over the testable region.
+            if n > pw + 1:
+                tail = segment_entropies[pw:]
+                positions = [pw + max(range(len(tail)), key=lambda i: tail[i])]
+            else:
+                return node
+        if not positions:
+            return node
+
+        diag["split_attempts"] += 1
+        p = positions[0]  # earliest by chronological sort
+
+        # Teacher branch-point query.
+        student_top = segment_top_logprobs[p] if p < len(segment_top_logprobs) else {}
+        teacher_top = await self._query_teacher_topk(
+            priv_ctx_ids=priv_ctx_ids,
+            prefix_ids=prefix_ids,
+            segment_tokens=segment_tokens,
+            branch_pos=p,
+            traj_id=traj_id,
+            images=images,
+            videos=videos,
+        )
+        if not student_top or teacher_top is None:
+            return node  # no signal to branch on
+
+        student_topk_pairs = list(student_top.items())
+        choice = pick_teacher_branches(
+            student_topk_pairs, teacher_top,
+            fallback_to_student=bool(cfg.fallback_to_student_topk),
+        )
+        if choice == (None, None):
+            diag["teacher_intersect_misses"] += 1
+            return node
+        (pos_tok, _), (neg_tok, _) = choice
+        if bool(cfg.require_distinct_branches) and pos_tok == neg_tok:
+            return node
+        diag["splits_succeeded"] += 1
+
+        node.is_leaf = False
+        node.branch_position = p
+        # Generate the two child continuations.
+        children: list[BranchNode] = []
+        for chosen_token in (pos_tok, neg_tok):
+            child_prefix = list(prefix_ids) + list(segment_tokens[:p]) + [int(chosen_token)]
+            # Response budget remaining: total response_length minus all
+            # response tokens consumed by every ancestor + this segment + the
+            # branch token. ``prefix_ids - root_prompt_len`` counts ancestors;
+            # ``len(segment_tokens[:p]) + 1`` counts this segment's preamble +
+            # the branch token we're about to insert.
+            already_used = (
+                (len(prefix_ids) - self._root_prompt_len)
+                + len(segment_tokens[:p])
+                + 1
+            )
+            remaining = max(0, self.response_length - already_used)
+            if remaining == 0:
+                # No room to continue; child is an immediate leaf carrying just the branch token.
+                child_node = BranchNode(
+                    prefix_tokens=child_prefix,
+                    segment_tokens=[],
+                    segment_entropies=[],
+                    segment_logprobs=[],
+                    segment_branch_mask=[],
+                    depth=depth + 1,
+                    is_leaf=True,
+                )
+                children.append(child_node)
+                continue
+            child_sp = self._student_sampling_params(student_sp, max_tokens=remaining)
+            child_out = await self.server_manager.generate(
+                request_id=traj_id,
+                prompt_ids=child_prefix,
+                sampling_params=child_sp,
+                image_data=images,
+                video_data=videos,
+            )
+            child_tokens = list(child_out.token_ids)
+            child_top = list(child_out.top_logprobs or [])
+            child_lps = list(child_out.log_probs or [0.0] * len(child_tokens))
+            child_entropies = (
+                [entropy_from_topk_logprobs(d) for d in child_top]
+                if child_top else [0.0] * len(child_tokens)
+            )
+            # The branch token itself is the first entry of the child's segment.
+            seg_tokens = [int(chosen_token)] + child_tokens
+            seg_entropies = [0.0] + child_entropies  # branch token's own entropy is undefined
+            seg_lps = [0.0] + child_lps
+            seg_top = [{}] + child_top  # branch token has no top-K from student's POV
+            child_node = await self._split_recursive(
+                prefix_ids=child_prefix[: -1],  # don't include the branch token in prefix
+                segment_tokens=seg_tokens,
+                segment_entropies=seg_entropies,
+                segment_top_logprobs=seg_top,
+                segment_realized_logprobs=seg_lps,
+                depth=depth + 1,
+                target=1,
+                traj_id=traj_id,
+                priv_ctx_ids=priv_ctx_ids,
+                student_sp=student_sp,
+                images=images,
+                videos=videos,
+                cfg=cfg,
+                max_depth=max_depth,
+                diag=diag,
+            )
+            # Mark the branch token position in the child's mask.
+            if child_node.segment_branch_mask:
+                child_node.segment_branch_mask[0] = 1
+            children.append(child_node)
+
+        node.children = children
+        # Truncate node's segment to before branch position so the leaf
+        # walker doesn't double-emit tokens past the split.
+        node.segment_tokens = node.segment_tokens[:p]
+        node.segment_entropies = node.segment_entropies[:p]
+        node.segment_logprobs = node.segment_logprobs[:p]
+        node.segment_branch_mask = node.segment_branch_mask[:p]
+        return node
+
+    async def _query_teacher_topk(
+        self,
+        *,
+        priv_ctx_ids: list[int],
+        prefix_ids: list[int],
+        segment_tokens: list[int],
+        branch_pos: int,
+        traj_id: str,
+        images: Optional[list[Any]],
+        videos: Optional[list[Any]],
+    ) -> Optional[dict[int, float]]:
+        """One vLLM call with the privileged-context prefix; read top-K of
+        the next-token distribution. Returns the {token_id: logprob} dict."""
+        # priv_ctx_ids already encodes (prompt + assistant_role_start + marker).
+        # The student response so far = (the response that PREDATES this
+        # segment's prefix_ids tail) + segment_tokens up to branch_pos.
+        # prefix_ids = original_prompt_ids + earlier_segment_tokens; the
+        # student response so far in TOKEN form is therefore:
+        #     prefix_ids[len(original_prompt_ids):] + segment_tokens[:branch_pos]
+        # But we don't carry "len(original_prompt_ids)" through — the priv_ctx
+        # already contains the original prompt portion. To stitch correctly we
+        # need (priv_ctx + student_response_so_far). Compute student_response_so_far
+        # from what we know: the parent called this segment with prefix_ids that
+        # equal original_prompt + previously-chosen branch tokens + earlier
+        # segments. The simplest correct construction is to take the suffix of
+        # prefix_ids beyond the original prompt, but we never tracked the
+        # original prompt length here. Instead, compute by length:
+        # priv_ctx_ids was built as prompt_ids (root) + marker. So
+        # student_response_so_far = prefix_ids[len(prompt_ids_root):] +
+        # segment_tokens[:branch_pos]. We don't have prompt_ids_root in scope —
+        # store it on self at the start of run() for this purpose.
+        student_so_far = (
+            prefix_ids[self._root_prompt_len :]
+            + list(segment_tokens[:branch_pos])
+        )
+        teacher_prompt = list(priv_ctx_ids) + list(student_so_far)
+        try:
+            out = await self.server_manager.generate(
+                request_id=traj_id,
+                prompt_ids=teacher_prompt,
+                sampling_params=self._teacher_sampling_params(),
+                image_data=images,
+                video_data=videos,
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        if not out.top_logprobs:
+            return None
+        return out.top_logprobs[0]
+
+    # ------------------------------------------------------------------
+    # Tree → AgentLoopOutput leaves.
+    # ------------------------------------------------------------------
+
+    def _flatten_tree_to_leaves(
+        self,
+        *,
+        root: BranchNode,
+        multi_modal_data: dict[str, Any],
+        diag: dict[str, int],
+        priv_ctx_meta: dict[str, Any],
+    ) -> list[AgentLoopOutput]:
         outputs: list[AgentLoopOutput] = []
-        # DFS, accumulating along the path.
         path_tokens: list[int] = []
         path_entropies: list[float] = []
         path_logprobs: list[float] = []
         path_branch_mask: list[int] = []
+        leaf_counter = [0]
 
         def _visit(node: BranchNode) -> None:
-            nonlocal path_tokens, path_entropies, path_logprobs, path_branch_mask
             saved = (
                 len(path_tokens), len(path_entropies),
                 len(path_logprobs), len(path_branch_mask),
@@ -323,19 +662,24 @@ class BranchingAgentLoop(AgentLoopBase):
             path_branch_mask.extend(node.segment_branch_mask)
 
             if node.is_leaf:
+                node.leaf_id = leaf_counter[0]
+                leaf_counter[0] += 1
+                truncate = self.response_length
                 outputs.append(
                     AgentLoopOutput(
                         prompt_ids=root.prefix_tokens,
-                        response_ids=list(path_tokens[: self.response_length]),
-                        response_mask=[1] * min(len(path_tokens), self.response_length),
-                        response_logprobs=list(path_logprobs[: self.response_length]),
-                        multi_modal_data=None,
+                        response_ids=list(path_tokens[:truncate]),
+                        response_mask=[1] * min(len(path_tokens), truncate),
+                        response_logprobs=list(path_logprobs[:truncate]),
+                        multi_modal_data=multi_modal_data,
                         num_turns=2,
                         metrics=AgentLoopMetrics(),
                         extra_fields={
-                            "branch_token_mask": list(path_branch_mask[: self.response_length]),
+                            "branch_token_mask": list(path_branch_mask[:truncate]),
                             "leaf_id": node.leaf_id,
                             "leaf_depth": node.depth,
+                            "branching_diag": dict(diag),
+                            "priv_ctx_meta": dict(priv_ctx_meta),
                         },
                     )
                 )
@@ -343,7 +687,6 @@ class BranchingAgentLoop(AgentLoopBase):
                 for child in node.children:
                     _visit(child)
 
-            # Backtrack.
             (lt, le, lp, lb) = saved
             del path_tokens[lt:]
             del path_entropies[le:]
@@ -351,9 +694,54 @@ class BranchingAgentLoop(AgentLoopBase):
             del path_branch_mask[lb:]
 
         _visit(root)
-        # Stable left-to-right leaf order (DFS already ensures this; sanity check).
+        # Sanity check via the structural collector.
         leaves = collect_leaves(root)
         assert len(outputs) == len(leaves), (
             f"Tree flatten produced {len(outputs)} outputs but tree has {len(leaves)} leaves"
         )
         return outputs
+
+    def _pad_leaves_to_n(self, leaves: list[AgentLoopOutput], n: int) -> list[AgentLoopOutput]:
+        """Ensure exactly ``n`` leaves by duplicating the last produced leaf
+        when the tree was shallower than expected. Never produce empty leaves
+        — torch.cat in _postprocess would explode on shape mismatch."""
+        if len(leaves) >= n:
+            return leaves[:n]
+        if not leaves:
+            raise RuntimeError("BranchingAgentLoop._pad_leaves_to_n: no leaves to pad from")
+        last = leaves[-1]
+        while len(leaves) < n:
+            # Shallow-copy: the AgentLoopOutput is a Pydantic model; copy() is fine.
+            leaves.append(last.model_copy(deep=False))
+        return leaves
+
+    def _fallback_n_copies(
+        self,
+        *,
+        prompt_ids: list[int],
+        response_tokens: list[int],
+        response_logprobs: Optional[list[float]],
+        multi_modal_data: dict[str, Any],
+        reason: str,
+    ) -> list[AgentLoopOutput]:
+        """Build ``n_leaves`` identical leaves from a single chain. Used when
+        we cannot branch (no top_logprobs surfaced, chain too short, etc.)."""
+        truncate = self.response_length
+        tokens = list(response_tokens[:truncate])
+        lps = list((response_logprobs or [0.0] * len(tokens))[:truncate])
+        single = AgentLoopOutput(
+            prompt_ids=prompt_ids,
+            response_ids=tokens,
+            response_mask=[1] * len(tokens),
+            response_logprobs=lps,
+            multi_modal_data=multi_modal_data,
+            num_turns=2,
+            metrics=AgentLoopMetrics(),
+            extra_fields={
+                "branch_token_mask": [0] * len(tokens),
+                "leaf_id": 0,
+                "leaf_depth": 0,
+                "branching_fallback": reason,
+            },
+        )
+        return [single] + [single.model_copy(deep=False) for _ in range(self.n_leaves - 1)]
