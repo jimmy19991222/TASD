@@ -559,6 +559,51 @@ class DataParallelPPOActor(BasePPOActor):
                     outputs["topk_indices"] = topk_indices
             return outputs
 
+    def _apply_branch_loss_mode(
+        self,
+        *,
+        response_mask: torch.Tensor,
+        branch_token_mask: Optional[torch.Tensor],
+        branch_loss_mode: str,
+    ) -> tuple[torch.Tensor, dict]:
+        """Apply the teacher-guided branching ablation to ``response_mask``.
+
+        Three modes:
+          ``all``  : default. mask is ignored; every response token contributes.
+          ``mask`` : zero-out branch tokens before aggregation
+                     (response_mask AND NOT branch_token_mask).
+          ``only`` : keep ONLY branch tokens (response_mask AND branch_token_mask).
+
+        Returns ``(effective_response_mask, metrics)``. When
+        ``branch_token_mask`` is None or ``branch_loss_mode == "all"``, the
+        original ``response_mask`` is returned and ``metrics`` is empty so the
+        legacy non-branching path stays a no-op. When the mask IS active, the
+        returned ``metrics`` carries diagnostics for SwanLab.
+        """
+        if branch_token_mask is None or branch_loss_mode == "all":
+            return response_mask, {}
+        btm = branch_token_mask.to(response_mask.device).to(response_mask.dtype)
+        if branch_loss_mode == "mask":
+            effective = response_mask * (1 - btm)
+        elif branch_loss_mode == "only":
+            effective = response_mask * btm
+        else:
+            raise ValueError(
+                f"branch_token_loss_mode must be one of {{all, mask, only}}, "
+                f"got {branch_loss_mode!r}"
+            )
+        with torch.no_grad():
+            base_active = response_mask.sum().clamp_min(1.0)
+            eff_active = effective.sum()
+            metrics = {
+                "branching/loss_mode_id": float(
+                    {"all": 0, "mask": 1, "only": 2}[branch_loss_mode]
+                ),
+                "branching/active_token_ratio": (eff_active / base_active).item(),
+                "branching/branch_token_count": btm.sum().item(),
+            }
+        return effective, metrics
+
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
         if self.scaler is not None:
@@ -809,6 +854,19 @@ class DataParallelPPOActor(BasePPOActor):
                     # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                     rollout_is_weights = model_inputs.get("rollout_is_weights", None)
 
+                    # Teacher-guided branching: derive an effective response_mask
+                    # from the teacher-injected branch_token_mask, applied to BOTH
+                    # the SDPO distill loss and the GRPO/PPO PG loss path so the
+                    # ablation modes (all/mask/only) compose consistently with
+                    # whichever loss is active.
+                    effective_response_mask, branch_metrics = self._apply_branch_loss_mode(
+                        response_mask=response_mask,
+                        branch_token_mask=model_inputs.get("branch_token_mask", None),
+                        branch_loss_mode=self.config.policy_loss.get("branch_token_loss_mode", "all"),
+                    )
+                    if branch_metrics:
+                        micro_batch_metrics.update(branch_metrics)
+
                     if self_distillation_enabled:
                         teacher_inputs = {
                             "responses": model_inputs["responses"],
@@ -837,7 +895,7 @@ class DataParallelPPOActor(BasePPOActor):
                         pg_loss, pg_metrics = compute_self_distillation_loss(
                             student_log_probs=log_prob,
                             teacher_log_probs=teacher_log_prob,
-                            response_mask=response_mask,
+                            response_mask=effective_response_mask,
                             self_distillation_config=self_distillation_cfg,
                             old_log_probs=old_log_prob,
                             student_all_log_probs=student_all_logps,
@@ -855,36 +913,6 @@ class DataParallelPPOActor(BasePPOActor):
                         # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
                         # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
                         policy_loss_fn = get_policy_loss_fn(loss_mode)
-
-                        # Teacher-guided branching: optionally re-mask the response
-                        # tokens by the teacher-injected branch_token_mask. Three
-                        # modes (default 'all' = unchanged):
-                        #   all  : no-op (every response token contributes).
-                        #   mask : zero-out branch tokens before PG aggregation.
-                        #   only : keep ONLY branch tokens (decision-token-only PG).
-                        effective_response_mask = response_mask
-                        branch_token_mask = model_inputs.get("branch_token_mask", None)
-                        branch_loss_mode = self.config.policy_loss.get("branch_token_loss_mode", "all")
-                        if branch_token_mask is not None and branch_loss_mode != "all":
-                            btm = branch_token_mask.to(response_mask.device).to(response_mask.dtype)
-                            if branch_loss_mode == "mask":
-                                effective_response_mask = response_mask * (1 - btm)
-                            elif branch_loss_mode == "only":
-                                effective_response_mask = response_mask * btm
-                            # Diagnostics so we can confirm the mask is doing
-                            # what we expect on a smoke run.
-                            with torch.no_grad():
-                                base_active = response_mask.sum().clamp_min(1.0)
-                                eff_active = effective_response_mask.sum()
-                                micro_batch_metrics["branching/loss_mode_id"] = float(
-                                    {"all": 0, "mask": 1, "only": 2}[branch_loss_mode]
-                                )
-                                micro_batch_metrics["branching/active_token_ratio"] = (
-                                    eff_active / base_active
-                                ).item()
-                                micro_batch_metrics["branching/branch_token_count"] = (
-                                    btm.sum().item()
-                                )
 
                         # Compute policy loss (any function is expected to return 2 values)
                         pg_loss, pg_metrics = policy_loss_fn(

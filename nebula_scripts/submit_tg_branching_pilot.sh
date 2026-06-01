@@ -10,11 +10,21 @@
 #   bash nebula_scripts/submit_tg_branching_pilot.sh [--dry-run]
 #   bash nebula_scripts/submit_tg_branching_pilot.sh --variant baseline [--dry-run]
 #   bash nebula_scripts/submit_tg_branching_pilot.sh --variant branching --loss-mode mask [--dry-run]
+#   bash nebula_scripts/submit_tg_branching_pilot.sh --variant sdpo [--loss-mode mask] [--dry-run]
 #
 # Variants:
 #   baseline   : rollout.branching.enabled=False, vanilla GRPO (control).
-#   branching  : full pipeline with branch_token_loss_mode in {all, mask, only}.
-#                Use --loss-mode all|mask|only|all_three (default all_three).
+#   branching  : full pipeline (GRPO loss) with branch_token_loss_mode in
+#                {all, mask, only}. Use --loss-mode all|mask|only|all_three
+#                (default all_three).
+#   sdpo       : full pipeline (SDPO loss) with branch_token_loss_mode in
+#                {all, mask, only}. Aligns
+#                actor.self_distillation.teacher_context_mode with
+#                rollout.branching.teacher_context_mode so the on-policy
+#                teacher distribution is byte-identical between rollout and
+#                training time. Use --loss-mode same as above.
+#   all        : baseline + branching (does NOT include sdpo by default —
+#                that's a heavier sweep; pass --variant sdpo explicitly).
 # =============================================================================
 
 # ── Nebula 账号配置 ──────────────────────────────────────────────────────
@@ -68,6 +78,10 @@ TRAIN_BATCH_SIZE="32"
 ROLLOUT_N="8"   # MUST equal 2 ** branching.n_splits when branching is enabled
 LRS=("1e-5")
 MINI_BATCH_SIZES=("32")
+
+# SDPO-specific defaults (only used by the sdpo variant)
+SDPO_ALPHA="${SDPO_ALPHA:-0.5}"
+SDPO_DONT_REPROMPT_ON_SELF_SUCCESS="${SDPO_DONT_REPROMPT_ON_SELF_SUCCESS:-False}"
 
 # Branching defaults
 N_SPLITS="3"
@@ -176,6 +190,35 @@ if [[ "$VARIANT" == "all" || "$VARIANT" == "branching" ]]; then
         _submit_job "$SCRIPT_PATH" "$JOB_NAME" \
             "$(_common_env "$JOB_NAME" "$DATASET" "$MODEL_NAME" "$LR" "$MINI_BATCH_SIZE") --env=BRANCHING_ENABLED=True --env=N_SPLITS=${N_SPLITS} --env=TOP_K=${TOP_K} --env=ENTROPY_WINDOW=${ENTROPY_WINDOW} --env=ENTROPY_SIGMA_START=${ENTROPY_SIGMA_START} --env=ENTROPY_SIGMA_FLOOR=${ENTROPY_SIGMA_FLOOR} --env=ENTROPY_SIGMA_STEP=${ENTROPY_SIGMA_STEP} --env=TEACHER_CONTEXT_MODE=${TEACHER_CONTEXT_MODE} --env=BRANCH_TOKEN_LOSS_MODE=${BTM} --env=ADV_STD_FLOOR=${ADV_STD_FLOOR}"
     done; done; done; done; done
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Variant: sdpo (SDPO loss + branching rollout)
+# Run only when explicitly requested (NOT included in --variant=all).
+# ─────────────────────────────────────────────────────────────────────────────
+if [[ "$VARIANT" == "sdpo" ]]; then
+    if [[ "$LOSS_MODE" == "all_three" ]]; then
+        LOSS_MODES=("all" "mask" "only")
+    else
+        LOSS_MODES=("$LOSS_MODE")
+    fi
+    SCRIPT_PATH="nebula_scripts/sdpo/sdpo_branching_sciknoweval_parametric.sh"
+    for DATASET in "${DATASETS[@]}"; do
+    for MODEL_NAME in "${MODEL_NAMES[@]}"; do
+    for LR in "${LRS[@]}"; do
+    for BTM in "${LOSS_MODES[@]}"; do
+        DATASET_SHORT=$(echo "$DATASET" | tr '/' '-')
+        LR_TAG=$(echo "$LR" | tr '-' '_')
+        CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
+        JOB_NAME="TGB-SDPO-${DATASET_SHORT}-${TEACHER_CONTEXT_MODE}-alpha${SDPO_ALPHA}-btm${BTM}-lr${LR_TAG}-${MODEL_NAME}-${CURRENT_TIME}"
+        # SDPO-specific env: ALPHA + DONT_REPROMPT_ON_SELF_SUCCESS. We use
+        # the GRPO-side _common_env then append SDPO and branching extras.
+        # Note: MINI_BATCH_SIZE is not threaded through SDPO parametric (it
+        # hardcodes ppo_mini_batch_size=32 for stability) but we still pass
+        # it for the env-block consistency.
+        _submit_job "$SCRIPT_PATH" "$JOB_NAME" \
+            "$(_common_env "$JOB_NAME" "$DATASET" "$MODEL_NAME" "$LR" "32") --env=ALPHA=${SDPO_ALPHA} --env=DONT_REPROMPT_ON_SELF_SUCCESS=${SDPO_DONT_REPROMPT_ON_SELF_SUCCESS} --env=BRANCHING_ENABLED=True --env=N_SPLITS=${N_SPLITS} --env=TOP_K=${TOP_K} --env=ENTROPY_WINDOW=${ENTROPY_WINDOW} --env=ENTROPY_SIGMA_START=${ENTROPY_SIGMA_START} --env=ENTROPY_SIGMA_FLOOR=${ENTROPY_SIGMA_FLOOR} --env=ENTROPY_SIGMA_STEP=${ENTROPY_SIGMA_STEP} --env=TEACHER_CONTEXT_MODE=${TEACHER_CONTEXT_MODE} --env=BRANCH_TOKEN_LOSS_MODE=${BTM} --env=ADV_STD_FLOOR=${ADV_STD_FLOOR}"
+    done; done; done; done
 fi
 
 echo ""
