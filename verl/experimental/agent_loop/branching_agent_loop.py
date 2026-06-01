@@ -222,17 +222,43 @@ class BranchingAgentLoop(AgentLoopBase):
             except BaseException as e:  # noqa: BLE001
                 logger.exception(
                     "BranchingAgentLoop pipeline failed (cache_key=%s); "
-                    "falling back to single-chain n_copies leaves.", cache_key,
+                    "attempting plain student rollout fallback.", cache_key,
                 )
                 # Best-effort fallback so siblings still get well-formed leaves.
-                # If even the fallback fails we propagate to siblings.
+                # First try a plain (non-branching) student rollout — if that
+                # works, all n_leaves siblings receive valid response tokens
+                # and downstream tokenizer.pad will not degenerate to a list
+                # (which is what happens when response_tokens is empty).
+                fallback_tokens: list[int] = []
+                fallback_lps: Optional[list[float]] = None
+                fallback_reason = f"pipeline_exception:{type(e).__name__}"
+                try:
+                    plain_sp = dict(sampling_params)
+                    plain_sp.pop("logprobs", None)  # drop the int-K override
+                    plain_sp["logprobs"] = False
+                    plain_out = await self.server_manager.generate(
+                        request_id=uuid4().hex,
+                        prompt_ids=prompt_ids,
+                        sampling_params=plain_sp,
+                        image_data=images,
+                        video_data=videos,
+                    )
+                    fallback_tokens = list(plain_out.token_ids)
+                    fallback_lps = list(plain_out.log_probs) if plain_out.log_probs else None
+                    fallback_reason = f"{fallback_reason}:plain_rollout_ok"
+                except BaseException as plain_err:  # noqa: BLE001
+                    logger.exception(
+                        "Plain-rollout fallback also failed for cache_key=%s; "
+                        "emitting EOS-only leaves.", cache_key,
+                    )
+                    fallback_reason = f"{fallback_reason}:plain_rollout_failed:{type(plain_err).__name__}"
                 try:
                     fallback_leaves = self._fallback_n_copies(
                         prompt_ids=prompt_ids,
-                        response_tokens=[],
-                        response_logprobs=None,
+                        response_tokens=fallback_tokens,
+                        response_logprobs=fallback_lps,
                         multi_modal_data=multi_modal_data,
-                        reason=f"pipeline_exception:{type(e).__name__}",
+                        reason=fallback_reason,
                     )
                     future.set_result(fallback_leaves)
                 except BaseException as fb_err:  # noqa: BLE001
@@ -719,17 +745,34 @@ class BranchingAgentLoop(AgentLoopBase):
                 node.leaf_id = leaf_counter[0]
                 leaf_counter[0] += 1
                 truncate = self.response_length
+                leaf_tokens = list(path_tokens[:truncate])
+                leaf_lps = list(path_logprobs[:truncate])
+                leaf_mask = list(path_branch_mask[:truncate])
+                # Defense: tokenizer.pad on an empty list returns a Python list
+                # (not a tensor), which crashes downstream
+                # _agent_loop_postprocess (response_output["input_ids"].dim()).
+                # Force at least one token (EOS / pad) so the leaf is always a
+                # well-formed sequence even if the student emitted nothing.
+                if not leaf_tokens:
+                    eos_id = (
+                        getattr(self.tokenizer, "eos_token_id", None)
+                        or getattr(self.tokenizer, "pad_token_id", None)
+                        or 0
+                    )
+                    leaf_tokens = [int(eos_id)]
+                    leaf_lps = [0.0]
+                    leaf_mask = [0]
                 outputs.append(
                     AgentLoopOutput(
                         prompt_ids=root.prefix_tokens,
-                        response_ids=list(path_tokens[:truncate]),
-                        response_mask=[1] * min(len(path_tokens), truncate),
-                        response_logprobs=list(path_logprobs[:truncate]),
+                        response_ids=leaf_tokens,
+                        response_mask=[1] * len(leaf_tokens),
+                        response_logprobs=leaf_lps,
                         multi_modal_data=multi_modal_data,
                         num_turns=2,
                         metrics=AgentLoopMetrics(),
                         extra_fields={
-                            "branch_token_mask": list(path_branch_mask[:truncate]),
+                            "branch_token_mask": leaf_mask,
                             "leaf_id": node.leaf_id,
                             "leaf_depth": node.depth,
                             "branching_diag": dict(diag),
@@ -825,10 +868,29 @@ class BranchingAgentLoop(AgentLoopBase):
 
         Each leaf gets its OWN extra_fields dict / list buffers so per-row
         mutation in ``_agent_loop_postprocess`` cannot leak across siblings.
+
+        IMPORTANT: ``response_tokens=[]`` would cause downstream
+        ``tokenizer.pad`` to return a Python list (not a tensor) — the
+        postprocess ``response_output["input_ids"].dim()`` call then raises
+        AttributeError and brings down the entire validation/rollout step.
+        We force at least 1 token (EOS or pad) so the response is always a
+        well-formed sequence.
         """
         truncate = self.response_length
         tokens = list(response_tokens[:truncate])
-        lps = list((response_logprobs or [0.0] * len(tokens))[:truncate])
+        if not tokens:
+            # Pad with a single end-of-sequence (or pad) token so postprocess
+            # produces a 1×response_length tensor, not a degenerate list.
+            eos_id = (
+                getattr(self.tokenizer, "eos_token_id", None)
+                or getattr(self.tokenizer, "pad_token_id", None)
+                or 0
+            )
+            tokens = [int(eos_id)]
+        lps_seed = response_logprobs if response_logprobs else [0.0] * len(tokens)
+        lps = list(lps_seed[:truncate])
+        if len(lps) < len(tokens):
+            lps = lps + [0.0] * (len(tokens) - len(lps))
 
         def _build(leaf_id: int) -> AgentLoopOutput:
             return AgentLoopOutput(
