@@ -102,8 +102,16 @@ class BranchingConfig(BaseConfig):
         teacher_context_mode: Which teacher context to use at branch points.
             One of {marker, gt_marker, ref_gt}. ref-from-peer is NOT supported
             here because peer rollouts haven't completed during branching.
-        teacher_context_template: Free-form override of the marker text. If
-            None, falls back to actor.self_distillation.gt_marker_template.
+        verdict_right_marker: Override for the verified-correct marker text.
+            None falls back to verl.utils.verdict_markers.VERDICT_RIGHT_MARKER.
+        gt_marker_template: Per-sample template; available placeholder
+            ``{ground_truth}``. Used when teacher_context_mode == "gt_marker".
+        reprompt_template: Used when teacher_context_mode == "ref_gt".
+            Available placeholders: ``{prompt}``, ``{solution}``, ``{feedback}``.
+        solution_template: Solution-section template inside ``reprompt_template``.
+            Available placeholder: ``{successful_previous_attempt}``.
+        max_reprompt_len: Cap on the rebuilt teacher prompt length under
+            ref_gt mode. Mirrored from actor.self_distillation.max_reprompt_len.
         teacher_branch_query_max_tokens: How many tokens to generate when
             asking the teacher engine to score top-K (always 1 in V1).
         fallback_to_student_topk: If teacher top-K and student top-K intersect
@@ -111,6 +119,9 @@ class BranchingConfig(BaseConfig):
         require_distinct_branches: If both children would carry the same
             token, treat the branch as failed (skip splitting at that
             position). Otherwise drop one child.
+        max_branch_depth: Optional cap on tree depth (defaults to n_splits).
+            Useful for ablations that want a deeper detector budget than the
+            actual leaf count.
     """
 
     enabled: bool = False
@@ -122,10 +133,25 @@ class BranchingConfig(BaseConfig):
     entropy_sigma_floor: float = 0.5
     entropy_sigma_step: float = 0.5
     teacher_context_mode: str = "gt_marker"
-    teacher_context_template: Optional[str] = None
+    verdict_right_marker: Optional[str] = None
+    gt_marker_template: str = (
+        "[Meta: the assistant response below is verified to correctly answer the question. "
+        "Reference answer: {ground_truth}]"
+    )
+    reprompt_template: str = (
+        "{prompt}{solution}{feedback}\n\n"
+        "Correctly solve the original question.\n"
+    )
+    solution_template: str = (
+        "\n"
+        "Correct solution:\n\n"
+        "{successful_previous_attempt}\n\n"
+    )
+    max_reprompt_len: int = 10240
     teacher_branch_query_max_tokens: int = 1
     fallback_to_student_topk: bool = True
     require_distinct_branches: bool = True
+    max_branch_depth: Optional[int] = None
 
     def __post_init__(self):
         if self.enabled:
@@ -150,6 +176,10 @@ class BranchingConfig(BaseConfig):
     @property
     def effective_protect_window(self) -> int:
         return self.entropy_protect_window if self.entropy_protect_window is not None else self.entropy_window
+
+    @property
+    def effective_max_branch_depth(self) -> int:
+        return self.max_branch_depth if self.max_branch_depth is not None else self.n_splits
 
 
 @dataclass

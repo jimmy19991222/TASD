@@ -234,9 +234,28 @@ branching:
   # ref-from-peer is NOT supported here (peer rollouts haven't completed during branching).
   teacher_context_mode: gt_marker
 
-  # Optional override for the marker text. If null, uses
-  # actor_rollout_ref.actor.self_distillation.gt_marker_template.
-  teacher_context_template: null
+  # Optional override for the verdict-correct marker text. null = default constant.
+  verdict_right_marker: null
+
+  # Per-sample template for gt_marker mode. Available placeholder: {ground_truth}.
+  gt_marker_template: |-
+    [Meta: the assistant response below is verified to correctly answer the question. Reference answer: {ground_truth}]
+
+  # Reprompt template for ref_gt mode. Available placeholders: {prompt}, {solution}, {feedback}.
+  reprompt_template: |-
+    {prompt}{solution}{feedback}
+
+    Correctly solve the original question.
+
+  # Solution-section template inside reprompt_template (ref_gt mode).
+  solution_template: |-
+
+    Correct solution:
+
+    {successful_previous_attempt}
+
+  # Cap on the rebuilt teacher prompt length under ref_gt mode.
+  max_reprompt_len: 10240
 
   # How many tokens to generate when asking the teacher engine to score top-K (always 1 in V1).
   teacher_branch_query_max_tokens: 1
@@ -246,6 +265,9 @@ branching:
 
   # If both children would carry the same token, skip the split at that position.
   require_distinct_branches: True
+
+  # Optional cap on tree depth. null = same as n_splits.
+  max_branch_depth: null
 
 # support logging rollout prob for debugging purpose
 # "Truncated importance sampling" requires rollout log probs, set to True when turning on Truncated importance sampling
