@@ -401,6 +401,22 @@ class AgentLoopWorker:
             trace_config.get("max_samples_per_step_per_worker", None),
         )
 
+    def clear_branching_cache(self) -> None:
+        """Drop the per-step coordination cache used by BranchingAgentLoop.
+
+        Called by AgentLoopManager before each generate_sequences dispatch so
+        sibling rows of step N don't pick up stale leaves cached during step
+        N-1. No-op when teacher-guided branching is disabled (the import is
+        cheap; the dicts are empty).
+        """
+        # Lazy import keeps the unrelated rollout paths free of branching deps.
+        from verl.experimental.agent_loop.branching_agent_loop import (
+            _branching_cache_clear,
+            _branching_index_counters_clear,
+        )
+        _branching_cache_clear()
+        _branching_index_counters_clear()
+
     @tqbridge()
     async def generate_sequences(self, batch: DataProto) -> DataProto:
         """Generate sequences from agent loop.
@@ -938,6 +954,16 @@ class AgentLoopManager:
         self.wake_up()
         if self.reward_model_manager:
             self.reward_model_manager.wake_up()
+
+        # Teacher-guided branching: clear the per-step coordination cache before
+        # dispatching this batch so sibling rows of step N don't pick up stale
+        # leaves cached during step N-1. Lives in workers, so dispatch a no-op
+        # method on each worker that calls _branching_cache_clear locally.
+        # Cheap (no-op) when branching is disabled.
+        ray.get([
+            worker.clear_branching_cache.remote()
+            for worker in self.agent_loop_workers
+        ])
 
         chunkes = prompts.chunk(len(self.agent_loop_workers))
         outputs = ray.get(
