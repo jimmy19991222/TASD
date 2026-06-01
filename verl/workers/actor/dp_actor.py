@@ -714,6 +714,10 @@ class DataParallelPPOActor(BasePPOActor):
         # Include rollout_log_probs for computing rollout_corr metrics in bypass mode
         if "rollout_log_probs" in data.batch.keys():
             select_keys.append("rollout_log_probs")
+        # Include branch_token_mask for the teacher-guided branching rollout's
+        # GRPO loss-mode ablations (lands in Phase 2).
+        if "branch_token_mask" in data.batch.keys():
+            select_keys.append("branch_token_mask")
 
         has_multi_modal_inputs = self._has_non_empty_multi_modal_inputs(
             data.non_tensor_batch.get("multi_modal_inputs")

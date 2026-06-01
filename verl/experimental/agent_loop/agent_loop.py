@@ -175,6 +175,10 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded log probabilities for the response tokens."""
     routed_experts: Optional[torch.Tensor] = None
     """Padded routed experts for the total tokens."""
+    branch_token_mask: Optional[torch.Tensor] = None
+    """Padded LongTensor [1, response_length]; 1 at positions where the
+    teacher-guided branching rollout injected a branch token, 0 elsewhere.
+    Only set when actor_rollout_ref.rollout.branching.enabled=True."""
     multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None
     """Multi-modal inputs for processors (e.g., pixel_values, image_grid_thw)."""
     extra_fields: dict[str, Any] = {}
@@ -595,6 +599,16 @@ class AgentLoopWorker:
             pad_size = self.config.actor_rollout_ref.rollout.response_length - len(output.response_logprobs)
             response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
 
+        branch_token_mask = None
+        btm_raw = output.extra_fields.pop("branch_token_mask", None) if output.extra_fields else None
+        if btm_raw is not None:
+            response_length = self.config.actor_rollout_ref.rollout.response_length
+            btm_list = list(btm_raw)[:response_length]
+            pad_size = response_length - len(btm_list)
+            branch_token_mask = torch.tensor(
+                btm_list + [0] * pad_size, dtype=torch.long
+            ).unsqueeze(0)
+
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
         attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
         input_ids = torch.cat([prompt_output["input_ids"], response_output["input_ids"]], dim=1)
@@ -644,6 +658,7 @@ class AgentLoopWorker:
             attention_mask=attention_mask,
             response_logprobs=response_logprobs,
             routed_experts=routed_experts,
+            branch_token_mask=branch_token_mask,
             multi_modal_inputs=multi_modal_inputs,
             multi_modal_data=output.multi_modal_data,
             reward_score=output.reward_score,
@@ -756,6 +771,10 @@ class AgentLoopWorker:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
         if inputs[0].routed_experts is not None:
             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
+        if inputs[0].branch_token_mask is not None:
+            optional_outputs["branch_token_mask"] = torch.cat(
+                [input.branch_token_mask for input in inputs], dim=0
+            )
 
         batch = TensorDict(
             {
