@@ -67,6 +67,10 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.torch_functional import postprocess_data
+from verl.utils.teacher_prompt import (
+    build_marker_text,
+    build_ref_gt_messages,
+)
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.utils.verdict_markers import VERDICT_RIGHT_MARKER, VERDICT_WRONG_MARKER  # noqa: F401
 from verl.workers.config import FSDPEngineConfig
@@ -886,24 +890,19 @@ class RayPPOTrainer:
         teacher_prompt_ids = teacher_prompt["input_ids"].to(device)
         teacher_prompt_mask = teacher_prompt["attention_mask"].to(device)
 
-        # Build per-sample marker text.
-        right_marker = self_distillation_cfg.get("verdict_right_marker", None) or VERDICT_RIGHT_MARKER
-        gt_template = self_distillation_cfg.gt_marker_template
+        # Build per-sample marker text via the shared helper so the rollout-time
+        # BranchingAgentLoop and this trainer-side builder agree on the exact
+        # string. The helper handles the gt-missing fallback and the trailing
+        # "\n\n" suffix uniformly.
         marker_texts: list[str] = []
         gt_found = 0
         for i in range(batch_size):
-            if mode == "marker":
-                marker_texts.append(right_marker + "\n\n")
-            else:  # gt_marker
-                gt = self._read_ground_truth(batch, i)
-                if gt is None:
-                    marker_texts.append(right_marker + "\n\n")
-                else:
-                    gt_found += 1
-                    txt = gt_template.format(ground_truth=gt)
-                    if not txt.endswith("\n\n"):
-                        txt = txt + "\n\n"
-                    marker_texts.append(txt)
+            gt = self._read_ground_truth(batch, i) if mode == "gt_marker" else None
+            if mode == "gt_marker" and gt is not None:
+                gt_found += 1
+            marker_texts.append(build_marker_text(
+                mode=mode, ground_truth=gt, self_distillation_cfg=self_distillation_cfg,
+            ))
 
         pad_id = self.tokenizer.pad_token_id
         if pad_id is None:
