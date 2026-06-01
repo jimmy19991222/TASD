@@ -327,7 +327,12 @@ class BranchingAgentLoop(AgentLoopBase):
         cfg = self.branching_cfg
         K = int(cfg.top_k)
         n_splits = int(cfg.n_splits)
-        max_depth = int(cfg.effective_max_branch_depth)
+        # Resolve effective values inline — `cfg` here is an OmegaConf DictConfig
+        # (the rollout.branching block read via .get(...)) and does NOT carry
+        # the BranchingConfig dataclass `@property` methods. Reading
+        # `cfg.effective_max_branch_depth` raises ConfigAttributeError.
+        _max_depth_override = cfg.get("max_branch_depth", None)
+        max_depth = int(_max_depth_override) if _max_depth_override is not None else int(n_splits)
         traj_id = uuid4().hex
 
         priv_ctx_ids, priv_ctx_meta = await self._build_privileged_context(
@@ -499,7 +504,10 @@ class BranchingAgentLoop(AgentLoopBase):
     ) -> BranchNode:
         n = len(segment_tokens)
         # Adaptive protect window: don't waste >25% of a short segment.
-        pw_default = int(cfg.effective_protect_window)
+        # Same caveat as effective_max_branch_depth above — `cfg` is a
+        # DictConfig without dataclass properties; resolve inline.
+        _pw_override = cfg.get("entropy_protect_window", None)
+        pw_default = int(_pw_override) if _pw_override is not None else int(cfg.entropy_window)
         pw = min(pw_default, max(2, n // 4))
 
         node = BranchNode(

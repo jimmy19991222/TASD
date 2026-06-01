@@ -173,6 +173,14 @@ class BranchingConfig(BaseConfig):
                     f"got {self.teacher_context_mode!r}"
                 )
 
+    # NOTE: ``@property`` accessors are NOT visible when the dataclass is read
+    # back through OmegaConf as a DictConfig (which is what happens at runtime
+    # in ``BranchingAgentLoop`` via ``rollout.get("branching")``). Callers that
+    # only have a DictConfig MUST inline the equivalent logic (resolve
+    # ``entropy_protect_window``/``max_branch_depth`` against their defaults
+    # manually). These properties are kept here for tests and direct instances
+    # that hold the live dataclass.
+
     @property
     def effective_protect_window(self) -> int:
         return self.entropy_protect_window if self.entropy_protect_window is not None else self.entropy_window
