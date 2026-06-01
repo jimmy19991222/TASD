@@ -227,58 +227,168 @@ def _build_loop():
     return loop, server, bal
 
 
-def main() -> None:
-    loop, server, bal = _build_loop()
+def _scenario_full_tree() -> None:
+    loop, server, _ = _build_loop()
     kwargs = {
         "raw_prompt": [{"role": "user", "content": "Q?"}],
         "reward_model": {"ground_truth": "A"},
     }
     sampling_params = {"temperature": 0.7, "top_p": 1.0, "logprobs": False}
 
-    async def _run():
-        leaves = await loop._run_branching_pipeline(
+    loop._root_prompt_len = 3
+    leaves = asyncio.get_event_loop().run_until_complete(
+        loop._run_branching_pipeline(
             prompt_ids=[10, 11, 12],
             sampling_params=sampling_params,
             images=None, videos=None,
             multi_modal_data={},
             kwargs=kwargs,
         )
-        return leaves
-
-    loop._root_prompt_len = 3
-    leaves = asyncio.get_event_loop().run_until_complete(_run())
+    )
 
     n_expected = 2 ** loop.branching_cfg.n_splits
     assert len(leaves) == n_expected, f"expected {n_expected} leaves, got {len(leaves)}"
-
-    # branch_token_mask 1-count should equal depth (n_splits) for fully-split leaves.
     for i, leaf in enumerate(leaves):
-        mask = leaf.extra_fields["branch_token_mask"]
-        ones = sum(mask)
-        # On fully-split leaves the count is exactly n_splits=2.
-        # When the tree was shallower (because we couldn't find a spike) padding
-        # may produce duplicates with fewer ones — accept anything in [0, n_splits].
-        assert 0 <= ones <= loop.branching_cfg.n_splits, (i, ones, mask)
+        ones = sum(leaf.extra_fields["branch_token_mask"])
+        assert 0 <= ones <= loop.branching_cfg.n_splits, (i, ones)
 
-    # At least one teacher query must have happened.
     teacher_calls = [c for c in server.calls if c["max_tokens"] == 1]
     assert len(teacher_calls) >= 1, "no teacher branch-point query was issued"
 
-    # All calls must use the same request_id (sticky LRU).
     rids = {c["request_id"] for c in server.calls}
     assert len(rids) == 1, f"expected single traj_id, got {rids}"
 
-    # Student calls must use logprobs=K (int).
     student_calls = [c for c in server.calls if c["max_tokens"] != 1]
     for c in student_calls:
         assert isinstance(c["logprobs"], int) and c["logprobs"] == 5, c
 
-    print(f"BranchingAgentLoop._run_branching_pipeline OK")
+    # REGRESSION: each leaf must own its own extra_fields dict. Mutating one
+    # cannot leak to another. Important for _agent_loop_postprocess hardening.
+    for i in range(len(leaves)):
+        for j in range(i + 1, len(leaves)):
+            assert id(leaves[i].extra_fields) != id(leaves[j].extra_fields), (
+                f"leaves {i} and {j} share extra_fields dict (id={id(leaves[i].extra_fields)})"
+            )
+            # Lists inside extra_fields must also be distinct.
+            mi = leaves[i].extra_fields.get("branch_token_mask")
+            mj = leaves[j].extra_fields.get("branch_token_mask")
+            if mi is not None and mj is not None and mi == mj:
+                # Even if the values match (siblings of the same split share
+                # the same mask up to their tree depth), the LIST objects
+                # should be distinct so a downstream mutation of one cannot
+                # leak to the other.
+                assert id(mi) != id(mj), (
+                    f"leaves {i} and {j} share branch_token_mask list (id={id(mi)})"
+                )
+
+    print(f"[scenario: full tree] OK")
     print(f"  leaves: {len(leaves)}")
     print(f"  total vLLM calls: {len(server.calls)}")
     print(f"  student calls: {len(student_calls)}")
     print(f"  teacher calls: {len(teacher_calls)}")
     print(f"  branch_mask ones per leaf: {[sum(l.extra_fields['branch_token_mask']) for l in leaves]}")
+    print(f"  extra_fields ids unique: ✓")
+
+
+class _NoTopLogprobsServer(_FakeServerManager):
+    """Server that returns top_logprobs=None for all calls — forces the
+    ``_fallback_n_copies`` path."""
+
+    async def generate(self, *, request_id, prompt_ids, sampling_params, image_data=None, video_data=None):
+        out = await super().generate(
+            request_id=request_id, prompt_ids=prompt_ids, sampling_params=sampling_params,
+            image_data=image_data, video_data=video_data,
+        )
+        out.top_logprobs = None
+        return out
+
+
+def _scenario_fallback_no_top_logprobs() -> None:
+    """Force the no-top-logprobs fallback path; verify _fallback_n_copies builds
+    fresh extra_fields per leaf."""
+    loop, _, _ = _build_loop()
+    # Swap server with the no-top-logprobs variant.
+    loop.server_manager = _NoTopLogprobsServer()
+    kwargs = {
+        "raw_prompt": [{"role": "user", "content": "Q?"}],
+        "reward_model": {"ground_truth": "A"},
+    }
+    sampling_params = {"temperature": 0.7, "top_p": 1.0, "logprobs": False}
+    loop._root_prompt_len = 3
+    leaves = asyncio.get_event_loop().run_until_complete(
+        loop._run_branching_pipeline(
+            prompt_ids=[10, 11, 12],
+            sampling_params=sampling_params,
+            images=None, videos=None,
+            multi_modal_data={},
+            kwargs=kwargs,
+        )
+    )
+    n_expected = 2 ** loop.branching_cfg.n_splits
+    assert len(leaves) == n_expected, len(leaves)
+    # Every leaf is a fallback copy with leaf_id 0..n-1 and zero branch tokens.
+    for i, leaf in enumerate(leaves):
+        ef = leaf.extra_fields
+        assert ef["leaf_id"] == i, (i, ef.get("leaf_id"))
+        assert sum(ef["branch_token_mask"]) == 0
+        assert ef["branching_fallback"] == "no_top_logprobs", ef.get("branching_fallback")
+    # Crucially: extra_fields dicts and inner lists are unique per leaf.
+    for i in range(len(leaves)):
+        for j in range(i + 1, len(leaves)):
+            assert id(leaves[i].extra_fields) != id(leaves[j].extra_fields)
+            assert id(leaves[i].extra_fields["branch_token_mask"]) != id(
+                leaves[j].extra_fields["branch_token_mask"]
+            )
+    print(f"[scenario: fallback no-top-logprobs] OK")
+    print(f"  leaves: {len(leaves)}, all fresh extra_fields")
+
+
+def _scenario_pad_after_shallow_tree() -> None:
+    """Build a synthetic shallow leaf list (1 leaf), call _pad_leaves_to_n,
+    verify the padded duplicates own their own dict / lists."""
+    loop, _, bal = _build_loop()
+
+    # Build one source leaf.
+    source = bal.AgentLoopOutput  # type: ignore[attr-defined]
+    src_leaf = source(
+        prompt_ids=[1, 2, 3],
+        response_ids=[10, 11, 12],
+        response_mask=[1, 1, 1],
+        response_logprobs=[-0.1, -0.2, -0.3],
+        multi_modal_data={},
+        num_turns=2,
+        metrics=None,
+        extra_fields={
+            "branch_token_mask": [0, 1, 0],
+            "leaf_id": 0,
+            "leaf_depth": 1,
+        },
+    )
+    padded = loop._pad_leaves_to_n([src_leaf], 4)
+    assert len(padded) == 4
+    # All four must have unique dicts.
+    ids = {id(p.extra_fields) for p in padded}
+    assert len(ids) == 4, f"expected 4 distinct extra_fields dicts, got {len(ids)}"
+    # And unique inner lists.
+    list_ids = {id(p.extra_fields["branch_token_mask"]) for p in padded}
+    assert len(list_ids) == 4, f"expected 4 distinct mask lists, got {len(list_ids)}"
+    # Padded duplicates carry an is_padded_duplicate marker.
+    assert padded[0].extra_fields.get("is_padded_duplicate") is not True
+    for p in padded[1:]:
+        assert p.extra_fields.get("is_padded_duplicate") is True, p.extra_fields
+
+    # Mutating one padded leaf's dict must not leak to others.
+    padded[1].extra_fields["branch_token_mask"][0] = 99
+    assert padded[2].extra_fields["branch_token_mask"][0] == 0, "shallow-copy regression"
+    print(f"[scenario: pad shallow tree] OK — 4 leaves, all dicts independent")
+
+
+def main() -> None:
+    _scenario_full_tree()
+    _scenario_fallback_no_top_logprobs()
+    _scenario_pad_after_shallow_tree()
+    print()
+    print("ALL 3 SCENARIOS PASS")
 
 
 if __name__ == "__main__":

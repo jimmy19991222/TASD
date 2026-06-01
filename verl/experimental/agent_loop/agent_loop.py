@@ -523,6 +523,11 @@ class AgentLoopWorker:
             )
 
             agent_loop_config = _agent_loop_registry[agent_name]
+            # Plumb the trainer's global step into kwargs so trajectory-aware
+            # agent loops (e.g. BranchingAgentLoop's per-step coordination
+            # cache key) can use it as a defense-in-depth signal alongside the
+            # explicit clear_branching_cache hook.
+            kwargs.setdefault("generation_step", int(trajectory.get("step", 0)))
             agent_loop = hydra.utils.instantiate(
                 config=agent_loop_config,
                 trainer_config=DictConfigWrap(config=self.config),
@@ -600,7 +605,11 @@ class AgentLoopWorker:
             response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
 
         branch_token_mask = None
-        btm_raw = output.extra_fields.pop("branch_token_mask", None) if output.extra_fields else None
+        # Use .get(..., None) (NOT .pop) so siblings sharing an extra_fields dict
+        # via a shallow copy don't clobber each other. BranchingAgentLoop already
+        # builds fresh dicts per leaf, but this guard makes the postprocess
+        # idempotent and tolerant of future producers.
+        btm_raw = output.extra_fields.get("branch_token_mask") if output.extra_fields else None
         if btm_raw is not None:
             response_length = self.config.actor_rollout_ref.rollout.response_length
             btm_list = list(btm_raw)[:response_length]
@@ -771,10 +780,24 @@ class AgentLoopWorker:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
         if inputs[0].routed_experts is not None:
             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
-        if inputs[0].branch_token_mask is not None:
-            optional_outputs["branch_token_mask"] = torch.cat(
-                [input.branch_token_mask for input in inputs], dim=0
-            )
+        # branch_token_mask: opt-in field from BranchingAgentLoop. Treat absence
+        # as all-zeros for robustness — historically `inputs[0]` could be the
+        # only None among siblings (e.g., when a fallback leaf landed in the
+        # first position) and silently dropping the field would disable the
+        # downstream Phase-2 weighting. Now: aggregate iff ANY input carries
+        # the mask, zero-fill the missing entries.
+        any_btm = any(getattr(input, "branch_token_mask", None) is not None for input in inputs)
+        if any_btm:
+            response_length = inputs[0].response_ids.shape[-1]
+            btm_chunks = []
+            for input in inputs:
+                if input.branch_token_mask is not None:
+                    btm_chunks.append(input.branch_token_mask)
+                else:
+                    btm_chunks.append(
+                        torch.zeros(1, response_length, dtype=torch.long)
+                    )
+            optional_outputs["branch_token_mask"] = torch.cat(btm_chunks, dim=0)
 
         batch = TensorDict(
             {

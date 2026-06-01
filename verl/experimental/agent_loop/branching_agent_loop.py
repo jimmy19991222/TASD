@@ -179,26 +179,35 @@ class BranchingAgentLoop(AgentLoopBase):
 
         # Each sibling row claims a leaf index. If rollout.n > 2^n_splits the
         # extras wrap around (duplicate leaves); typical config aligns the two.
-        branch_index = int(kwargs.get("branch_index", -1))
-        if branch_index < 0:
-            branch_index = await _claim_branch_index(cache_key, self.n_leaves)
+        # If branch_index is explicit (callers pre-assign), we don't bump the
+        # counter — bumping with no consumer was redundant and risked drift
+        # against claimed indices.
+        explicit_index = int(kwargs.get("branch_index", -1))
+        if explicit_index >= 0:
+            branch_index = explicit_index
+            counter_bumped = False
         else:
-            # Even with explicit indices we still bump the counter so that
-            # _branching_index_counters_clear keeps a consistent picture.
-            await _claim_branch_index(cache_key, self.n_leaves)
+            branch_index = await _claim_branch_index(cache_key, self.n_leaves)
+            counter_bumped = True
 
         metrics: dict[str, Any] = {}
         # Coordination: at most one sibling actually runs the pipeline; others await.
         async with _BRANCHING_CACHE_LOCK:
             future = _BRANCHING_CACHE.get(cache_key)
             if future is None:
-                future = asyncio.get_event_loop().create_future()
+                # Use get_running_loop in async context to avoid Python 3.12
+                # implicit-loop creation deprecation.
+                future = asyncio.get_running_loop().create_future()
                 _BRANCHING_CACHE[cache_key] = future
                 am_owner = True
             else:
                 am_owner = False
 
         if am_owner:
+            # Wrap the pipeline in try/except so a single bad prompt cannot
+            # blast-radius into all 8 sibling rows + the entire batch chunk.
+            # On failure the owner emits a fallback set of identical leaves and
+            # surfaces the error via diagnostics rather than re-raising.
             try:
                 with simple_timer("branching_pipeline", metrics):
                     leaves = await self._run_branching_pipeline(
@@ -211,10 +220,39 @@ class BranchingAgentLoop(AgentLoopBase):
                     )
                 future.set_result(leaves)
             except BaseException as e:  # noqa: BLE001
-                future.set_exception(e)
-                raise
+                logger.exception(
+                    "BranchingAgentLoop pipeline failed (cache_key=%s); "
+                    "falling back to single-chain n_copies leaves.", cache_key,
+                )
+                # Best-effort fallback so siblings still get well-formed leaves.
+                # If even the fallback fails we propagate to siblings.
+                try:
+                    fallback_leaves = self._fallback_n_copies(
+                        prompt_ids=prompt_ids,
+                        response_tokens=[],
+                        response_logprobs=None,
+                        multi_modal_data=multi_modal_data,
+                        reason=f"pipeline_exception:{type(e).__name__}",
+                    )
+                    future.set_result(fallback_leaves)
+                except BaseException as fb_err:  # noqa: BLE001
+                    future.set_exception(fb_err)
+                    raise
 
-        leaves = await future
+        try:
+            leaves = await future
+        except BaseException:
+            # Owner pipeline genuinely failed and even the fallback didn't fire
+            # (or our row is non-owner and the owner's fallback also raised).
+            # Roll back this sibling's counter claim so the next PPO step starts
+            # clean even if clear_branching_cache is somehow skipped.
+            if counter_bumped:
+                async with _BRANCHING_INDEX_COUNTERS_LOCK:
+                    if cache_key in _BRANCHING_INDEX_COUNTERS:
+                        _BRANCHING_INDEX_COUNTERS[cache_key] = max(
+                            0, _BRANCHING_INDEX_COUNTERS[cache_key] - 1
+                        )
+            raise
 
         if not (0 <= branch_index < len(leaves)):
             raise RuntimeError(
@@ -501,6 +539,20 @@ class BranchingAgentLoop(AgentLoopBase):
             return node
         diag["splits_succeeded"] += 1
 
+        # Pre-flight budget check: if any child would have zero room to fit even
+        # the branch token + at least one continuation token, abort the split
+        # entirely and return this node as a leaf. The earlier remaining==0
+        # branch produced a zero-segment child that silently dropped the branch
+        # token from the response (it lived only in prefix_tokens, which the
+        # leaf flattener never emits) — degrading the split to two byte-
+        # identical siblings with depth-1 ones in the mask. Cleanest fix is to
+        # not split at all when the budget is exhausted.
+        already_used_at_branch = (
+            (len(prefix_ids) - self._root_prompt_len) + len(segment_tokens[:p]) + 1
+        )
+        if already_used_at_branch >= self.response_length:
+            return node
+
         node.is_leaf = False
         node.branch_position = p
         # Generate the two child continuations.
@@ -519,13 +571,15 @@ class BranchingAgentLoop(AgentLoopBase):
             )
             remaining = max(0, self.response_length - already_used)
             if remaining == 0:
-                # No room to continue; child is an immediate leaf carrying just the branch token.
+                # Edge: pre-flight passed but a sibling consumed the last token.
+                # The branch token still needs to land in the response, so emit
+                # a 1-token leaf segment carrying just the chosen token.
                 child_node = BranchNode(
-                    prefix_tokens=child_prefix,
-                    segment_tokens=[],
-                    segment_entropies=[],
-                    segment_logprobs=[],
-                    segment_branch_mask=[],
+                    prefix_tokens=list(prefix_ids) + list(segment_tokens[:p]),
+                    segment_tokens=[int(chosen_token)],
+                    segment_entropies=[0.0],
+                    segment_logprobs=[0.0],
+                    segment_branch_mask=[1],
                     depth=depth + 1,
                     is_leaf=True,
                 )
@@ -704,16 +758,58 @@ class BranchingAgentLoop(AgentLoopBase):
     def _pad_leaves_to_n(self, leaves: list[AgentLoopOutput], n: int) -> list[AgentLoopOutput]:
         """Ensure exactly ``n`` leaves by duplicating the last produced leaf
         when the tree was shallower than expected. Never produce empty leaves
-        — torch.cat in _postprocess would explode on shape mismatch."""
+        — torch.cat in _postprocess would explode on shape mismatch.
+
+        IMPORTANT: each duplicate must own its own ``extra_fields`` dict
+        (Pydantic ``model_copy(deep=False)`` shares dict references). Without
+        this, downstream mutation in ``_agent_loop_postprocess`` (which
+        ``pop()``s ``branch_token_mask`` and writes ``raw_prompt``) would
+        clobber siblings and crash ``torch.cat`` in the aggregator.
+        """
         if len(leaves) >= n:
             return leaves[:n]
         if not leaves:
             raise RuntimeError("BranchingAgentLoop._pad_leaves_to_n: no leaves to pad from")
         last = leaves[-1]
+        pad_idx = 0
         while len(leaves) < n:
-            # Shallow-copy: the AgentLoopOutput is a Pydantic model; copy() is fine.
-            leaves.append(last.model_copy(deep=False))
+            pad_idx += 1
+            leaves.append(self._clone_leaf(last, leaf_id_override=last.extra_fields.get("leaf_id", 0), pad_index=pad_idx))
         return leaves
+
+    @staticmethod
+    def _clone_leaf(
+        source: AgentLoopOutput,
+        *,
+        leaf_id_override: Optional[int] = None,
+        pad_index: int = 0,
+    ) -> AgentLoopOutput:
+        """Build a fresh AgentLoopOutput with its OWN extra_fields/list buffers,
+        deep-copying mutable per-row state so post-processing can safely pop /
+        write into one without affecting siblings."""
+        src_extra = source.extra_fields or {}
+        # Lists are stored by-reference inside the Pydantic model — we copy them
+        # explicitly so per-row mutations stay local.
+        src_metrics = getattr(source, "metrics", None)
+        return AgentLoopOutput(
+            prompt_ids=list(source.prompt_ids),
+            response_ids=list(source.response_ids),
+            response_mask=list(source.response_mask),
+            response_logprobs=(
+                list(source.response_logprobs) if source.response_logprobs is not None else None
+            ),
+            routed_experts=getattr(source, "routed_experts", None),
+            multi_modal_data=source.multi_modal_data,
+            num_turns=source.num_turns,
+            metrics=AgentLoopMetrics(**src_metrics.model_dump()) if src_metrics is not None else AgentLoopMetrics(),
+            extra_fields={
+                **{k: (list(v) if isinstance(v, list) else (dict(v) if isinstance(v, dict) else v))
+                   for k, v in src_extra.items()},
+                "leaf_id": leaf_id_override if leaf_id_override is not None else src_extra.get("leaf_id", 0),
+                "is_padded_duplicate": True,
+                "pad_index": pad_index,
+            },
+        )
 
     def _fallback_n_copies(
         self,
@@ -725,23 +821,30 @@ class BranchingAgentLoop(AgentLoopBase):
         reason: str,
     ) -> list[AgentLoopOutput]:
         """Build ``n_leaves`` identical leaves from a single chain. Used when
-        we cannot branch (no top_logprobs surfaced, chain too short, etc.)."""
+        we cannot branch (no top_logprobs surfaced, chain too short, etc.).
+
+        Each leaf gets its OWN extra_fields dict / list buffers so per-row
+        mutation in ``_agent_loop_postprocess`` cannot leak across siblings.
+        """
         truncate = self.response_length
         tokens = list(response_tokens[:truncate])
         lps = list((response_logprobs or [0.0] * len(tokens))[:truncate])
-        single = AgentLoopOutput(
-            prompt_ids=prompt_ids,
-            response_ids=tokens,
-            response_mask=[1] * len(tokens),
-            response_logprobs=lps,
-            multi_modal_data=multi_modal_data,
-            num_turns=2,
-            metrics=AgentLoopMetrics(),
-            extra_fields={
-                "branch_token_mask": [0] * len(tokens),
-                "leaf_id": 0,
-                "leaf_depth": 0,
-                "branching_fallback": reason,
-            },
-        )
-        return [single] + [single.model_copy(deep=False) for _ in range(self.n_leaves - 1)]
+
+        def _build(leaf_id: int) -> AgentLoopOutput:
+            return AgentLoopOutput(
+                prompt_ids=list(prompt_ids),
+                response_ids=list(tokens),
+                response_mask=[1] * len(tokens),
+                response_logprobs=list(lps),
+                multi_modal_data=multi_modal_data,
+                num_turns=2,
+                metrics=AgentLoopMetrics(),
+                extra_fields={
+                    "branch_token_mask": [0] * len(tokens),
+                    "leaf_id": leaf_id,
+                    "leaf_depth": 0,
+                    "branching_fallback": reason,
+                },
+            )
+
+        return [_build(i) for i in range(self.n_leaves)]
