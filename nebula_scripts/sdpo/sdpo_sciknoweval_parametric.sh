@@ -19,11 +19,22 @@ check_env MODEL_NAME
 
 SEED="${SEED:-42}"
 
+# Checkpoint / validation cadence (env-overridable)
+TEST_FREQ="${TEST_FREQ:-10}"
+SAVE_FREQ="${SAVE_FREQ:-10}"
+VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-True}"
+SAVE_HF_ONLY="${SAVE_HF_ONLY:-True}"
+if [ "${SAVE_HF_ONLY}" = "True" ]; then
+    SAVE_CONTENTS_HYDRA="[hf_model]"
+else
+    SAVE_CONTENTS_HYDRA="[model,optimizer,extra,hf_model]"
+fi
+
 # 数据集路径
 train_data_path="${OSS_ROOT}/datasets/${DATASET}/train.parquet"
 val_data_path="${OSS_ROOT}/datasets/${DATASET}/test.parquet"
 model_path="${OSS_ROOT}/base_models/${MODEL_NAME}"
-save_path="${OSS_ROOT}/models/${JOB_NAME:-sdpo_sweep}"
+save_path="${OSS_ROOT}/rl_models/${JOB_NAME:-sdpo_sweep}"
 
 # ── 环境 ──────────────────────────────────────────────────────────────
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
@@ -56,6 +67,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.self_distillation.alpha=${ALPHA} \
     actor_rollout_ref.actor.self_distillation.dont_reprompt_on_self_success=${DONT_REPROMPT_ON_SELF_SUCCESS} \
     actor_rollout_ref.actor.self_distillation.include_environment_feedback=False \
+    actor_rollout_ref.actor.checkpoint.save_contents=${SAVE_CONTENTS_HYDRA} \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.rollout.n=${ROLLOUT_N} \
     actor_rollout_ref.rollout.val_kwargs.n=16 \
@@ -64,10 +76,12 @@ python -m verl.trainer.main_ppo \
     algorithm.rollout_correction.rollout_is=token \
     trainer.total_epochs=30 \
     trainer.total_training_steps=250 \
-    trainer.save_freq=-1 \
+    trainer.save_freq=${SAVE_FREQ} \
+    trainer.max_actor_ckpt_to_keep=null \
+    trainer.test_freq=${TEST_FREQ} \
     trainer.save_best_metric="val-core/sciknoweval/acc/mean@16" \
     trainer.n_gpus_per_node=4 \
-    trainer.val_before_train=False \
+    trainer.val_before_train=${VAL_BEFORE_TRAIN} \
     trainer.default_local_dir="${save_path}" \
     trainer.project_name="${PROJECT_NAME:-Baselines}" \
     trainer.experiment_name="${JOB_NAME:-sdpo_sweep}" \
