@@ -25,6 +25,11 @@
 #                training time. Use --loss-mode same as above.
 #   all        : baseline + branching (does NOT include sdpo by default —
 #                that's a heavier sweep; pass --variant sdpo explicitly).
+#   compare    : 3 GRPO branching + 3 SDPO branching = 6 jobs, NO baselines.
+#                For when historical vanilla GRPO/SDPO baselines already
+#                exist in SwanLab on prior commits. Cross-commit comparison
+#                via SwanLab git_branch/git_commit fields (recorded by the
+#                runs since commit 4f57094).
 # =============================================================================
 
 # ── Nebula 账号配置 ──────────────────────────────────────────────────────
@@ -190,6 +195,43 @@ if [[ "$VARIANT" == "all" || "$VARIANT" == "branching" ]]; then
         _submit_job "$SCRIPT_PATH" "$JOB_NAME" \
             "$(_common_env "$JOB_NAME" "$DATASET" "$MODEL_NAME" "$LR" "$MINI_BATCH_SIZE") --env=BRANCHING_ENABLED=True --env=N_SPLITS=${N_SPLITS} --env=TOP_K=${TOP_K} --env=ENTROPY_WINDOW=${ENTROPY_WINDOW} --env=ENTROPY_SIGMA_START=${ENTROPY_SIGMA_START} --env=ENTROPY_SIGMA_FLOOR=${ENTROPY_SIGMA_FLOOR} --env=ENTROPY_SIGMA_STEP=${ENTROPY_SIGMA_STEP} --env=TEACHER_CONTEXT_MODE=${TEACHER_CONTEXT_MODE} --env=BRANCH_TOKEN_LOSS_MODE=${BTM} --env=ADV_STD_FLOOR=${ADV_STD_FLOOR}"
     done; done; done; done; done
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Variant: compare — head-to-head GRPO branching vs SDPO branching.
+# 3 GRPO branching jobs (loss_mode ∈ {all, mask, only}) plus 3 SDPO branching
+# jobs (same loss_mode set). NO baselines. Designed for the case where the
+# user already has vanilla GRPO/SDPO control runs from a prior commit.
+# ─────────────────────────────────────────────────────────────────────────────
+if [[ "$VARIANT" == "compare" ]]; then
+    # GRPO branching arm (3 jobs)
+    SCRIPT_PATH="nebula_scripts/grpo/grpo_branching_sciknoweval_parametric.sh"
+    for DATASET in "${DATASETS[@]}"; do
+    for MODEL_NAME in "${MODEL_NAMES[@]}"; do
+    for LR in "${LRS[@]}"; do
+    for MINI_BATCH_SIZE in "${MINI_BATCH_SIZES[@]}"; do
+    for BTM in "all" "mask" "only"; do
+        DATASET_SHORT=$(echo "$DATASET" | tr '/' '-')
+        LR_TAG=$(echo "$LR" | tr '-' '_')
+        CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
+        JOB_NAME="TGB-GRPO-${DATASET_SHORT}-${TEACHER_CONTEXT_MODE}-btm${BTM}-mbs${MINI_BATCH_SIZE}-lr${LR_TAG}-${MODEL_NAME}-${CURRENT_TIME}"
+        _submit_job "$SCRIPT_PATH" "$JOB_NAME" \
+            "$(_common_env "$JOB_NAME" "$DATASET" "$MODEL_NAME" "$LR" "$MINI_BATCH_SIZE") --env=BRANCHING_ENABLED=True --env=N_SPLITS=${N_SPLITS} --env=TOP_K=${TOP_K} --env=ENTROPY_WINDOW=${ENTROPY_WINDOW} --env=ENTROPY_SIGMA_START=${ENTROPY_SIGMA_START} --env=ENTROPY_SIGMA_FLOOR=${ENTROPY_SIGMA_FLOOR} --env=ENTROPY_SIGMA_STEP=${ENTROPY_SIGMA_STEP} --env=TEACHER_CONTEXT_MODE=${TEACHER_CONTEXT_MODE} --env=BRANCH_TOKEN_LOSS_MODE=${BTM} --env=ADV_STD_FLOOR=${ADV_STD_FLOOR}"
+    done; done; done; done; done
+
+    # SDPO branching arm (3 jobs)
+    SCRIPT_PATH="nebula_scripts/sdpo/sdpo_branching_sciknoweval_parametric.sh"
+    for DATASET in "${DATASETS[@]}"; do
+    for MODEL_NAME in "${MODEL_NAMES[@]}"; do
+    for LR in "${LRS[@]}"; do
+    for BTM in "all" "mask" "only"; do
+        DATASET_SHORT=$(echo "$DATASET" | tr '/' '-')
+        LR_TAG=$(echo "$LR" | tr '-' '_')
+        CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
+        JOB_NAME="TGB-SDPO-${DATASET_SHORT}-${TEACHER_CONTEXT_MODE}-alpha${SDPO_ALPHA}-btm${BTM}-lr${LR_TAG}-${MODEL_NAME}-${CURRENT_TIME}"
+        _submit_job "$SCRIPT_PATH" "$JOB_NAME" \
+            "$(_common_env "$JOB_NAME" "$DATASET" "$MODEL_NAME" "$LR" "32") --env=ALPHA=${SDPO_ALPHA} --env=DONT_REPROMPT_ON_SELF_SUCCESS=${SDPO_DONT_REPROMPT_ON_SELF_SUCCESS} --env=BRANCHING_ENABLED=True --env=N_SPLITS=${N_SPLITS} --env=TOP_K=${TOP_K} --env=ENTROPY_WINDOW=${ENTROPY_WINDOW} --env=ENTROPY_SIGMA_START=${ENTROPY_SIGMA_START} --env=ENTROPY_SIGMA_FLOOR=${ENTROPY_SIGMA_FLOOR} --env=ENTROPY_SIGMA_STEP=${ENTROPY_SIGMA_STEP} --env=TEACHER_CONTEXT_MODE=${TEACHER_CONTEXT_MODE} --env=BRANCH_TOKEN_LOSS_MODE=${BTM} --env=ADV_STD_FLOOR=${ADV_STD_FLOOR}"
+    done; done; done; done
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
