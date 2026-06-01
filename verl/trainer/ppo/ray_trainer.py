@@ -1658,7 +1658,12 @@ class RayPPOTrainer:
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
             default_backend=self.config.trainer.logger,
-            config=OmegaConf.to_container(self.config, resolve=True),
+            config={
+                **OmegaConf.to_container(self.config, resolve=True),
+                # Add git info from environment variables for experiment traceability
+                "git_branch": os.environ.get("GIT_BRANCH", "unknown"),
+                "git_commit": os.environ.get("GIT_COMMIT", "unknown"),
+            },
             group_name=_swanlab_group,
             tags=_swanlab_tags,
         )
@@ -1678,6 +1683,9 @@ class RayPPOTrainer:
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
+            # Also save initial best (step 0) so OOD eval has a pre-training reference and
+            # the save-best pipeline is exercised before the first test_freq tick.
+            self._maybe_save_best_checkpoint(val_metrics)
             if self.config.trainer.get("val_only", False):
                 return
 
