@@ -26,6 +26,7 @@ __all__ = [
     "MultiTurnConfig",
     "CustomAsyncServerConfig",
     "AgentLoopConfig",
+    "BranchingConfig",
     "TraceConfig",
     "ServerConfig",
     "PrometheusConfig",
@@ -75,6 +76,80 @@ class AgentLoopConfig(BaseConfig):
     # Fully qualified class name for custom AgentLoopManager (e.g., "mypackage.module.MyManager").
     # Security: This class will be dynamically imported via importlib. Only use trusted class paths.
     agent_loop_manager_class: Optional[str] = None
+
+
+@dataclass
+class BranchingConfig(BaseConfig):
+    """Configuration for teacher-guided branching rollout.
+
+    See research/teacher_branching_rollout.md.
+
+    Attributes:
+        enabled: Master switch. When False (default) the rollout falls back
+            to the standard single_turn_agent behaviour.
+        n_splits: Number of binary splits per prompt. With rollout_n=8 the
+            balanced tree depth is 3, yielding 2^n_splits = 8 leaves.
+        top_k: How many top logprobs vLLM should return per generated token.
+            Used both for student entropy estimation and for the teacher
+            branch-point query. K=50 is the default; raise if the student/
+            teacher top-K intersection is too thin.
+        entropy_window: Window size W for the rolling z-score.
+        entropy_protect_window: Protect window — first P tokens are never
+            flagged as decision tokens (running stats unstable). Defaults to W.
+        entropy_sigma_start: Initial threshold k in H_t > mean + k*std.
+        entropy_sigma_floor: Lower bound during σ-relaxation.
+        entropy_sigma_step: How much to lower σ per relaxation iteration.
+        teacher_context_mode: Which teacher context to use at branch points.
+            One of {marker, gt_marker, ref_gt}. ref-from-peer is NOT supported
+            here because peer rollouts haven't completed during branching.
+        teacher_context_template: Free-form override of the marker text. If
+            None, falls back to actor.self_distillation.gt_marker_template.
+        teacher_branch_query_max_tokens: How many tokens to generate when
+            asking the teacher engine to score top-K (always 1 in V1).
+        fallback_to_student_topk: If teacher top-K and student top-K intersect
+            in fewer than 2 tokens, fall back to student's own top-1 / top-2.
+        require_distinct_branches: If both children would carry the same
+            token, treat the branch as failed (skip splitting at that
+            position). Otherwise drop one child.
+    """
+
+    enabled: bool = False
+    n_splits: int = 3
+    top_k: int = 50
+    entropy_window: int = 20
+    entropy_protect_window: Optional[int] = None
+    entropy_sigma_start: float = 2.0
+    entropy_sigma_floor: float = 0.5
+    entropy_sigma_step: float = 0.5
+    teacher_context_mode: str = "gt_marker"
+    teacher_context_template: Optional[str] = None
+    teacher_branch_query_max_tokens: int = 1
+    fallback_to_student_topk: bool = True
+    require_distinct_branches: bool = True
+
+    def __post_init__(self):
+        if self.enabled:
+            if self.n_splits < 1:
+                raise ValueError(f"branching.n_splits must be >= 1, got {self.n_splits}")
+            if self.top_k < 2:
+                raise ValueError(f"branching.top_k must be >= 2, got {self.top_k}")
+            if self.entropy_window <= 1:
+                raise ValueError(f"branching.entropy_window must be > 1, got {self.entropy_window}")
+            if self.entropy_sigma_floor > self.entropy_sigma_start:
+                raise ValueError(
+                    "branching.entropy_sigma_floor must be <= entropy_sigma_start, "
+                    f"got floor={self.entropy_sigma_floor} start={self.entropy_sigma_start}"
+                )
+            valid_modes = {"marker", "gt_marker", "ref_gt"}
+            if self.teacher_context_mode not in valid_modes:
+                raise ValueError(
+                    f"branching.teacher_context_mode must be one of {valid_modes}, "
+                    f"got {self.teacher_context_mode!r}"
+                )
+
+    @property
+    def effective_protect_window(self) -> int:
+        return self.entropy_protect_window if self.entropy_protect_window is not None else self.entropy_window
 
 
 @dataclass
@@ -178,6 +253,9 @@ class RolloutConfig(BaseConfig):
     trace: TraceConfig = field(default_factory=TraceConfig)
 
     multi_turn: MultiTurnConfig = field(default_factory=MultiTurnConfig)
+
+    # Teacher-guided branching rollout (off by default).
+    branching: BranchingConfig = field(default_factory=BranchingConfig)
 
     # Server configuration for sglang server mode
     server: ServerConfig = field(default_factory=ServerConfig)

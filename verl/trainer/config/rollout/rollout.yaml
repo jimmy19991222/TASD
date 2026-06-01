@@ -198,6 +198,55 @@ multi_turn:
   # Number of repeat rollouts for each interaction
   num_repeat_rollouts: null
 
+# Teacher-guided branching rollout (off by default).
+# See research/teacher_branching_rollout.md.
+branching:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.workers.config.BranchingConfig
+
+  # Master switch. When False the rollout falls back to single_turn_agent.
+  enabled: False
+
+  # Number of binary splits per prompt. With rollout_n=8 the balanced tree depth is 3 → 8 leaves.
+  n_splits: 3
+
+  # How many top logprobs vLLM should return per generated token. Used for both student
+  # entropy estimation and teacher branch-point scoring.
+  top_k: 50
+
+  # Rolling-window size W for the z-score detector.
+  entropy_window: 20
+
+  # Protect window — first P tokens never flagged as decision tokens. Defaults to entropy_window.
+  entropy_protect_window: null
+
+  # Initial threshold k in: H_t > running_mean + k * running_std.
+  entropy_sigma_start: 2.0
+
+  # Lower bound during σ-relaxation.
+  entropy_sigma_floor: 0.5
+
+  # σ step size during relaxation.
+  entropy_sigma_step: 0.5
+
+  # Which teacher context to use at branch points. One of {marker, gt_marker, ref_gt}.
+  # ref-from-peer is NOT supported here (peer rollouts haven't completed during branching).
+  teacher_context_mode: gt_marker
+
+  # Optional override for the marker text. If null, uses
+  # actor_rollout_ref.actor.self_distillation.gt_marker_template.
+  teacher_context_template: null
+
+  # How many tokens to generate when asking the teacher engine to score top-K (always 1 in V1).
+  teacher_branch_query_max_tokens: 1
+
+  # If teacher and student top-K intersect in fewer than 2 tokens, fall back to student top-1/top-2.
+  fallback_to_student_topk: True
+
+  # If both children would carry the same token, skip the split at that position.
+  require_distinct_branches: True
+
 # support logging rollout prob for debugging purpose
 # "Truncated importance sampling" requires rollout log probs, set to True when turning on Truncated importance sampling
 calculate_log_probs: False
