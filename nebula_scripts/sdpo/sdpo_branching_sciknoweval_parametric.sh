@@ -118,7 +118,7 @@ python -m verl.trainer.main_ppo \
     algorithm.rollout_correction.rollout_is=token \
     algorithm.adv_std_floor=${ADV_STD_FLOOR} \
     trainer.total_epochs=30 \
-    trainer.total_training_steps=250 \
+    trainer.total_training_steps=300 \
     trainer.save_freq=${SAVE_FREQ} \
     trainer.max_actor_ckpt_to_keep=null \
     trainer.test_freq=${TEST_FREQ} \
