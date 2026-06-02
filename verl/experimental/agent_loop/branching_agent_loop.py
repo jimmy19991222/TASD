@@ -248,22 +248,21 @@ class BranchingAgentLoop(AgentLoopBase):
                     )
                     future.set_result(fallback_leaves)
                 except BaseException as plain_err:  # noqa: BLE001
+                    # Both branching AND plain rollout failed for this prompt.
+                    # Previously we substituted EOS-only leaves here, but that
+                    # produced n_leaves IDENTICAL responses → group_std=0 →
+                    # GRPO advantage=0 → grad_norm=0 — the exact dead-batch
+                    # collapse the outer fallback was added to prevent.
+                    # Re-raise so the trainer sees a real failure and the
+                    # async_rollout_manager can surface it (the alternative
+                    # — silently degenerating the PPO group baseline — was
+                    # found by the Phase 1c.2 audit to be worse).
                     logger.exception(
                         "Plain-rollout fallback also failed for cache_key=%s; "
-                        "emitting EOS-only leaves.", cache_key,
+                        "propagating to siblings.", cache_key,
                     )
-                    try:
-                        fallback_leaves = self._fallback_n_copies(
-                            prompt_ids=prompt_ids,
-                            response_tokens=[],
-                            response_logprobs=None,
-                            multi_modal_data=multi_modal_data,
-                            reason=f"{fallback_reason}:plain_rollout_failed:{type(plain_err).__name__}",
-                        )
-                        future.set_result(fallback_leaves)
-                    except BaseException as fb_err:  # noqa: BLE001
-                        future.set_exception(fb_err)
-                        raise
+                    future.set_exception(plain_err)
+                    raise
 
         try:
             leaves = await future
@@ -781,6 +780,7 @@ class BranchingAgentLoop(AgentLoopBase):
                         metrics=AgentLoopMetrics(),
                         extra_fields={
                             "branch_token_mask": leaf_mask,
+                            "is_branching_fallback": 0,
                             "leaf_id": node.leaf_id,
                             "leaf_depth": node.depth,
                             "branching_diag": dict(diag),
@@ -872,24 +872,43 @@ class BranchingAgentLoop(AgentLoopBase):
         videos: Optional[list[Any]],
         reason: str,
     ) -> list[AgentLoopOutput]:
-        """Fire ``n_leaves`` INDEPENDENT student rollouts and wrap each as a
-        leaf. Used when the branching pipeline raises but a plain student
-        rollout still works.
+        """Fire ``n_leaves`` INDEPENDENT student rollouts in PARALLEL and wrap
+        each as a leaf. Used when the branching pipeline raises but a plain
+        student rollout still works.
 
-        Each leaf has different response tokens (different vLLM seeds) so the
-        downstream GRPO group baseline retains variance — without this, all
-        siblings of a uid receive identical rewards, ``id_std → 0``, and the
-        advantage-from-group-mean degenerates to 0 (zero gradient).
+        Three properties matter:
+          (a) Different vLLM request_ids → different rollouts → GRPO group
+              baseline retains variance (no zero-gradient collapse).
+          (b) ``asyncio.gather`` parallelises the n_leaves calls so a fallback
+              uid does NOT pay 8× wall-clock vs the normal branching path.
+          (c) Every leaf is tagged ``is_branching_fallback=True``; dp_actor
+              treats those rows as ``branch_token_loss_mode='all'`` regardless
+              of the configured mode, so the mode×fallback interaction does
+              not silently zero out PG (B1 of the 1c.2 audit).
         """
-        leaves: list[AgentLoopOutput] = []
-        for idx in range(self.n_leaves):
-            out = await self.server_manager.generate(
+        # logprobs=0 = vLLM's "realized-token only" mode (vs False which yields
+        # None). Keeping logprobs in the request preserves response_logprobs
+        # downstream so the importance ratio doesn't degenerate.
+        sp = dict(sampling_params)
+        if sp.get("logprobs") is False or sp.get("logprobs") is None:
+            sp["logprobs"] = 0
+
+        # Parallel fan-out, one call per leaf, each with its own request_id.
+        # AsyncLLMServerManager's sticky LRU keys on request_id, so distinct
+        # uuid4 per leaf gives different replicas / different seeds.
+        async def _one_call(_idx: int):
+            return await self.server_manager.generate(
                 request_id=uuid4().hex,
                 prompt_ids=prompt_ids,
-                sampling_params=dict(sampling_params),
+                sampling_params=dict(sp),
                 image_data=images,
                 video_data=videos,
             )
+
+        outs = await asyncio.gather(*(_one_call(i) for i in range(self.n_leaves)))
+
+        leaves: list[AgentLoopOutput] = []
+        for idx, out in enumerate(outs):
             tokens = list(out.token_ids)[: self.response_length]
             if not tokens:
                 eos_id = (
@@ -911,6 +930,7 @@ class BranchingAgentLoop(AgentLoopBase):
                 metrics=AgentLoopMetrics(),
                 extra_fields={
                     "branch_token_mask": [0] * len(tokens),
+                    "is_branching_fallback": 1,
                     "leaf_id": idx,
                     "leaf_depth": 0,
                     "branching_fallback": reason,
@@ -967,6 +987,7 @@ class BranchingAgentLoop(AgentLoopBase):
                 metrics=AgentLoopMetrics(),
                 extra_fields={
                     "branch_token_mask": [0] * len(tokens),
+                    "is_branching_fallback": 1,
                     "leaf_id": leaf_id,
                     "leaf_depth": 0,
                     "branching_fallback": reason,

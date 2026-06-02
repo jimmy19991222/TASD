@@ -565,6 +565,7 @@ class DataParallelPPOActor(BasePPOActor):
         response_mask: torch.Tensor,
         branch_token_mask: Optional[torch.Tensor],
         branch_loss_mode: str,
+        is_branching_fallback: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, dict]:
         """Apply the teacher-guided branching ablation to ``response_mask``.
 
@@ -574,24 +575,46 @@ class DataParallelPPOActor(BasePPOActor):
                      (response_mask AND NOT branch_token_mask).
           ``only`` : keep ONLY branch tokens (response_mask AND branch_token_mask).
 
-        Returns ``(effective_response_mask, metrics)``. When
-        ``branch_token_mask`` is None or ``branch_loss_mode == "all"``, the
-        original ``response_mask`` is returned and ``metrics`` is empty so the
-        legacy non-branching path stays a no-op. When the mask IS active, the
-        returned ``metrics`` carries diagnostics for SwanLab.
+        For rows where ``is_branching_fallback`` is True (BranchingAgentLoop's
+        owner pipeline raised, the row is a plain student rollout), the
+        configured mode is OVERRIDDEN to ``all`` for that row only — otherwise
+        ``btm=only`` would silently zero out every fallback row's gradient
+        (mask is all-zero on fallback leaves; ``response_mask * 0 = 0``).
+
+        Returns ``(effective_response_mask, metrics)``. Diagnostic metrics
+        are emitted REGARDLESS of mode so btm=all runs are still observable
+        in SwanLab — without this, a run that silently degraded to 100%
+        fallback would be indistinguishable from healthy branching.
         """
-        if branch_token_mask is None or branch_loss_mode == "all":
+        # Fast path: mask absent (non-branching rollout) — no telemetry needed.
+        if branch_token_mask is None:
             return response_mask, {}
         btm = branch_token_mask.to(response_mask.device).to(response_mask.dtype)
-        if branch_loss_mode == "mask":
-            effective = response_mask * (1 - btm)
-        elif branch_loss_mode == "only":
-            effective = response_mask * btm
+
+        # Per-row mode application: fallback rows always run as "all".
+        if branch_loss_mode == "all":
+            effective = response_mask
+        elif branch_loss_mode in ("mask", "only"):
+            if branch_loss_mode == "mask":
+                masked = response_mask * (1 - btm)
+            else:  # "only"
+                masked = response_mask * btm
+            if is_branching_fallback is not None and is_branching_fallback.numel() > 0:
+                # is_branching_fallback shape: [B]; broadcast to [B, T] selector.
+                ifb = is_branching_fallback.to(response_mask.device).to(response_mask.dtype)
+                ifb_row = ifb.view(-1, *([1] * (response_mask.dim() - 1)))
+                # Where ifb=1, use response_mask (all-tokens); where 0, use masked.
+                effective = ifb_row * response_mask + (1.0 - ifb_row) * masked
+            else:
+                effective = masked
         else:
             raise ValueError(
                 f"branch_token_loss_mode must be one of {{all, mask, only}}, "
                 f"got {branch_loss_mode!r}"
             )
+
+        # Always-on diagnostics so btm=all and btm=mask runs are
+        # distinguishable, and silent-fallback runs are immediately visible.
         with torch.no_grad():
             base_active = response_mask.sum().clamp_min(1.0)
             eff_active = effective.sum()
@@ -602,6 +625,10 @@ class DataParallelPPOActor(BasePPOActor):
                 "branching/active_token_ratio": (eff_active / base_active).item(),
                 "branching/branch_token_count": btm.sum().item(),
             }
+            if is_branching_fallback is not None and is_branching_fallback.numel() > 0:
+                ifb = is_branching_fallback.to(torch.float32)
+                metrics["branching/fallback_row_fraction"] = ifb.mean().item()
+                metrics["branching/fallback_row_count"] = int(ifb.sum().item())
         return effective, metrics
 
     def _optimizer_step(self):
@@ -763,6 +790,12 @@ class DataParallelPPOActor(BasePPOActor):
         # GRPO loss-mode ablations (lands in Phase 2).
         if "branch_token_mask" in data.batch.keys():
             select_keys.append("branch_token_mask")
+        # is_branching_fallback travels alongside branch_token_mask: tells
+        # _apply_branch_loss_mode which rows came from a fallback path so it
+        # can override mode='all' for those rows (else btm=only silently zeros
+        # the gradient on the fallback rows).
+        if "is_branching_fallback" in data.batch.keys():
+            select_keys.append("is_branching_fallback")
 
         has_multi_modal_inputs = self._has_non_empty_multi_modal_inputs(
             data.non_tensor_batch.get("multi_modal_inputs")
@@ -858,11 +891,14 @@ class DataParallelPPOActor(BasePPOActor):
                     # from the teacher-injected branch_token_mask, applied to BOTH
                     # the SDPO distill loss and the GRPO/PPO PG loss path so the
                     # ablation modes (all/mask/only) compose consistently with
-                    # whichever loss is active.
+                    # whichever loss is active. Fallback rows (where the owner
+                    # pipeline raised) are forced to mode='all' on a per-row
+                    # basis so btm=only doesn't silently zero them out.
                     effective_response_mask, branch_metrics = self._apply_branch_loss_mode(
                         response_mask=response_mask,
                         branch_token_mask=model_inputs.get("branch_token_mask", None),
                         branch_loss_mode=self.config.policy_loss.get("branch_token_loss_mode", "all"),
+                        is_branching_fallback=model_inputs.get("is_branching_fallback", None),
                     )
                     if branch_metrics:
                         micro_batch_metrics.update(branch_metrics)

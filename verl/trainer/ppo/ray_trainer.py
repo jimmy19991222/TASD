@@ -1898,6 +1898,14 @@ class RayPPOTrainer:
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
+                        # Surface teacher-guided branching aggregates from
+                        # AgentLoopWorker._postprocess into step metrics so SwanLab
+                        # shows whether branching actually fired (vs fell back).
+                        _branching_metrics = gen_batch_output.meta_info.pop(
+                            "branching_metrics", None
+                        )
+                        if _branching_metrics:
+                            metrics.update(_branching_metrics)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:

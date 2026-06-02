@@ -179,6 +179,11 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded LongTensor [1, response_length]; 1 at positions where the
     teacher-guided branching rollout injected a branch token, 0 elsewhere.
     Only set when actor_rollout_ref.rollout.branching.enabled=True."""
+    is_branching_fallback: Optional[torch.Tensor] = None
+    """Per-row LongTensor [1]; 1 if this leaf came from a branching-fallback
+    path (owner pipeline raised, we used a plain student rollout instead),
+    else 0. Used by dp_actor to override branch_token_loss_mode='all' for
+    fallback rows so they don't get silently zero-gradient under btm=only."""
     multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None
     """Multi-modal inputs for processors (e.g., pixel_values, image_grid_thw)."""
     extra_fields: dict[str, Any] = {}
@@ -605,6 +610,7 @@ class AgentLoopWorker:
             response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
 
         branch_token_mask = None
+        is_branching_fallback = None
         # Use .get(..., None) (NOT .pop) so siblings sharing an extra_fields dict
         # via a shallow copy don't clobber each other. BranchingAgentLoop already
         # builds fresh dicts per leaf, but this guard makes the postprocess
@@ -617,6 +623,17 @@ class AgentLoopWorker:
             branch_token_mask = torch.tensor(
                 btm_list + [0] * pad_size, dtype=torch.long
             ).unsqueeze(0)
+            # Per-row scalar: 1 if this leaf came from a branching fallback
+            # path (BranchingAgentLoop's owner pipeline raised and we fell
+            # through to a plain student rollout), else 0. dp_actor uses this
+            # to override branch_token_loss_mode='all' for fallback rows so
+            # the mode×fallback interaction does NOT silently zero out the PG
+            # (e.g. btm=only on a row whose mask is all-zeros — see Phase 1c.2
+            # adversarial audit).
+            is_branching_fallback = torch.tensor(
+                [int(output.extra_fields.get("is_branching_fallback", 0) or 0)],
+                dtype=torch.long,
+            )
 
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
         attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
@@ -668,6 +685,7 @@ class AgentLoopWorker:
             response_logprobs=response_logprobs,
             routed_experts=routed_experts,
             branch_token_mask=branch_token_mask,
+            is_branching_fallback=is_branching_fallback,
             multi_modal_inputs=multi_modal_inputs,
             multi_modal_data=output.multi_modal_data,
             reward_score=output.reward_score,
@@ -790,6 +808,7 @@ class AgentLoopWorker:
         if any_btm:
             response_length = inputs[0].response_ids.shape[-1]
             btm_chunks = []
+            ifb_chunks = []
             for input in inputs:
                 if input.branch_token_mask is not None:
                     btm_chunks.append(input.branch_token_mask)
@@ -797,7 +816,12 @@ class AgentLoopWorker:
                     btm_chunks.append(
                         torch.zeros(1, response_length, dtype=torch.long)
                     )
+                if getattr(input, "is_branching_fallback", None) is not None:
+                    ifb_chunks.append(input.is_branching_fallback)
+                else:
+                    ifb_chunks.append(torch.zeros(1, dtype=torch.long))
             optional_outputs["branch_token_mask"] = torch.cat(btm_chunks, dim=0)
+            optional_outputs["is_branching_fallback"] = torch.cat(ifb_chunks, dim=0)
 
         batch = TensorDict(
             {
@@ -846,11 +870,65 @@ class AgentLoopWorker:
             extra_fields[key] = temp_arr
 
         non_tensor_batch.update(extra_fields)
+
+        # Aggregate teacher-guided branching rollout diagnostics (extra_fields["branching_diag"]
+        # carries per-leaf {sigma_relaxations, teacher_intersect_misses, split_attempts,
+        # splits_succeeded}) into step-level rollout metrics so SwanLab shows whether
+        # branching actually fired even when btm=all. Without this aggregation a 100%-fallback
+        # run is indistinguishable from a healthy branching run on btm=all (loss-equivalent
+        # by design — see Phase 1c.2 audit).
+        branching_metrics = self._aggregate_branching_diag(inputs)
+
+        meta_info = {"metrics": metrics, "reward_extra_keys": reward_extra_keys}
+        if branching_metrics:
+            meta_info["branching_metrics"] = branching_metrics
         return DataProto(
             batch=batch,
             non_tensor_batch=non_tensor_batch,
-            meta_info={"metrics": metrics, "reward_extra_keys": reward_extra_keys},
+            meta_info=meta_info,
         )
+
+    @staticmethod
+    def _aggregate_branching_diag(inputs) -> dict:
+        """Walk per-leaf ``extra_fields[branching_diag]`` + ``is_branching_fallback`` and emit
+        step-level aggregates suitable for SwanLab. Returns {} when none of the leaves
+        carry branching diagnostics (legacy non-branching rollouts)."""
+        n = len(inputs)
+        if n == 0:
+            return {}
+        diag_keys = ("sigma_relaxations", "teacher_intersect_misses", "split_attempts", "splits_succeeded")
+        sums = {k: 0 for k in diag_keys}
+        seen_diag = 0
+        fallback_count = 0
+        for inp in inputs:
+            ef = getattr(inp, "extra_fields", None) or {}
+            d = ef.get("branching_diag")
+            if isinstance(d, dict):
+                seen_diag += 1
+                for k in diag_keys:
+                    v = d.get(k)
+                    if isinstance(v, (int, float)):
+                        sums[k] += int(v)
+            if int(ef.get("is_branching_fallback", 0) or 0):
+                fallback_count += 1
+        if seen_diag == 0 and fallback_count == 0:
+            return {}
+        out = {
+            "rollout/branching/owner_calls": float(seen_diag),
+            "rollout/branching/leaf_count": float(n),
+            "rollout/branching/fallback_leaves": float(fallback_count),
+            "rollout/branching/fallback_fraction": float(fallback_count) / max(n, 1),
+        }
+        if seen_diag > 0:
+            for k, v in sums.items():
+                out[f"rollout/branching/{k}_total"] = float(v)
+                out[f"rollout/branching/{k}_per_owner"] = float(v) / max(seen_diag, 1)
+            attempts = sums["split_attempts"]
+            succeeded = sums["splits_succeeded"]
+            out["rollout/branching/split_success_rate"] = (
+                float(succeeded) / max(attempts, 1)
+            )
+        return out
 
     def create_transferqueue_client(
         self,
