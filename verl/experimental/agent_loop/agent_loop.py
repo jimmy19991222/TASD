@@ -871,64 +871,21 @@ class AgentLoopWorker:
 
         non_tensor_batch.update(extra_fields)
 
-        # Aggregate teacher-guided branching rollout diagnostics (extra_fields["branching_diag"]
-        # carries per-leaf {sigma_relaxations, teacher_intersect_misses, split_attempts,
-        # splits_succeeded}) into step-level rollout metrics so SwanLab shows whether
-        # branching actually fired even when btm=all. Without this aggregation a 100%-fallback
-        # run is indistinguishable from a healthy branching run on btm=all (loss-equivalent
-        # by design — see Phase 1c.2 audit).
-        branching_metrics = self._aggregate_branching_diag(inputs)
-
-        meta_info = {"metrics": metrics, "reward_extra_keys": reward_extra_keys}
-        if branching_metrics:
-            meta_info["branching_metrics"] = branching_metrics
+        # NOTE: branching diagnostic aggregation is INTENTIONALLY NOT done here.
+        # If we wrote a per-worker dict into meta_info, DataProto.concat across
+        # AgentLoopWorker chunks asserts equality on meta_info values
+        # (verl/protocol.py:963 "Conflicting values for meta_info key
+        # 'branching_metrics'") — different workers produce different
+        # aggregates and the assertion fires.
+        # Per-leaf branching_diag and is_branching_fallback are still in
+        # non_tensor_batch (above), so AgentLoopManager.generate_sequences
+        # aggregates after the concat. See _aggregate_branching_diag_from_batch.
         return DataProto(
             batch=batch,
             non_tensor_batch=non_tensor_batch,
-            meta_info=meta_info,
+            meta_info={"metrics": metrics, "reward_extra_keys": reward_extra_keys},
         )
 
-    @staticmethod
-    def _aggregate_branching_diag(inputs) -> dict:
-        """Walk per-leaf ``extra_fields[branching_diag]`` + ``is_branching_fallback`` and emit
-        step-level aggregates suitable for SwanLab. Returns {} when none of the leaves
-        carry branching diagnostics (legacy non-branching rollouts)."""
-        n = len(inputs)
-        if n == 0:
-            return {}
-        diag_keys = ("sigma_relaxations", "teacher_intersect_misses", "split_attempts", "splits_succeeded")
-        sums = {k: 0 for k in diag_keys}
-        seen_diag = 0
-        fallback_count = 0
-        for inp in inputs:
-            ef = getattr(inp, "extra_fields", None) or {}
-            d = ef.get("branching_diag")
-            if isinstance(d, dict):
-                seen_diag += 1
-                for k in diag_keys:
-                    v = d.get(k)
-                    if isinstance(v, (int, float)):
-                        sums[k] += int(v)
-            if int(ef.get("is_branching_fallback", 0) or 0):
-                fallback_count += 1
-        if seen_diag == 0 and fallback_count == 0:
-            return {}
-        out = {
-            "rollout/branching/owner_calls": float(seen_diag),
-            "rollout/branching/leaf_count": float(n),
-            "rollout/branching/fallback_leaves": float(fallback_count),
-            "rollout/branching/fallback_fraction": float(fallback_count) / max(n, 1),
-        }
-        if seen_diag > 0:
-            for k, v in sums.items():
-                out[f"rollout/branching/{k}_total"] = float(v)
-                out[f"rollout/branching/{k}_per_owner"] = float(v) / max(seen_diag, 1)
-            attempts = sums["split_attempts"]
-            succeeded = sums["splits_succeeded"]
-            out["rollout/branching/split_success_rate"] = (
-                float(succeeded) / max(attempts, 1)
-            )
-        return out
 
     def create_transferqueue_client(
         self,
@@ -943,6 +900,70 @@ class AgentLoopWorker:
             client_id=f"AgentLoopWorker_{client_name}",
             config=self.config.transfer_queue,
         )
+
+
+def _aggregate_branching_diag_from_batch(output: DataProto) -> dict:
+    """Aggregate teacher-guided branching diagnostics across the FULL post-concat batch.
+
+    Reads ``non_tensor_batch["branching_diag"]`` (per-leaf dict carrying
+    sigma_relaxations / teacher_intersect_misses / split_attempts /
+    splits_succeeded — written by BranchingAgentLoop._flatten_tree_to_leaves)
+    and ``non_tensor_batch["is_branching_fallback"]`` (per-leaf int 0/1).
+
+    Returns a flat ``{step_metric_name: float}`` dict suitable for SwanLab.
+    Empty dict when no leaves carry branching state (legacy non-branching
+    rollouts). Crucially, runs ONCE per step at the manager level — putting
+    this in the worker triggers a DataProto.concat meta_info conflict
+    (verl/protocol.py:963 'Conflicting values for meta_info key ...').
+    """
+    nt = getattr(output, "non_tensor_batch", None) or {}
+    diag_arr = nt.get("branching_diag")
+    fb_arr = nt.get("is_branching_fallback")
+    if diag_arr is None and fb_arr is None:
+        return {}
+
+    diag_keys = ("sigma_relaxations", "teacher_intersect_misses", "split_attempts", "splits_succeeded")
+    sums = {k: 0 for k in diag_keys}
+    seen_diag = 0
+    fallback_count = 0
+    n = 0
+    if diag_arr is not None:
+        for d in diag_arr:
+            n += 1
+            if isinstance(d, dict):
+                seen_diag += 1
+                for k in diag_keys:
+                    v = d.get(k)
+                    if isinstance(v, (int, float)):
+                        sums[k] += int(v)
+    if fb_arr is not None:
+        for f in fb_arr:
+            try:
+                if int(f or 0) > 0:
+                    fallback_count += 1
+            except (TypeError, ValueError):
+                pass
+        if n == 0:
+            n = len(fb_arr)
+
+    if seen_diag == 0 and fallback_count == 0:
+        return {}
+    out = {
+        "rollout/branching/owner_calls": float(seen_diag),
+        "rollout/branching/leaf_count": float(n),
+        "rollout/branching/fallback_leaves": float(fallback_count),
+        "rollout/branching/fallback_fraction": float(fallback_count) / max(n, 1),
+    }
+    if seen_diag > 0:
+        for k, v in sums.items():
+            out[f"rollout/branching/{k}_total"] = float(v)
+            out[f"rollout/branching/{k}_per_owner"] = float(v) / max(seen_diag, 1)
+        attempts = sums["split_attempts"]
+        succeeded = sums["splits_succeeded"]
+        out["rollout/branching/split_success_rate"] = (
+            float(succeeded) / max(attempts, 1)
+        )
+    return out
 
 
 async def get_trajectory_info(step, index, validate):
@@ -1093,6 +1114,16 @@ class AgentLoopManager:
             ]
         )
         output = DataProto.concat(outputs)
+
+        # Aggregate teacher-guided branching diagnostics across the full batch
+        # AFTER the concat. We can't do this inside the worker because
+        # DataProto.concat asserts meta_info equality across chunks; per-worker
+        # aggregates would conflict. Instead read non_tensor_batch which IS
+        # concatenated row-wise, and produce one step-level aggregate here.
+        branching_metrics = _aggregate_branching_diag_from_batch(output)
+        if branching_metrics:
+            output.meta_info["branching_metrics"] = branching_metrics
+
         # Fix for Issue #4147: Always call sleep() to ensure proper cleanup
         self.sleep()
         if self.reward_model_manager:
