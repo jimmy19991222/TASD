@@ -126,15 +126,33 @@ class BranchingConfig(BaseConfig):
 
     enabled: bool = False
     n_splits: int = 3
-    # NOTE: vLLM's AsyncEngineArgs default ``max_logprobs`` is 20. Setting top_k
-    # above 20 *requires* the user to bump the engine's max_logprobs via
-    # ``actor_rollout_ref.rollout.engine_kwargs.vllm.max_logprobs`` (the
-    # branching parametric script does this for top_k=50). Going past 20 with
-    # the default engine config triggers
-    # ``vllm.exceptions.VLLMValidationError: Requested sample logprobs of K,
-    # which is greater than max allowed: 20`` on every initial student call,
-    # which is what brought down the first pilot — see Phase 1c.2 retro.
-    top_k: int = 20
+    # ``top_k`` = how many logprobs vLLM returns at each STUDENT generation
+    # position. Defines (a) the depth used for truncated-entropy estimation
+    # (z-score detector consumes this dict), and (b) the candidate pool the
+    # teacher will choose argmax/argmin from at branch points.
+    #
+    # Lowered from 50 → 10 after the first pilot showed K=50 caused severe
+    # OOD pressure: teacher's argmin within student's top-50 is by definition
+    # a token the student would almost never sample (rank-50 student logprob
+    # ~1e-3 to 1e-5), and forcing the chain to continue from it produces an
+    # OOD prefix and noise-dominated PG. K=10 keeps both branches inside the
+    # plausible student support.
+    top_k: int = 10
+    # ``teacher_top_k`` = how many logprobs vLLM returns from the TEACHER
+    # branch-point query. This is independent from ``top_k``. We want it
+    # *large* so that the teacher's top-K covers all of student's top-K
+    # tokens — otherwise pick_teacher_branches sees only the
+    # student∩teacher intersection, dropping (student-only) candidates from
+    # the argmax/argmin selection. With teacher_top_k >> top_k the
+    # intersection ≈ student top-K, so every student candidate effectively
+    # gets a teacher score. Default 50 requires bumping vLLM's engine
+    # ``max_logprobs`` ≥ 50 (parametric scripts do this automatically).
+    teacher_top_k: int = 50
+    # Optional sub-selection: how many of student's top-K we offer the
+    # teacher for argmax/argmin. None ⇒ use top_k (consider all student
+    # candidates). Set lower (e.g. 5) to keep both branches strictly in the
+    # student's high-probability core.
+    teacher_pick_top_k: Optional[int] = None
     entropy_window: int = 20
     entropy_protect_window: Optional[int] = None
     entropy_sigma_start: float = 2.0

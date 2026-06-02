@@ -30,6 +30,29 @@
 #                exist in SwanLab on prior commits. Cross-commit comparison
 #                via SwanLab git_branch/git_commit fields (recorded by the
 #                runs since commit 4f57094).
+#
+# Env-overridable knobs (export before running):
+#   Branching:
+#     N_SPLITS               default 3   number of binary splits per prompt
+#     ROLLOUT_N              default 8   MUST equal 2**N_SPLITS (validated)
+#     TOP_K                  default 50  vLLM logprobs depth (student & teacher)
+#                                        — also bumps engine max_logprobs
+#     ENTROPY_WINDOW         default 20  rolling z-score window
+#     ENTROPY_SIGMA_START    default 2.0 initial spike threshold
+#     ENTROPY_SIGMA_FLOOR    default 0.5 σ-relaxation lower bound
+#     ENTROPY_SIGMA_STEP     default 0.5 σ decrement per relaxation
+#     TEACHER_CONTEXT_MODE   default gt_marker  one of {marker, gt_marker, ref_gt}
+#     ADV_STD_FLOOR          default 0.05  GRPO group_std clamp lower bound
+#   Sweep:
+#     SEED, TRAIN_BATCH_SIZE, LR, MINI_BATCH_SIZE, MODEL_NAME, DATASET
+#   SDPO arm only:
+#     SDPO_ALPHA                          default 0.5
+#     SDPO_DONT_REPROMPT_ON_SELF_SUCCESS  default False
+#
+# Examples:
+#   N_SPLITS=2 ROLLOUT_N=4 bash ... --variant branching --loss-mode mask
+#   TEACHER_CONTEXT_MODE=marker bash ... --variant branching --loss-mode mask
+#   TOP_K=20 bash ... --variant branching            # tighter K, vLLM-default-cap-friendly
 # =============================================================================
 
 # ── Nebula 账号配置 ──────────────────────────────────────────────────────
@@ -74,27 +97,40 @@ if [ "$DRY_RUN" = true ]; then
 fi
 
 # =============================================================================
-# 超参配置
+# 超参配置(全部 env-overridable;在 cli 前 export 即可改)
 # =============================================================================
-MODEL_NAMES=("Qwen3-8B")
-DATASETS=("sciknoweval/biology")
-SEED="42"
-TRAIN_BATCH_SIZE="32"
-ROLLOUT_N="8"   # MUST equal 2 ** branching.n_splits when branching is enabled
-LRS=("1e-5")
-MINI_BATCH_SIZES=("32")
+MODEL_NAMES=("${MODEL_NAME:-Qwen3-8B}")
+DATASETS=("${DATASET:-sciknoweval/biology}")
+SEED="${SEED:-42}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"
+LRS=("${LR:-1e-5}")
+MINI_BATCH_SIZES=("${MINI_BATCH_SIZE:-32}")
+
+# rollout.n MUST equal 2**branching.n_splits when branching is enabled —
+# enforced via N_LEAVES below; mismatched values raise a clear error.
+N_SPLITS="${N_SPLITS:-3}"
+ROLLOUT_N="${ROLLOUT_N:-8}"
+N_LEAVES=$((1 << N_SPLITS))   # 2 ** N_SPLITS
+if [ "$ROLLOUT_N" != "$N_LEAVES" ]; then
+    echo "ERROR: ROLLOUT_N=$ROLLOUT_N must equal 2**N_SPLITS=$N_LEAVES (n_splits=$N_SPLITS)." 1>&2
+    echo "       Set both: e.g. 'N_SPLITS=2 ROLLOUT_N=4 bash $0 ...'" 1>&2
+    exit 2
+fi
 
 # SDPO-specific defaults (only used by the sdpo variant)
 SDPO_ALPHA="${SDPO_ALPHA:-0.5}"
 SDPO_DONT_REPROMPT_ON_SELF_SUCCESS="${SDPO_DONT_REPROMPT_ON_SELF_SUCCESS:-False}"
 
-# Branching defaults
-N_SPLITS="3"
-TOP_K="50"
-ENTROPY_WINDOW="20"
-ENTROPY_SIGMA_START="2.0"
-ENTROPY_SIGMA_FLOOR="0.5"
-ENTROPY_SIGMA_STEP="0.5"
+# Branching defaults — all env-overridable
+# Asymmetric K: student top_k bounds the candidate pool (kept tight to avoid
+# OOD branches); teacher_top_k is what vLLM returns from the teacher forward
+# (kept LARGE so teacher's distribution covers ALL of student's candidates).
+TOP_K="${TOP_K:-10}"
+TEACHER_TOP_K="${TEACHER_TOP_K:-50}"
+ENTROPY_WINDOW="${ENTROPY_WINDOW:-20}"
+ENTROPY_SIGMA_START="${ENTROPY_SIGMA_START:-2.0}"
+ENTROPY_SIGMA_FLOOR="${ENTROPY_SIGMA_FLOOR:-0.5}"
+ENTROPY_SIGMA_STEP="${ENTROPY_SIGMA_STEP:-0.5}"
 TEACHER_CONTEXT_MODE="${TEACHER_CONTEXT_MODE:-gt_marker}"
 ADV_STD_FLOOR="0.05"
 
@@ -193,7 +229,7 @@ if [[ "$VARIANT" == "all" || "$VARIANT" == "branching" ]]; then
         CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
         JOB_NAME="TGB-${DATASET_SHORT}-${TEACHER_CONTEXT_MODE}-btm${BTM}-mbs${MINI_BATCH_SIZE}-lr${LR_TAG}-${MODEL_NAME}-${CURRENT_TIME}"
         _submit_job "$SCRIPT_PATH" "$JOB_NAME" \
-            "$(_common_env "$JOB_NAME" "$DATASET" "$MODEL_NAME" "$LR" "$MINI_BATCH_SIZE") --env=BRANCHING_ENABLED=True --env=N_SPLITS=${N_SPLITS} --env=TOP_K=${TOP_K} --env=ENTROPY_WINDOW=${ENTROPY_WINDOW} --env=ENTROPY_SIGMA_START=${ENTROPY_SIGMA_START} --env=ENTROPY_SIGMA_FLOOR=${ENTROPY_SIGMA_FLOOR} --env=ENTROPY_SIGMA_STEP=${ENTROPY_SIGMA_STEP} --env=TEACHER_CONTEXT_MODE=${TEACHER_CONTEXT_MODE} --env=BRANCH_TOKEN_LOSS_MODE=${BTM} --env=ADV_STD_FLOOR=${ADV_STD_FLOOR}"
+            "$(_common_env "$JOB_NAME" "$DATASET" "$MODEL_NAME" "$LR" "$MINI_BATCH_SIZE") --env=BRANCHING_ENABLED=True --env=N_SPLITS=${N_SPLITS} --env=TOP_K=${TOP_K} --env=TEACHER_TOP_K=${TEACHER_TOP_K} --env=ENTROPY_WINDOW=${ENTROPY_WINDOW} --env=ENTROPY_SIGMA_START=${ENTROPY_SIGMA_START} --env=ENTROPY_SIGMA_FLOOR=${ENTROPY_SIGMA_FLOOR} --env=ENTROPY_SIGMA_STEP=${ENTROPY_SIGMA_STEP} --env=TEACHER_CONTEXT_MODE=${TEACHER_CONTEXT_MODE} --env=BRANCH_TOKEN_LOSS_MODE=${BTM} --env=ADV_STD_FLOOR=${ADV_STD_FLOOR}"
     done; done; done; done; done
 fi
 
@@ -216,7 +252,7 @@ if [[ "$VARIANT" == "compare" ]]; then
         CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
         JOB_NAME="TGB-GRPO-${DATASET_SHORT}-${TEACHER_CONTEXT_MODE}-btm${BTM}-mbs${MINI_BATCH_SIZE}-lr${LR_TAG}-${MODEL_NAME}-${CURRENT_TIME}"
         _submit_job "$SCRIPT_PATH" "$JOB_NAME" \
-            "$(_common_env "$JOB_NAME" "$DATASET" "$MODEL_NAME" "$LR" "$MINI_BATCH_SIZE") --env=BRANCHING_ENABLED=True --env=N_SPLITS=${N_SPLITS} --env=TOP_K=${TOP_K} --env=ENTROPY_WINDOW=${ENTROPY_WINDOW} --env=ENTROPY_SIGMA_START=${ENTROPY_SIGMA_START} --env=ENTROPY_SIGMA_FLOOR=${ENTROPY_SIGMA_FLOOR} --env=ENTROPY_SIGMA_STEP=${ENTROPY_SIGMA_STEP} --env=TEACHER_CONTEXT_MODE=${TEACHER_CONTEXT_MODE} --env=BRANCH_TOKEN_LOSS_MODE=${BTM} --env=ADV_STD_FLOOR=${ADV_STD_FLOOR}"
+            "$(_common_env "$JOB_NAME" "$DATASET" "$MODEL_NAME" "$LR" "$MINI_BATCH_SIZE") --env=BRANCHING_ENABLED=True --env=N_SPLITS=${N_SPLITS} --env=TOP_K=${TOP_K} --env=TEACHER_TOP_K=${TEACHER_TOP_K} --env=ENTROPY_WINDOW=${ENTROPY_WINDOW} --env=ENTROPY_SIGMA_START=${ENTROPY_SIGMA_START} --env=ENTROPY_SIGMA_FLOOR=${ENTROPY_SIGMA_FLOOR} --env=ENTROPY_SIGMA_STEP=${ENTROPY_SIGMA_STEP} --env=TEACHER_CONTEXT_MODE=${TEACHER_CONTEXT_MODE} --env=BRANCH_TOKEN_LOSS_MODE=${BTM} --env=ADV_STD_FLOOR=${ADV_STD_FLOOR}"
     done; done; done; done; done
 
     # SDPO branching arm (3 jobs)
@@ -230,7 +266,7 @@ if [[ "$VARIANT" == "compare" ]]; then
         CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
         JOB_NAME="TGB-SDPO-${DATASET_SHORT}-${TEACHER_CONTEXT_MODE}-alpha${SDPO_ALPHA}-btm${BTM}-lr${LR_TAG}-${MODEL_NAME}-${CURRENT_TIME}"
         _submit_job "$SCRIPT_PATH" "$JOB_NAME" \
-            "$(_common_env "$JOB_NAME" "$DATASET" "$MODEL_NAME" "$LR" "32") --env=ALPHA=${SDPO_ALPHA} --env=DONT_REPROMPT_ON_SELF_SUCCESS=${SDPO_DONT_REPROMPT_ON_SELF_SUCCESS} --env=BRANCHING_ENABLED=True --env=N_SPLITS=${N_SPLITS} --env=TOP_K=${TOP_K} --env=ENTROPY_WINDOW=${ENTROPY_WINDOW} --env=ENTROPY_SIGMA_START=${ENTROPY_SIGMA_START} --env=ENTROPY_SIGMA_FLOOR=${ENTROPY_SIGMA_FLOOR} --env=ENTROPY_SIGMA_STEP=${ENTROPY_SIGMA_STEP} --env=TEACHER_CONTEXT_MODE=${TEACHER_CONTEXT_MODE} --env=BRANCH_TOKEN_LOSS_MODE=${BTM} --env=ADV_STD_FLOOR=${ADV_STD_FLOOR}"
+            "$(_common_env "$JOB_NAME" "$DATASET" "$MODEL_NAME" "$LR" "32") --env=ALPHA=${SDPO_ALPHA} --env=DONT_REPROMPT_ON_SELF_SUCCESS=${SDPO_DONT_REPROMPT_ON_SELF_SUCCESS} --env=BRANCHING_ENABLED=True --env=N_SPLITS=${N_SPLITS} --env=TOP_K=${TOP_K} --env=TEACHER_TOP_K=${TEACHER_TOP_K} --env=ENTROPY_WINDOW=${ENTROPY_WINDOW} --env=ENTROPY_SIGMA_START=${ENTROPY_SIGMA_START} --env=ENTROPY_SIGMA_FLOOR=${ENTROPY_SIGMA_FLOOR} --env=ENTROPY_SIGMA_STEP=${ENTROPY_SIGMA_STEP} --env=TEACHER_CONTEXT_MODE=${TEACHER_CONTEXT_MODE} --env=BRANCH_TOKEN_LOSS_MODE=${BTM} --env=ADV_STD_FLOOR=${ADV_STD_FLOOR}"
     done; done; done; done
 fi
 
@@ -259,7 +295,7 @@ if [[ "$VARIANT" == "sdpo" ]]; then
         # hardcodes ppo_mini_batch_size=32 for stability) but we still pass
         # it for the env-block consistency.
         _submit_job "$SCRIPT_PATH" "$JOB_NAME" \
-            "$(_common_env "$JOB_NAME" "$DATASET" "$MODEL_NAME" "$LR" "32") --env=ALPHA=${SDPO_ALPHA} --env=DONT_REPROMPT_ON_SELF_SUCCESS=${SDPO_DONT_REPROMPT_ON_SELF_SUCCESS} --env=BRANCHING_ENABLED=True --env=N_SPLITS=${N_SPLITS} --env=TOP_K=${TOP_K} --env=ENTROPY_WINDOW=${ENTROPY_WINDOW} --env=ENTROPY_SIGMA_START=${ENTROPY_SIGMA_START} --env=ENTROPY_SIGMA_FLOOR=${ENTROPY_SIGMA_FLOOR} --env=ENTROPY_SIGMA_STEP=${ENTROPY_SIGMA_STEP} --env=TEACHER_CONTEXT_MODE=${TEACHER_CONTEXT_MODE} --env=BRANCH_TOKEN_LOSS_MODE=${BTM} --env=ADV_STD_FLOOR=${ADV_STD_FLOOR}"
+            "$(_common_env "$JOB_NAME" "$DATASET" "$MODEL_NAME" "$LR" "32") --env=ALPHA=${SDPO_ALPHA} --env=DONT_REPROMPT_ON_SELF_SUCCESS=${SDPO_DONT_REPROMPT_ON_SELF_SUCCESS} --env=BRANCHING_ENABLED=True --env=N_SPLITS=${N_SPLITS} --env=TOP_K=${TOP_K} --env=TEACHER_TOP_K=${TEACHER_TOP_K} --env=ENTROPY_WINDOW=${ENTROPY_WINDOW} --env=ENTROPY_SIGMA_START=${ENTROPY_SIGMA_START} --env=ENTROPY_SIGMA_FLOOR=${ENTROPY_SIGMA_FLOOR} --env=ENTROPY_SIGMA_STEP=${ENTROPY_SIGMA_STEP} --env=TEACHER_CONTEXT_MODE=${TEACHER_CONTEXT_MODE} --env=BRANCH_TOKEN_LOSS_MODE=${BTM} --env=ADV_STD_FLOOR=${ADV_STD_FLOOR}"
     done; done; done; done
 fi
 

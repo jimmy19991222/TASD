@@ -467,13 +467,22 @@ class BranchingAgentLoop(AgentLoopBase):
 
     def _teacher_sampling_params(self) -> dict[str, Any]:
         """Sampling params for the teacher branch-point query: max_tokens=1,
-        logprobs=K. Temperature is forced to 0.0 — we are reading a
-        distribution, not sampling."""
+        logprobs=teacher_top_k. Temperature 0.0 — we read a distribution,
+        not sample.
+
+        We use ``teacher_top_k`` (default 50, independent of student ``top_k``
+        default 10) so the teacher returns enough logprobs to cover all of
+        student's top-K candidates with high probability. Without this
+        asymmetry, the intersection between student and teacher top-K is
+        small and many of student's candidates have UNKNOWN teacher logprob
+        — they get silently dropped from argmax/argmin selection.
+        """
+        teacher_k = int(self.branching_cfg.get("teacher_top_k", None) or self.branching_cfg.top_k)
         return {
             "temperature": 0.0,
             "top_p": 1.0,
             "top_k": -1,
-            "logprobs": int(self.branching_cfg.top_k),
+            "logprobs": teacher_k,
             "max_tokens": int(self.branching_cfg.teacher_branch_query_max_tokens),
             "repetition_penalty": 1.0,
         }
@@ -559,7 +568,16 @@ class BranchingAgentLoop(AgentLoopBase):
         if not student_top or teacher_top is None:
             return node  # no signal to branch on
 
-        student_topk_pairs = list(student_top.items())
+        # Sort student candidates by descending logprob — teacher picks within
+        # the top ``teacher_pick_top_k`` (default = top_k, i.e. all candidates).
+        # Slicing here lets us request a deep student top-K for entropy
+        # estimation while still presenting only the high-probability core
+        # to the teacher for branch selection (avoids OOD branches).
+        student_topk_pairs = sorted(student_top.items(), key=lambda kv: -kv[1])
+        _pick_k_override = cfg.get("teacher_pick_top_k", None)
+        pick_k = int(_pick_k_override) if _pick_k_override is not None else int(cfg.top_k)
+        if pick_k > 0:
+            student_topk_pairs = student_topk_pairs[:pick_k]
         choice = pick_teacher_branches(
             student_topk_pairs, teacher_top,
             fallback_to_student=bool(cfg.fallback_to_student_topk),

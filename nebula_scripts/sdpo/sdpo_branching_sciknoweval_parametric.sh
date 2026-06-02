@@ -36,10 +36,13 @@ fi
 # ── Branching 专属超参 ────────────────────────────────────────────────
 BRANCHING_ENABLED="${BRANCHING_ENABLED:-True}"
 N_SPLITS="${N_SPLITS:-3}"
-# top_k > 20 requires bumping vLLM engine's max_logprobs (default 20). We set
-# both below; keep them aligned.
-TOP_K="${TOP_K:-50}"
-VLLM_MAX_LOGPROBS="${VLLM_MAX_LOGPROBS:-${TOP_K}}"
+# Asymmetric K: student top_k=10 keeps branches in-distribution; teacher
+# top_k=50 ensures teacher returns enough logprobs to cover all of student's
+# 10 candidates (otherwise the intersection drops candidates silently).
+TOP_K="${TOP_K:-10}"
+TEACHER_TOP_K="${TEACHER_TOP_K:-50}"
+VLLM_MAX_LOGPROBS_REQUIRED=$(( TOP_K > TEACHER_TOP_K ? TOP_K : TEACHER_TOP_K ))
+VLLM_MAX_LOGPROBS="${VLLM_MAX_LOGPROBS:-${VLLM_MAX_LOGPROBS_REQUIRED}}"
 ENTROPY_WINDOW="${ENTROPY_WINDOW:-20}"
 ENTROPY_SIGMA_START="${ENTROPY_SIGMA_START:-2.0}"
 ENTROPY_SIGMA_FLOOR="${ENTROPY_SIGMA_FLOOR:-0.5}"
@@ -106,6 +109,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.branching.enabled=${BRANCHING_ENABLED} \
     actor_rollout_ref.rollout.branching.n_splits=${N_SPLITS} \
     actor_rollout_ref.rollout.branching.top_k=${TOP_K} \
+    actor_rollout_ref.rollout.branching.teacher_top_k=${TEACHER_TOP_K} \
     actor_rollout_ref.rollout.branching.entropy_window=${ENTROPY_WINDOW} \
     actor_rollout_ref.rollout.branching.entropy_sigma_start=${ENTROPY_SIGMA_START} \
     actor_rollout_ref.rollout.branching.entropy_sigma_floor=${ENTROPY_SIGMA_FLOOR} \
