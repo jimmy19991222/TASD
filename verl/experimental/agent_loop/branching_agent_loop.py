@@ -160,6 +160,19 @@ class BranchingAgentLoop(AgentLoopBase):
         return 2 ** int(self.branching_cfg.n_splits)
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
+        # Validate-time fast path: skip the entire branching pipeline so val
+        # rollouts match a vanilla single-turn agent (no teacher peek, no GT
+        # leakage via priv ctx). Without this guard, val_before_train and the
+        # periodic test_freq=N evals also run the teacher-guided pipeline,
+        # which under teacher_context_mode in {gt_marker, ref_gt} feeds the
+        # teacher the ground-truth answer at scoring time. That inflates val
+        # reward by ~0.04 vs vanilla GRPO baseline at step 0 and makes any
+        # post-deploy comparison (no teacher, no GT) misleading.
+        if bool(kwargs.get("validate", False)):
+            return await self._run_validate_single_rollout(
+                sampling_params=sampling_params, **kwargs
+            )
+
         messages = list(kwargs["raw_prompt"])
 
         multi_modal_data = await self.process_vision_info(messages)
@@ -289,6 +302,67 @@ class BranchingAgentLoop(AgentLoopBase):
         # inherit empty metrics so we don't double-count timing.
         leaf.metrics = AgentLoopMetrics(**metrics) if am_owner else AgentLoopMetrics()
         return leaf
+
+    # ------------------------------------------------------------------
+    # Validate-time fast path — bypass branching pipeline entirely.
+    # ------------------------------------------------------------------
+
+    async def _run_validate_single_rollout(
+        self, *, sampling_params: dict[str, Any], **kwargs
+    ) -> AgentLoopOutput:
+        """Plain single-turn student rollout for val.
+
+        Equivalent in semantics to ``SingleTurnAgentLoop.run``: apply chat
+        template, call the rollout server once, wrap the result in an
+        ``AgentLoopOutput``. We deliberately do NOT touch the module-level
+        cache or branch-index counter so the train-time owner/sibling
+        coordination is unaffected when val and train rollouts interleave.
+
+        We also strip ``logprobs`` from the sampling params: the branching
+        pipeline asks vLLM for top-K logprobs, but plain val rollouts don't
+        need them and some vLLM configs reject ``logprobs=K`` paired with
+        the simple chat path.
+        """
+        messages = list(kwargs["raw_prompt"])
+
+        multi_modal_data = await self.process_vision_info(messages)
+        images = multi_modal_data.get("images")
+        videos = multi_modal_data.get("videos")
+
+        prompt_ids = await self.apply_chat_template(
+            messages, tools=self.tool_schemas, images=images, videos=videos,
+        )
+
+        plain_sp = dict(sampling_params)
+        plain_sp.pop("logprobs", None)
+        plain_sp["logprobs"] = False
+
+        metrics: dict[str, Any] = {}
+        with simple_timer("generate_sequences", metrics):
+            output = await self.server_manager.generate(
+                request_id=uuid4().hex,
+                prompt_ids=prompt_ids,
+                sampling_params=plain_sp,
+                image_data=images,
+                video_data=videos,
+            )
+        response_mask = [1] * len(output.token_ids)
+        return AgentLoopOutput(
+            prompt_ids=prompt_ids,
+            response_ids=output.token_ids[: self.response_length],
+            response_mask=response_mask[: self.response_length],
+            response_logprobs=(
+                output.log_probs[: self.response_length] if output.log_probs else None
+            ),
+            routed_experts=(
+                output.routed_experts[: len(prompt_ids) + self.response_length]
+                if output.routed_experts is not None
+                else None
+            ),
+            multi_modal_data=multi_modal_data,
+            num_turns=2,
+            metrics=AgentLoopMetrics(**metrics),
+        )
 
     # ------------------------------------------------------------------
     # Pipeline entry — owner row only (siblings await the cache).

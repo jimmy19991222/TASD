@@ -533,6 +533,13 @@ class AgentLoopWorker:
             # cache key) can use it as a defense-in-depth signal alongside the
             # explicit clear_branching_cache hook.
             kwargs.setdefault("generation_step", int(trajectory.get("step", 0)))
+            # Plumb the validate flag through so agent loops can branch on it.
+            # BranchingAgentLoop in particular needs this to disable its
+            # teacher-guided pipeline at val time and avoid GT leakage via
+            # priv-ctx (gt_marker / ref_gt modes inflate val reward by
+            # showing the teacher the ground-truth answer at evaluation, where
+            # deploy has neither teacher nor GT).
+            kwargs.setdefault("validate", bool(trajectory.get("validate", False)))
             agent_loop = hydra.utils.instantiate(
                 config=agent_loop_config,
                 trainer_config=DictConfigWrap(config=self.config),
