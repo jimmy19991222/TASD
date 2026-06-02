@@ -682,7 +682,19 @@ class RayPPOTrainer:
     ) -> Optional[tuple[DataProto, dict[str, float]]]:
         self_distillation_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
         loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
-        if self_distillation_cfg is None or loss_mode != "sdpo":
+        if self_distillation_cfg is None:
+            return None
+
+        loss_method = self_distillation_cfg.get("loss_method", "sdpo")
+
+        # ── TG-GRPO / CDM path: dual teacher prompts (pos/neg verdict markers) ──
+        if loss_mode == "tg_grpo" and loss_method == "cdm":
+            return self._build_self_distillation_batch_cdm(
+                batch, reward_tensor, reward_extra_infos_dict, self_distillation_cfg,
+            )
+
+        # ── Legacy SDPO path ────────────────────────────────────────────────
+        if loss_mode != "sdpo":
             return None
 
         teacher_context_mode = self_distillation_cfg.get("teacher_context_mode", "ref")
@@ -702,7 +714,7 @@ class RayPPOTrainer:
             )
         raise ValueError(
             f"Unknown teacher_context_mode={teacher_context_mode!r}; "
-            "expected one of {ref, ref_gt, marker, gt_marker}."
+            "expected one of {ref, ref_gt, marker, gt_marker, cdm}."
         )
 
     @staticmethod
@@ -941,6 +953,195 @@ class RayPPOTrainer:
             "teacher_input_ids": teacher_input_ids,
             "teacher_attention_mask": teacher_attention_mask,
             "teacher_position_ids": teacher_position_ids,
+            "self_distillation_mask": self_distillation_mask,
+        }), metrics
+
+    def _build_self_distillation_batch_cdm(
+        self,
+        batch: DataProto,
+        reward_tensor: torch.Tensor,
+        reward_extra_infos_dict: Optional[dict[str, list]],
+        self_distillation_cfg,
+    ) -> tuple[DataProto, dict[str, float]]:
+        """TG-GRPO CDM (Contrastive Distillation Modeling) dual-prompt teacher batch.
+
+        Builds *two* teacher input sets that share the same response tokens but
+        differ only in the verdict marker prepended to the assistant role-start:
+
+            pos: [user_prompt][cdm_positive_marker][response]
+            neg: [user_prompt][cdm_negative_marker][response]
+
+        The actor later runs forward_micro_batch on each set to obtain
+        logπ_T+(y_t|s_t) and logπ_T-(y_t|s_t); their differential |δ_t|
+        becomes the per-token weight selector for the policy loss.
+
+        When ``cdm_use_ref=True``, the user message is additionally rewritten
+        with a sibling-success demonstration via the same reprompt template as
+        legacy ``ref`` mode ("ref+marker" variant). Otherwise the user message
+        is left unchanged (marker-only variant).
+        """
+        device = batch.batch["input_ids"].device
+        response_mask = batch.batch["response_mask"]
+        responses = batch.batch["responses"]
+        prompt_texts = [msgs[-1]["content"] for msgs in batch.non_tensor_batch["raw_prompt"]]
+        batch_size = batch.batch.batch_size[0]
+
+        cdm_use_ref = bool(self_distillation_cfg.get("cdm_use_ref", True))
+        pos_template = self_distillation_cfg.get("cdm_positive_template", "This answer is verified correct.")
+        neg_template = self_distillation_cfg.get("cdm_negative_template", "This answer is verified incorrect.")
+
+        # ── user-side message construction (optionally with ref-style reprompt) ──
+        if cdm_use_ref:
+            success_by_uid = self._collect_solutions_by_uid(
+                batch, reward_tensor,
+                success_reward_threshold=self_distillation_cfg.success_reward_threshold,
+            )
+            response_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in responses]
+            solution_strs = [
+                self._get_solution(
+                    i,
+                    success_by_uid,
+                    batch.non_tensor_batch["uid"],
+                    response_texts,
+                    self_distillation_cfg.dont_reprompt_on_self_success,
+                    self_distillation_cfg.get("remove_thinking_from_demonstration", False),
+                )
+                for i in range(batch_size)
+            ]
+            feedback_list = self._collect_feedback(
+                include_environment_feedback=self_distillation_cfg.include_environment_feedback,
+                reward_extra_infos_dict=reward_extra_infos_dict,
+                batch_size=batch_size,
+            )
+            num_with_solution = sum(1 for s in solution_strs if s is not None)
+        else:
+            success_by_uid = {}
+            solution_strs = [None] * batch_size
+            feedback_list = [None] * batch_size
+            num_with_solution = 0
+
+        def _build_user_message(i: int) -> list[dict]:
+            system_messages = batch.non_tensor_batch["raw_prompt"][i][:-1]
+            has_solution = solution_strs[i] is not None
+            has_feedback = feedback_list[i] is not None
+            feedback_only_without_solution = self_distillation_cfg.get(
+                "environment_feedback_only_without_solution", False
+            )
+            use_feedback = has_feedback and (not feedback_only_without_solution or not has_solution)
+            if not (has_solution or use_feedback):
+                return list(system_messages) + [{"role": "user", "content": prompt_texts[i]}]
+            solution_section = (
+                self_distillation_cfg.solution_template.format(successful_previous_attempt=solution_strs[i])
+                if has_solution else ""
+            )
+            feedback_section = (
+                self_distillation_cfg.feedback_template.format(feedback_raw=feedback_list[i])
+                if use_feedback else ""
+            )
+            reprompt_text = self_distillation_cfg.reprompt_template.format(
+                prompt=prompt_texts[i],
+                solution=solution_section,
+                feedback=feedback_section,
+            )
+            return list(system_messages) + [{"role": "user", "content": reprompt_text}]
+
+        messages = [_build_user_message(i) for i in range(batch_size)]
+        enable_thinking = self.config.data.apply_chat_template_kwargs.get("enable_thinking", True) if self.config.data.apply_chat_template_kwargs else True
+        teacher_prompt = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            return_tensors="pt",
+            return_dict=True,
+            continue_final_message=False,
+            add_generation_prompt=True,
+            enable_thinking=enable_thinking,
+            max_length=self_distillation_cfg.max_reprompt_len,
+            padding=True,
+            truncation=True,
+        )
+        teacher_prompt_ids = teacher_prompt["input_ids"].to(device)
+        teacher_prompt_mask = teacher_prompt["attention_mask"].to(device)
+
+        # ── dual marker construction (per-sample, supports {ground_truth}) ──
+        pos_texts: list[str] = []
+        neg_texts: list[str] = []
+        gt_found = 0
+        for i in range(batch_size):
+            gt = self._read_ground_truth(batch, i)
+            if gt is not None:
+                gt_found += 1
+            try:
+                pos_t = pos_template.format(ground_truth=gt) if gt is not None else pos_template
+            except (KeyError, IndexError):
+                pos_t = pos_template
+            try:
+                neg_t = neg_template.format(ground_truth=gt) if gt is not None else neg_template
+            except (KeyError, IndexError):
+                neg_t = neg_template
+            if not pos_t.endswith("\n\n"):
+                pos_t = pos_t + "\n\n"
+            if not neg_t.endswith("\n\n"):
+                neg_t = neg_t + "\n\n"
+            pos_texts.append(pos_t)
+            neg_texts.append(neg_t)
+
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = self.tokenizer.eos_token_id or 0
+
+        def _pack_marker(token_lists: list[list[int]]) -> tuple[torch.Tensor, torch.Tensor]:
+            max_len = max((len(t) for t in token_lists), default=0)
+            ids = torch.full(
+                (batch_size, max_len), pad_id,
+                dtype=teacher_prompt_ids.dtype, device=device,
+            )
+            mask = torch.zeros(
+                batch_size, max_len,
+                dtype=teacher_prompt_mask.dtype, device=device,
+            )
+            for i, t in enumerate(token_lists):
+                L = len(t)
+                if L > 0:
+                    ids[i, -L:] = torch.tensor(t, dtype=teacher_prompt_ids.dtype, device=device)
+                    mask[i, -L:] = 1
+            return ids, mask
+
+        pos_token_lists = [self.tokenizer.encode(t, add_special_tokens=False) for t in pos_texts]
+        neg_token_lists = [self.tokenizer.encode(t, add_special_tokens=False) for t in neg_texts]
+        pos_marker_ids, pos_marker_mask = _pack_marker(pos_token_lists)
+        neg_marker_ids, neg_marker_mask = _pack_marker(neg_token_lists)
+
+        teacher_pos_input_ids = torch.cat([teacher_prompt_ids, pos_marker_ids, responses], dim=1)
+        teacher_pos_attention_mask = torch.cat([teacher_prompt_mask, pos_marker_mask, response_mask], dim=1)
+        teacher_pos_position_ids = compute_position_id_with_mask(teacher_pos_attention_mask)
+
+        teacher_neg_input_ids = torch.cat([teacher_prompt_ids, neg_marker_ids, responses], dim=1)
+        teacher_neg_attention_mask = torch.cat([teacher_prompt_mask, neg_marker_mask, response_mask], dim=1)
+        teacher_neg_position_ids = compute_position_id_with_mask(teacher_neg_attention_mask)
+
+        # CDM is always active for tg_grpo (no per-sample gating); selector lives at token level.
+        self_distillation_mask = torch.ones(batch_size, dtype=torch.float32, device=device)
+
+        pos_max_len = pos_marker_ids.shape[1]
+        neg_max_len = neg_marker_ids.shape[1]
+        metrics = {
+            "self_distillation/teacher_context_mode": 4.0,  # cdm sentinel
+            "self_distillation/cdm_use_ref": 1.0 if cdm_use_ref else 0.0,
+            "self_distillation/cdm_pos_marker_len_max": float(pos_max_len),
+            "self_distillation/cdm_neg_marker_len_max": float(neg_max_len),
+            "self_distillation/cdm_gt_available_fraction": gt_found / max(batch_size, 1),
+            "self_distillation/success_sample_fraction": (
+                num_with_solution / max(batch_size, 1) if cdm_use_ref else 0.0
+            ),
+            "self_distillation/reprompt_sample_fraction": 1.0,
+        }
+        return DataProto.from_dict(tensors={
+            "teacher_pos_input_ids": teacher_pos_input_ids,
+            "teacher_pos_attention_mask": teacher_pos_attention_mask,
+            "teacher_pos_position_ids": teacher_pos_position_ids,
+            "teacher_neg_input_ids": teacher_neg_input_ids,
+            "teacher_neg_attention_mask": teacher_neg_attention_mask,
+            "teacher_neg_position_ids": teacher_neg_position_ids,
             "self_distillation_mask": self_distillation_mask,
         }), metrics
 

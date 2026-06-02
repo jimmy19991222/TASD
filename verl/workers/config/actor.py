@@ -65,9 +65,25 @@ class SelfDistillationConfig(BaseConfig):
             - "marker": prepend a static verdict marker to the assistant response.
             - "gt_marker": prepend a per-sample marker derived from the parquet ``ground_truth`` field.
             - "ref_gt": use the parquet ``ground_truth`` field as the ref text (does not require peer rollouts).
+            - "cdm": dual prompts (positive/negative verdict markers) for TG-GRPO contrastive
+              distillation modeling. Emits two teacher input tensor sets (pos/neg).
         verdict_right_marker (Optional[str]): Override for the verified-correct marker (default: VERDICT_RIGHT_MARKER).
         verdict_wrong_marker (Optional[str]): Override for the verified-incorrect marker (default: VERDICT_WRONG_MARKER).
         gt_marker_template (str): Template used by ``gt_marker`` mode. Available placeholders: ``{ground_truth}``.
+        loss_method (str): Distillation loss family. ``"sdpo"`` (default) keeps the legacy
+            self-distillation KL/IS path. ``"cdm"`` switches to TG-GRPO's contrastive
+            distillation modeling — the trainer emits dual (positive/negative) teacher
+            inputs and the actor computes |δ_t| = |log π_T+ - log π_T-| as the per-token
+            weight selector for the policy loss.
+        cdm_positive_template (str): Verdict text used to construct the positive teacher
+            prompt under ``teacher_context_mode="cdm"`` (e.g. "This answer is verified correct.").
+            Supports ``{ground_truth}`` placeholder.
+        cdm_negative_template (str): Verdict text used to construct the negative teacher
+            prompt under ``teacher_context_mode="cdm"`` (e.g. "This answer is verified incorrect.").
+            Supports ``{ground_truth}`` placeholder.
+        cdm_use_ref (bool): If True, also concatenate a sibling-success peer-rollout response
+            (same-uid ref text, like ``teacher_context_mode="ref"``) into the teacher prompt
+            in addition to the verdict marker ("ref+marker" variant). If False, marker-only.
     """
 
     full_logit_distillation: bool = True
@@ -105,6 +121,11 @@ class SelfDistillationConfig(BaseConfig):
         "[Meta: the assistant response below is verified to correctly answer the question. "
         "Reference answer: {ground_truth}]"
     )
+    # ── TG-GRPO / CDM dual-teacher fields ─────────────────────────────────
+    loss_method: str = "sdpo"
+    cdm_positive_template: str = "This answer is verified correct."
+    cdm_negative_template: str = "This answer is verified incorrect."
+    cdm_use_ref: bool = True
 
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:
@@ -125,11 +146,27 @@ class SelfDistillationConfig(BaseConfig):
             )
         if self.is_clip is not None and self.is_clip <= 0:
             raise ValueError(f"self_distillation.is_clip must be positive, got {self.is_clip}")
-        valid_teacher_context_modes = ["ref", "marker", "gt_marker", "ref_gt"]
+        valid_teacher_context_modes = ["ref", "marker", "gt_marker", "ref_gt", "cdm"]
         if self.teacher_context_mode not in valid_teacher_context_modes:
             raise ValueError(
                 "self_distillation.teacher_context_mode must be one of "
                 f"{valid_teacher_context_modes}, got {self.teacher_context_mode}"
+            )
+        valid_loss_methods = ["sdpo", "cdm"]
+        if self.loss_method not in valid_loss_methods:
+            raise ValueError(
+                "self_distillation.loss_method must be one of "
+                f"{valid_loss_methods}, got {self.loss_method}"
+            )
+        if self.loss_method == "cdm" and self.teacher_context_mode != "cdm":
+            raise ValueError(
+                "self_distillation.loss_method='cdm' requires teacher_context_mode='cdm', "
+                f"got teacher_context_mode={self.teacher_context_mode!r}"
+            )
+        if self.teacher_context_mode == "cdm" and self.loss_method != "cdm":
+            raise ValueError(
+                "self_distillation.teacher_context_mode='cdm' requires loss_method='cdm', "
+                f"got loss_method={self.loss_method!r}"
             )
 
 
@@ -169,12 +206,22 @@ class PolicyLossConfig(BaseConfig):
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
 
     Args:
-        loss_mode (str): Loss function mode. Options: 'vanilla', 'clip-cov', 'kl-cov', 'gpg', 'sdpo'.
+        loss_mode (str): Loss function mode. Options: 'vanilla', 'clip-cov', 'kl-cov', 'gpg', 'sdpo', 'tg_grpo'.
         clip_cov_ratio (float): Ratio of tokens to be clipped for clip-cov loss.
         clip_cov_lb (float): Lower bound for clip-cov loss.
         clip_cov_ub (float): Upper bound for clip-cov loss.
         kl_cov_ratio (float): Ratio of tokens to be applied KL penalty for kl-cov loss.
         ppo_kl_coef (float): KL divergence penalty coefficient.
+        tg_top_k (float): Fraction of tokens to keep for TG-GRPO percentile-based modes
+            (``topk_traj``, ``topk_batch``). E.g. 0.30 keeps top-30% by |δ_t|.
+        tg_w_mode (str): TG-GRPO per-token weight mode w_t = f(|δ_t|). Options:
+
+            - ``topk_traj`` (default, recommended): per-trajectory top-k·|response_mask| hard mask.
+            - ``topk_batch``: global top-k across the whole batch (length-biased).
+            - ``sigmoid``: soft weighting w_t = sigmoid(β · (|δ_t| - median(|δ|))).
+            - ``hard``: per-token threshold w_t = 1{|δ_t| >= τ}.
+        tg_w_sigmoid_beta (float): Sharpness β for sigmoid mode.
+        tg_w_hard_threshold (float): Threshold τ for hard mode.
         branch_token_loss_mode (str): How the teacher-guided branching rollout's
             ``branch_token_mask`` weights the policy loss. Options:
 
@@ -196,6 +243,11 @@ class PolicyLossConfig(BaseConfig):
     clip_cov_ub: float = 5.0
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
+    # ── TG-GRPO per-token weight knobs ────────────────────────────────────
+    tg_top_k: float = 0.30
+    tg_w_mode: str = "topk_traj"
+    tg_w_sigmoid_beta: float = 5.0
+    tg_w_hard_threshold: float = 0.3
     branch_token_loss_mode: str = "all"
 
     def __post_init__(self):
@@ -204,6 +256,20 @@ class PolicyLossConfig(BaseConfig):
             raise ValueError(
                 f"policy_loss.branch_token_loss_mode must be one of {valid}, "
                 f"got {self.branch_token_loss_mode!r}"
+            )
+        valid_tg_modes = {"topk_traj", "topk_batch", "sigmoid", "hard"}
+        if self.tg_w_mode not in valid_tg_modes:
+            raise ValueError(
+                f"policy_loss.tg_w_mode must be one of {valid_tg_modes}, "
+                f"got {self.tg_w_mode!r}"
+            )
+        if not 0.0 < self.tg_top_k <= 1.0:
+            raise ValueError(
+                f"policy_loss.tg_top_k must be in (0,1], got {self.tg_top_k}"
+            )
+        if self.tg_w_sigmoid_beta <= 0.0:
+            raise ValueError(
+                f"policy_loss.tg_w_sigmoid_beta must be positive, got {self.tg_w_sigmoid_beta}"
             )
 
 
