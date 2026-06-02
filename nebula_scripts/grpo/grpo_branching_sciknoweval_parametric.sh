@@ -39,7 +39,7 @@ N_SPLITS="${N_SPLITS:-3}"
 # teacher's top-K covers all of student's top-K candidates with high
 # probability (otherwise pick_teacher_branches sees a thin intersection).
 TOP_K="${TOP_K:-10}"
-TEACHER_TOP_K="${TEACHER_TOP_K:-50}"
+TEACHER_TOP_K="${TEACHER_TOP_K:-100}"
 # vLLM engine max_logprobs must be >= max(TOP_K, TEACHER_TOP_K). The engine
 # default is 20 so anything above triggers VLLMValidationError.
 VLLM_MAX_LOGPROBS_REQUIRED=$(( TOP_K > TEACHER_TOP_K ? TOP_K : TEACHER_TOP_K ))

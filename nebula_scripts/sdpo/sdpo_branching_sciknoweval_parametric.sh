@@ -40,7 +40,7 @@ N_SPLITS="${N_SPLITS:-3}"
 # top_k=50 ensures teacher returns enough logprobs to cover all of student's
 # 10 candidates (otherwise the intersection drops candidates silently).
 TOP_K="${TOP_K:-10}"
-TEACHER_TOP_K="${TEACHER_TOP_K:-50}"
+TEACHER_TOP_K="${TEACHER_TOP_K:-100}"
 VLLM_MAX_LOGPROBS_REQUIRED=$(( TOP_K > TEACHER_TOP_K ? TOP_K : TEACHER_TOP_K ))
 VLLM_MAX_LOGPROBS="${VLLM_MAX_LOGPROBS:-${VLLM_MAX_LOGPROBS_REQUIRED}}"
 ENTROPY_WINDOW="${ENTROPY_WINDOW:-20}"

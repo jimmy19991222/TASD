@@ -126,13 +126,19 @@ SDPO_DONT_REPROMPT_ON_SELF_SUCCESS="${SDPO_DONT_REPROMPT_ON_SELF_SUCCESS:-False}
 # OOD branches); teacher_top_k is what vLLM returns from the teacher forward
 # (kept LARGE so teacher's distribution covers ALL of student's candidates).
 TOP_K="${TOP_K:-10}"
-TEACHER_TOP_K="${TEACHER_TOP_K:-50}"
+TEACHER_TOP_K="${TEACHER_TOP_K:-100}"
 ENTROPY_WINDOW="${ENTROPY_WINDOW:-20}"
 ENTROPY_SIGMA_START="${ENTROPY_SIGMA_START:-2.0}"
 ENTROPY_SIGMA_FLOOR="${ENTROPY_SIGMA_FLOOR:-0.5}"
 ENTROPY_SIGMA_STEP="${ENTROPY_SIGMA_STEP:-0.5}"
 TEACHER_CONTEXT_MODE="${TEACHER_CONTEXT_MODE:-gt_marker}"
-ADV_STD_FLOOR="0.05"
+# adv_std_floor was an over-cautious add: GRPO advantage = (R-mean)/(std+eps)
+# is naturally bounded by sqrt(n) when std is small AND R_i ≠ mean, and
+# returns 0 (not ∞) when std=0 AND R_i=mean. The floor (0.05) silently
+# down-weighted low-variance groups (substituting std with 0.05 reduces the
+# advantage magnitude by std/0.05 ratio) — a behaviour change vs vanilla
+# GRPO baseline that confounds A/B comparisons. Default 0 (disabled).
+ADV_STD_FLOOR="${ADV_STD_FLOOR:-0.0}"
 
 # =============================================================================
 TOTAL=0

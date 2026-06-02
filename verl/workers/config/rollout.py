@@ -145,9 +145,11 @@ class BranchingConfig(BaseConfig):
     # student∩teacher intersection, dropping (student-only) candidates from
     # the argmax/argmin selection. With teacher_top_k >> top_k the
     # intersection ≈ student top-K, so every student candidate effectively
-    # gets a teacher score. Default 50 requires bumping vLLM's engine
-    # ``max_logprobs`` ≥ 50 (parametric scripts do this automatically).
-    teacher_top_k: int = 50
+    # gets a teacher score. The teacher branch query is max_tokens=1 so the
+    # K-cost is trivial (1 position × K logprobs); bumping to 100 gives
+    # >>99% coverage of student top-10 and only requires engine
+    # ``max_logprobs`` ≥ 100 (parametric scripts auto-bump).
+    teacher_top_k: int = 100
     # Optional sub-selection: how many of student's top-K we offer the
     # teacher for argmax/argmin. None ⇒ use top_k (consider all student
     # candidates). Set lower (e.g. 5) to keep both branches strictly in the

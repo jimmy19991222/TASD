@@ -221,9 +221,9 @@ branching:
   # branch-point query. Independent from top_k. Set LARGER than top_k so
   # teacher's returned distribution covers all of student's top-K candidates
   # (otherwise pick_teacher_branches sees only the intersection and many
-  # student candidates are silently dropped). Default 50 requires bumping
-  # engine `max_logprobs` ≥ 50.
-  teacher_top_k: 50
+  # student candidates are silently dropped). Default 100 ≫ top_k=10 gives
+  # >>99% coverage; engine `max_logprobs` auto-bumps via parametric.
+  teacher_top_k: 100
 
   # Optional sub-selection: only offer the top-N of student's candidates to
   # the teacher for argmax/argmin. null ⇒ use top_k.
