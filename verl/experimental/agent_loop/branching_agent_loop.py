@@ -224,46 +224,46 @@ class BranchingAgentLoop(AgentLoopBase):
                     "BranchingAgentLoop pipeline failed (cache_key=%s); "
                     "attempting plain student rollout fallback.", cache_key,
                 )
-                # Best-effort fallback so siblings still get well-formed leaves.
-                # First try a plain (non-branching) student rollout — if that
-                # works, all n_leaves siblings receive valid response tokens
-                # and downstream tokenizer.pad will not degenerate to a list
-                # (which is what happens when response_tokens is empty).
-                fallback_tokens: list[int] = []
-                fallback_lps: Optional[list[float]] = None
+                # Best-effort fallback. CRITICAL: emit ``n_leaves`` INDEPENDENT
+                # student rollouts (different vLLM seeds → different responses)
+                # rather than 1 rollout × n copies. If we copied a single
+                # rollout, GRPO's group baseline computes ``id_std=0`` over
+                # identical rewards and ``adv_std_floor`` clamps the divisor
+                # — every advantage becomes ``(R - R)/floor = 0`` and the run
+                # is dead (grad_norm=0, pg_loss=0). Verified on the first TGB
+                # pilot: vLLM rejected logprobs=50, every owner pipeline took
+                # the fallback, identical leaves killed GRPO.
                 fallback_reason = f"pipeline_exception:{type(e).__name__}"
                 try:
                     plain_sp = dict(sampling_params)
-                    plain_sp.pop("logprobs", None)  # drop the int-K override
+                    plain_sp.pop("logprobs", None)
                     plain_sp["logprobs"] = False
-                    plain_out = await self.server_manager.generate(
-                        request_id=uuid4().hex,
+                    fallback_leaves = await self._fallback_n_independent(
                         prompt_ids=prompt_ids,
                         sampling_params=plain_sp,
-                        image_data=images,
-                        video_data=videos,
+                        multi_modal_data=multi_modal_data,
+                        images=images,
+                        videos=videos,
+                        reason=f"{fallback_reason}:plain_rollout_ok",
                     )
-                    fallback_tokens = list(plain_out.token_ids)
-                    fallback_lps = list(plain_out.log_probs) if plain_out.log_probs else None
-                    fallback_reason = f"{fallback_reason}:plain_rollout_ok"
+                    future.set_result(fallback_leaves)
                 except BaseException as plain_err:  # noqa: BLE001
                     logger.exception(
                         "Plain-rollout fallback also failed for cache_key=%s; "
                         "emitting EOS-only leaves.", cache_key,
                     )
-                    fallback_reason = f"{fallback_reason}:plain_rollout_failed:{type(plain_err).__name__}"
-                try:
-                    fallback_leaves = self._fallback_n_copies(
-                        prompt_ids=prompt_ids,
-                        response_tokens=fallback_tokens,
-                        response_logprobs=fallback_lps,
-                        multi_modal_data=multi_modal_data,
-                        reason=fallback_reason,
-                    )
-                    future.set_result(fallback_leaves)
-                except BaseException as fb_err:  # noqa: BLE001
-                    future.set_exception(fb_err)
-                    raise
+                    try:
+                        fallback_leaves = self._fallback_n_copies(
+                            prompt_ids=prompt_ids,
+                            response_tokens=[],
+                            response_logprobs=None,
+                            multi_modal_data=multi_modal_data,
+                            reason=f"{fallback_reason}:plain_rollout_failed:{type(plain_err).__name__}",
+                        )
+                        future.set_result(fallback_leaves)
+                    except BaseException as fb_err:  # noqa: BLE001
+                        future.set_exception(fb_err)
+                        raise
 
         try:
             leaves = await future
@@ -861,6 +861,62 @@ class BranchingAgentLoop(AgentLoopBase):
                 "pad_index": pad_index,
             },
         )
+
+    async def _fallback_n_independent(
+        self,
+        *,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        multi_modal_data: dict[str, Any],
+        images: Optional[list[Any]],
+        videos: Optional[list[Any]],
+        reason: str,
+    ) -> list[AgentLoopOutput]:
+        """Fire ``n_leaves`` INDEPENDENT student rollouts and wrap each as a
+        leaf. Used when the branching pipeline raises but a plain student
+        rollout still works.
+
+        Each leaf has different response tokens (different vLLM seeds) so the
+        downstream GRPO group baseline retains variance — without this, all
+        siblings of a uid receive identical rewards, ``id_std → 0``, and the
+        advantage-from-group-mean degenerates to 0 (zero gradient).
+        """
+        leaves: list[AgentLoopOutput] = []
+        for idx in range(self.n_leaves):
+            out = await self.server_manager.generate(
+                request_id=uuid4().hex,
+                prompt_ids=prompt_ids,
+                sampling_params=dict(sampling_params),
+                image_data=images,
+                video_data=videos,
+            )
+            tokens = list(out.token_ids)[: self.response_length]
+            if not tokens:
+                eos_id = (
+                    getattr(self.tokenizer, "eos_token_id", None)
+                    or getattr(self.tokenizer, "pad_token_id", None)
+                    or 0
+                )
+                tokens = [int(eos_id)]
+            lps = list((out.log_probs or [0.0] * len(tokens))[: self.response_length])
+            if len(lps) < len(tokens):
+                lps = lps + [0.0] * (len(tokens) - len(lps))
+            leaves.append(AgentLoopOutput(
+                prompt_ids=list(prompt_ids),
+                response_ids=tokens,
+                response_mask=[1] * len(tokens),
+                response_logprobs=lps,
+                multi_modal_data=multi_modal_data,
+                num_turns=2,
+                metrics=AgentLoopMetrics(),
+                extra_fields={
+                    "branch_token_mask": [0] * len(tokens),
+                    "leaf_id": idx,
+                    "leaf_depth": 0,
+                    "branching_fallback": reason,
+                },
+            ))
+        return leaves
 
     def _fallback_n_copies(
         self,

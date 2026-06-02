@@ -33,7 +33,10 @@ fi
 # ── Branching 专属超参 ────────────────────────────────────────────────
 BRANCHING_ENABLED="${BRANCHING_ENABLED:-True}"
 N_SPLITS="${N_SPLITS:-3}"
+# top_k > 20 requires bumping vLLM engine's max_logprobs (default 20). We set
+# both below; keep them aligned.
 TOP_K="${TOP_K:-50}"
+VLLM_MAX_LOGPROBS="${VLLM_MAX_LOGPROBS:-${TOP_K}}"
 ENTROPY_WINDOW="${ENTROPY_WINDOW:-20}"
 ENTROPY_SIGMA_START="${ENTROPY_SIGMA_START:-2.0}"
 ENTROPY_SIGMA_FLOOR="${ENTROPY_SIGMA_FLOOR:-0.5}"
@@ -84,6 +87,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
     actor_rollout_ref.rollout.enable_prefix_caching=True \
+    actor_rollout_ref.rollout.engine_kwargs.vllm.max_logprobs=${VLLM_MAX_LOGPROBS} \
     actor_rollout_ref.rollout.agent.default_agent_loop=${DEFAULT_AGENT_LOOP} \
     actor_rollout_ref.rollout.branching.enabled=${BRANCHING_ENABLED} \
     actor_rollout_ref.rollout.branching.n_splits=${N_SPLITS} \

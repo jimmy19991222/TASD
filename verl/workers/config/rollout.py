@@ -126,7 +126,15 @@ class BranchingConfig(BaseConfig):
 
     enabled: bool = False
     n_splits: int = 3
-    top_k: int = 50
+    # NOTE: vLLM's AsyncEngineArgs default ``max_logprobs`` is 20. Setting top_k
+    # above 20 *requires* the user to bump the engine's max_logprobs via
+    # ``actor_rollout_ref.rollout.engine_kwargs.vllm.max_logprobs`` (the
+    # branching parametric script does this for top_k=50). Going past 20 with
+    # the default engine config triggers
+    # ``vllm.exceptions.VLLMValidationError: Requested sample logprobs of K,
+    # which is greater than max allowed: 20`` on every initial student call,
+    # which is what brought down the first pilot — see Phase 1c.2 retro.
+    top_k: int = 20
     entropy_window: int = 20
     entropy_protect_window: Optional[int] = None
     entropy_sigma_start: float = 2.0

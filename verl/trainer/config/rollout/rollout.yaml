@@ -211,9 +211,11 @@ branching:
   # Number of binary splits per prompt. With rollout_n=8 the balanced tree depth is 3 → 8 leaves.
   n_splits: 3
 
-  # How many top logprobs vLLM should return per generated token. Used for both student
-  # entropy estimation and teacher branch-point scoring.
-  top_k: 50
+  # How many top logprobs vLLM should return per generated token. Used for both
+  # student entropy estimation and teacher branch-point scoring. vLLM's default
+  # `max_logprobs` cap is 20 — going higher REQUIRES bumping the engine cap via
+  # `engine_kwargs.vllm.max_logprobs` (see grpo/sdpo_branching parametric scripts).
+  top_k: 20
 
   # Rolling-window size W for the z-score detector.
   entropy_window: 20
