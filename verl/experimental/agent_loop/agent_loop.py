@@ -1121,8 +1121,6 @@ class AgentLoopManager:
         # aggregates would conflict. Instead read non_tensor_batch which IS
         # concatenated row-wise, and produce one step-level aggregate here.
         branching_metrics = _aggregate_branching_diag_from_batch(output)
-        if branching_metrics:
-            output.meta_info["branching_metrics"] = branching_metrics
 
         # Fix for Issue #4147: Always call sleep() to ensure proper cleanup
         self.sleep()
@@ -1133,7 +1131,13 @@ class AgentLoopManager:
         metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
         timing = self._performance_metrics(metrics, output)
 
+        # NOTE: this assignment fully REPLACES output.meta_info with timing +
+        # outputs[0].meta_info — any keys we set on output.meta_info BEFORE
+        # this line would be silently dropped. Stash branching_metrics here so
+        # the trainer hook (ray_trainer.py:1900-1908) can pick it up.
         output.meta_info = {"timing": timing, **outputs[0].meta_info}
+        if branching_metrics:
+            output.meta_info["branching_metrics"] = branching_metrics
         return output
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
