@@ -101,7 +101,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
     actor_rollout_ref.rollout.enable_prefix_caching=True \
-    actor_rollout_ref.rollout.engine_kwargs.vllm.max_logprobs=${VLLM_MAX_LOGPROBS} \
+    ++actor_rollout_ref.rollout.engine_kwargs.vllm.max_logprobs=${VLLM_MAX_LOGPROBS} \
     actor_rollout_ref.rollout.agent.default_agent_loop=${DEFAULT_AGENT_LOOP} \
     actor_rollout_ref.rollout.branching.enabled=${BRANCHING_ENABLED} \
     actor_rollout_ref.rollout.branching.n_splits=${N_SPLITS} \
