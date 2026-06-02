@@ -578,6 +578,20 @@ class BranchingAgentLoop(AgentLoopBase):
         pick_k = int(_pick_k_override) if _pick_k_override is not None else int(cfg.top_k)
         if pick_k > 0:
             student_topk_pairs = student_topk_pairs[:pick_k]
+
+        # Coverage diagnostic: how many of student's pick_k candidates appear
+        # in teacher's top-K? If teacher_top_k is too small the intersection
+        # is thin and many student candidates are silently dropped from the
+        # argmax/argmin selection. We aggregate (intersect_total, pick_total)
+        # across all split decisions and surface coverage_ratio in SwanLab.
+        intersect_count = sum(1 for tok, _ in student_topk_pairs if tok in teacher_top)
+        diag["teacher_coverage_intersect_total"] = (
+            diag.get("teacher_coverage_intersect_total", 0) + intersect_count
+        )
+        diag["teacher_coverage_pick_total"] = (
+            diag.get("teacher_coverage_pick_total", 0) + len(student_topk_pairs)
+        )
+
         choice = pick_teacher_branches(
             student_topk_pairs, teacher_top,
             fallback_to_student=bool(cfg.fallback_to_student_topk),
@@ -803,6 +817,7 @@ class BranchingAgentLoop(AgentLoopBase):
                             "leaf_depth": node.depth,
                             "branching_diag": dict(diag),
                             "priv_ctx_meta": dict(priv_ctx_meta),
+                            "branching_fallback": "",
                         },
                     )
                 )
@@ -951,6 +966,8 @@ class BranchingAgentLoop(AgentLoopBase):
                     "is_branching_fallback": 1,
                     "leaf_id": idx,
                     "leaf_depth": 0,
+                    "branching_diag": {},
+                    "priv_ctx_meta": {},
                     "branching_fallback": reason,
                 },
             ))
@@ -1008,6 +1025,8 @@ class BranchingAgentLoop(AgentLoopBase):
                     "is_branching_fallback": 1,
                     "leaf_id": leaf_id,
                     "leaf_depth": 0,
+                    "branching_diag": {},
+                    "priv_ctx_meta": {},
                     "branching_fallback": reason,
                 },
             )
