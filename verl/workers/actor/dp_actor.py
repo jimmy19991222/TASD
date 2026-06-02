@@ -29,7 +29,7 @@ from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, compute_policy_loss_tg_grpo, compute_self_distillation_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import agg_loss, compute_self_distillation_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -755,14 +755,6 @@ class DataParallelPPOActor(BasePPOActor):
 
         self_distillation_enabled = loss_mode == "sdpo"
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
-        # TG-GRPO with CDM dual-teacher: shares the self_distillation pipeline
-        # but emits dual (pos/neg) teacher inputs and runs a different policy
-        # loss path (vanilla PG with response_mask replaced by w_t = f(|δ_t|)).
-        tg_grpo_enabled = (
-            loss_mode == "tg_grpo"
-            and self_distillation_cfg is not None
-            and self_distillation_cfg.get("loss_method", "sdpo") == "cdm"
-        )
         if self_distillation_enabled:
             self_distillation_required_keys = {
                 "teacher_input_ids",
@@ -771,20 +763,6 @@ class DataParallelPPOActor(BasePPOActor):
                 "self_distillation_mask",
             }
             assert self_distillation_required_keys.issubset(set(data.batch.keys())), f"Missing required keys: {self_distillation_required_keys - set(data.batch.keys())}"
-        elif tg_grpo_enabled:
-            tg_grpo_required_keys = {
-                "teacher_pos_input_ids",
-                "teacher_pos_attention_mask",
-                "teacher_pos_position_ids",
-                "teacher_neg_input_ids",
-                "teacher_neg_attention_mask",
-                "teacher_neg_position_ids",
-                "self_distillation_mask",
-            }
-            assert tg_grpo_required_keys.issubset(set(data.batch.keys())), (
-                f"TG-GRPO missing required keys: {tg_grpo_required_keys - set(data.batch.keys())}. "
-                "Did the trainer build the CDM dual-prompt batch?"
-            )
 
         select_keys = [
             "responses",
@@ -801,8 +779,6 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("ref_log_prob")
         if self_distillation_enabled:
             select_keys.extend(list(self_distillation_required_keys))
-        if tg_grpo_enabled:
-            select_keys.extend(list(tg_grpo_required_keys))
         # Include pre-computed IS weights if present in batch
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
@@ -868,14 +844,9 @@ class DataParallelPPOActor(BasePPOActor):
                     loss_agg_mode = self.config.loss_agg_mode
 
                     calculate_entropy = self.config.calculate_entropy or (entropy_coeff != 0)
-                    self_distillation_mask = (
-                        model_inputs.get("self_distillation_mask")
-                        if (self_distillation_enabled or tg_grpo_enabled) else None
-                    )
+                    self_distillation_mask = model_inputs.get("self_distillation_mask") if self_distillation_enabled else None
                     if self_distillation_enabled:
                         assert not has_multi_modal_inputs, "Multi-modal inputs are not supported for distillation"
-                    if tg_grpo_enabled:
-                        assert not has_multi_modal_inputs, "Multi-modal inputs are not supported for TG-GRPO"
 
                     if self.config.use_dynamic_bsz:
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
@@ -888,12 +859,6 @@ class DataParallelPPOActor(BasePPOActor):
                     # all return: (bsz, response_length)
                     return_all_logps = self_distillation_cfg.full_logit_distillation and not self_distillation_cfg.distillation_topk
                     distill_topk = self_distillation_cfg.distillation_topk if self_distillation_cfg.full_logit_distillation else None
-                    # TG-GRPO does not need teacher full-logit / topk distillation —
-                    # only the per-token logp is consumed (for |δ_t|). Skip the
-                    # extra return-payloads to save memory.
-                    if tg_grpo_enabled:
-                        return_all_logps = False
-                        distill_topk = None
                     outputs = self._forward_micro_batch(
                         model_inputs,
                         temperature=temperature,
@@ -979,53 +944,6 @@ class DataParallelPPOActor(BasePPOActor):
                         )
 
                         pg_metrics["self_distillation/empty_target_batch"] = self_distillation_mask.sum().item() == 0
-                        micro_batch_metrics.update(pg_metrics)
-                    elif tg_grpo_enabled:
-                        # TG-GRPO CDM: dual teacher forward (π_T+, π_T-) under no_grad,
-                        # using self.actor_module as teacher (CDM teacher = student;
-                        # only the prompt context differs by verdict marker).
-                        teacher_pos_inputs = {
-                            "responses": model_inputs["responses"],
-                            "input_ids": model_inputs["teacher_pos_input_ids"],
-                            "attention_mask": model_inputs["teacher_pos_attention_mask"],
-                            "position_ids": model_inputs["teacher_pos_position_ids"],
-                        }
-                        teacher_neg_inputs = {
-                            "responses": model_inputs["responses"],
-                            "input_ids": model_inputs["teacher_neg_input_ids"],
-                            "attention_mask": model_inputs["teacher_neg_attention_mask"],
-                            "position_ids": model_inputs["teacher_neg_position_ids"],
-                        }
-                        with torch.no_grad():
-                            teacher_pos_outputs = self._forward_micro_batch(
-                                teacher_pos_inputs,
-                                temperature=temperature,
-                                calculate_entropy=False,
-                                return_all_logps=False,
-                                distill_topk=None,
-                                module=self.actor_module,
-                            )
-                            teacher_neg_outputs = self._forward_micro_batch(
-                                teacher_neg_inputs,
-                                temperature=temperature,
-                                calculate_entropy=False,
-                                return_all_logps=False,
-                                distill_topk=None,
-                                module=self.actor_module,
-                            )
-                        teacher_pos_log_prob = teacher_pos_outputs["log_probs"].detach()
-                        teacher_neg_log_prob = teacher_neg_outputs["log_probs"].detach()
-                        delta_abs = (teacher_pos_log_prob - teacher_neg_log_prob).abs()
-                        pg_loss, pg_metrics = compute_policy_loss_tg_grpo(
-                            old_log_prob=old_log_prob,
-                            log_prob=log_prob,
-                            advantages=advantages,
-                            response_mask=effective_response_mask,
-                            delta_abs=delta_abs,
-                            loss_agg_mode=loss_agg_mode,
-                            config=self.config,
-                            rollout_is_weights=rollout_is_weights,
-                        )
                         micro_batch_metrics.update(pg_metrics)
                     else:
                         # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
