@@ -461,7 +461,14 @@ class BranchingAgentLoop(AgentLoopBase):
         leaves = self._flatten_tree_to_leaves(
             root=root, multi_modal_data=multi_modal_data, diag=diag, priv_ctx_meta=priv_ctx_meta,
         )
-        leaves = self._pad_leaves_to_n(leaves, self.n_leaves)
+        leaves = await self._pad_leaves_to_n(
+            leaves, self.n_leaves,
+            prompt_ids=prompt_ids,
+            sampling_params=sampling_params,
+            multi_modal_data=multi_modal_data,
+            images=images,
+            videos=videos,
+        )
         return leaves
 
     # ------------------------------------------------------------------
@@ -913,26 +920,114 @@ class BranchingAgentLoop(AgentLoopBase):
         )
         return outputs
 
-    def _pad_leaves_to_n(self, leaves: list[AgentLoopOutput], n: int) -> list[AgentLoopOutput]:
-        """Ensure exactly ``n`` leaves by duplicating the last produced leaf
-        when the tree was shallower than expected. Never produce empty leaves
-        — torch.cat in _postprocess would explode on shape mismatch.
+    async def _pad_leaves_to_n(
+        self,
+        leaves: list[AgentLoopOutput],
+        n: int,
+        *,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        multi_modal_data: dict[str, Any],
+        images: Optional[list[Any]] = None,
+        videos: Optional[list[Any]] = None,
+    ) -> list[AgentLoopOutput]:
+        """Ensure exactly ``n`` leaves.
 
-        IMPORTANT: each duplicate must own its own ``extra_fields`` dict
-        (Pydantic ``model_copy(deep=False)`` shares dict references). Without
-        this, downstream mutation in ``_agent_loop_postprocess`` (which
-        ``pop()``s ``branch_token_mask`` and writes ``raw_prompt``) would
-        clobber siblings and crash ``torch.cat`` in the aggregator.
+        When the tree is shallower than expected (fewer leaves than n_leaves),
+        fill missing slots with INDEPENDENT student rollouts instead of cloning
+        the last leaf. This preserves GRPO group diversity — cloned duplicates
+        have identical rewards and collapse the group variance to zero, starving
+        the policy gradient of learning signal.
+
+        Each independent rollout is tagged ``is_branching_fallback=1`` so
+        dp_actor treats it with ``branch_token_loss_mode='all'`` (its
+        branch_token_mask is all-zeros anyway).
         """
         if len(leaves) >= n:
             return leaves[:n]
         if not leaves:
             raise RuntimeError("BranchingAgentLoop._pad_leaves_to_n: no leaves to pad from")
-        last = leaves[-1]
-        pad_idx = 0
-        while len(leaves) < n:
-            pad_idx += 1
-            leaves.append(self._clone_leaf(last, leaf_id_override=last.extra_fields.get("leaf_id", 0), pad_index=pad_idx))
+
+        n_missing = n - len(leaves)
+        # Generate independent student rollouts to fill the gap.
+        fill_leaves = await self._fill_independent_rollouts(
+            count=n_missing,
+            prompt_ids=prompt_ids,
+            sampling_params=sampling_params,
+            multi_modal_data=multi_modal_data,
+            images=images,
+            videos=videos,
+            start_leaf_id=len(leaves),
+            reason=f"tree_shallow_{len(leaves)}_of_{n}",
+        )
+        leaves.extend(fill_leaves)
+        return leaves[:n]
+
+    async def _fill_independent_rollouts(
+        self,
+        *,
+        count: int,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        multi_modal_data: dict[str, Any],
+        images: Optional[list[Any]],
+        videos: Optional[list[Any]],
+        start_leaf_id: int,
+        reason: str,
+    ) -> list[AgentLoopOutput]:
+        """Generate ``count`` independent student rollouts to fill tree gaps.
+
+        Unlike _fallback_n_independent (which always produces n_leaves), this
+        generates exactly ``count`` rollouts. Each is a plain student generation
+        tagged as is_branching_fallback=1 so dp_actor uses mode='all' for these
+        rows (their branch_token_mask is all-zeros).
+        """
+        sp = dict(sampling_params)
+        if sp.get("logprobs") is False or sp.get("logprobs") is None:
+            sp["logprobs"] = 0
+
+        async def _one_call(_idx: int):
+            return await self.server_manager.generate(
+                request_id=uuid4().hex,
+                prompt_ids=prompt_ids,
+                sampling_params=dict(sp),
+                image_data=images,
+                video_data=videos,
+            )
+
+        outs = await asyncio.gather(*(_one_call(i) for i in range(count)))
+
+        leaves: list[AgentLoopOutput] = []
+        for idx, out in enumerate(outs):
+            tokens = list(out.token_ids)[: self.response_length]
+            if not tokens:
+                eos_id = (
+                    getattr(self.tokenizer, "eos_token_id", None)
+                    or getattr(self.tokenizer, "pad_token_id", None)
+                    or 0
+                )
+                tokens = [int(eos_id)]
+            lps = list((out.log_probs or [0.0] * len(tokens))[: self.response_length])
+            if len(lps) < len(tokens):
+                lps = lps + [0.0] * (len(tokens) - len(lps))
+            leaves.append(AgentLoopOutput(
+                prompt_ids=list(prompt_ids),
+                response_ids=tokens,
+                response_mask=[1] * len(tokens),
+                response_logprobs=lps,
+                multi_modal_data=multi_modal_data,
+                num_turns=2,
+                metrics=AgentLoopMetrics(),
+                extra_fields={
+                    "branch_token_mask": [0] * len(tokens),
+                    "is_branching_fallback": 1,
+                    "leaf_id": start_leaf_id + idx,
+                    "leaf_depth": 0,
+                    "branching_diag": {},
+                    "priv_ctx_meta": {},
+                    "branching_fallback": reason,
+                },
+            ))
         return leaves
 
     @staticmethod
