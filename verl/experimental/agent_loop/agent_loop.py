@@ -1120,6 +1120,29 @@ class AgentLoopManager:
                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
             ]
         )
+        # Branching rollout can produce different non_tensor_batch key sets
+        # across worker chunks (e.g. only some chunks contain padded duplicate
+        # leaves carrying ``is_padded_duplicate`` / ``pad_index``, or only some
+        # chunks hit a fallback path). DataProto.concat -> list_of_dict_to_dict_of_list
+        # uses outputs[0].keys() as the schema and asserts every later chunk's
+        # keys is a subset, so any drift triggers an AssertionError mid-training.
+        # Align the schemas to the union of keys here, filling missing slots
+        # with an object array of None so downstream consumers that already
+        # check ``isinstance(d, dict)`` (e.g. _aggregate_branching_diag_from_batch)
+        # remain safe.
+        if len(outputs) > 1:
+            all_nt_keys: set = set()
+            for _o in outputs:
+                _nt = getattr(_o, "non_tensor_batch", None) or {}
+                all_nt_keys.update(_nt.keys())
+            for _o in outputs:
+                _nt = _o.non_tensor_batch
+                _bsz = int(_o.batch.batch_size[0])
+                for _k in all_nt_keys:
+                    if _k not in _nt:
+                        _arr = np.empty(_bsz, dtype=object)
+                        _arr[:] = [None] * _bsz
+                        _nt[_k] = _arr
         output = DataProto.concat(outputs)
 
         # Aggregate teacher-guided branching diagnostics across the full batch
