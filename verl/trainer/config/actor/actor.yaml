@@ -76,10 +76,12 @@ policy_loss:
   ppo_kl_coef: 0.1
 
   # How the teacher-guided branching rollout's branch_token_mask weights
-  # the policy loss. One of {all, mask, only}.
-  #   all  : default — every response token contributes (mask is ignored).
-  #   mask : zero-out branch tokens before PG aggregation (response_mask AND NOT branch_token_mask).
-  #   only : only branch tokens contribute (response_mask AND branch_token_mask).
+  # the policy loss. One of {all, mask, only, suffix}.
+  #   all    : default — every response token contributes (mask is ignored).
+  #   mask   : zero-out branch tokens before PG aggregation (response_mask AND NOT branch_token_mask).
+  #   only   : only branch tokens contribute (response_mask AND branch_token_mask).
+  #   suffix : only tokens AFTER the last branch token per leaf contribute — isolates
+  #            the unique student continuation, eliminates shared-prefix gradient cancellation.
   # No-op when branch_token_mask is absent from the data batch.
   branch_token_loss_mode: "all"
 

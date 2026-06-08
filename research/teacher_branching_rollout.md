@@ -124,3 +124,42 @@ V1 默认 `gt_marker`,因为它在 sciknoweval / lcb 上都有 `ground_truth` �
 - rollout class 名: `BranchingAgentLoop`(继承 `SingleTurnAgentLoop`)
 - 配置 namespace: `actor_rollout_ref.rollout.branching.*`
 - loss mode: 不新增,沿用 `vanilla` + `branch_token_loss_mode`(因为 advantage 仍是 GRPO 的)。SDPO V2 时再考虑。
+
+---
+
+## §12 N-trees topology(2026-06 升级)
+
+### 动机
+
+Phase-3 / SDPO branching pilot 观察：`n_splits=3` 单棵深树在 sciknoweval 上 acc≈0.485，显著低于 vanilla GRPO ceiling（0.5875）。诊断显示 8 个 leaf 共享前 ~70-80% prefix 时，reward variance 主要来自尾段决策点，group baseline 信号集中，advantage 趋同 → 模型快速过拟合到一条主路径。
+
+**N-trees 拓扑**：把「1 prompt → 1 棵 8-leaf 深树」换成「1 prompt → 多棵浅树」，每棵树独立 vLLM seed + 独立 prompt rollout，树间无前缀共享。这样 8 个 leaf 拆成 4 组共前缀的 (sibling, sibling) pair，每个 pair 内部仍由 teacher 在 disagreement 位上分裂，但 pair 之间的多样性来自不同初始 rollout，大幅降低过拟合风险。
+
+### 配置（`BranchingConfig`）
+
+- `n_trees: int = 1` — 每个 prompt 派生的独立树数量，默认 1 保持向后兼容。
+- `n_splits: int = N` — 每棵树的分裂深度。每棵树叶子数 `2**n_splits`。
+- 强制约束：`rollout.n == n_trees * 2**n_splits`（违反则在 `__post_init__` 抛错）。
+- `split_trigger: str = "entropy"` — 候选 `{entropy, entropy_disagreement}`。
+  - `entropy`：沿用旧逻辑，在 candidate 位中选第一个高熵位分裂。
+  - `entropy_disagreement`：在所有候选高熵位中遍历，只在 teacher 在 student top-K 的 argmax 与 student 实际采样 token 不一致的位置分裂；若全部位置一致则该树不分裂（记 `branching/no_disagreement_count`）。要求 `teacher_guided_rollout=True`。
+
+### 推荐首发
+
+```
+N_TREES=4 N_SPLITS=1 ROLLOUT_N=8 \
+BRANCH_TOKEN_LOSS_MODE=suffix \
+SPLIT_TRIGGER=entropy_disagreement \
+bash nebula_scripts/submit_tg_branching_pilot.sh --variant grpo_tg
+# --variant sdpo_tg 同理
+```
+
+4 棵 1-split 树 = 4 个独立 (sibling, sibling) pair / prompt，每个 pair 仅在最关键的 disagreement 位差一个 token。SwanLab run name 自动带 `tT4-bsplit1-trigDis` 标签，便于和 vanilla GRPO / 旧 1-tree branching 同图对比。
+
+### 实现要点
+
+- `BranchingAgentLoop` 全局 slot 计数器仍按 base prompt key，从 slot 解构 `(tree_idx, leaf_idx_in_tree)`。
+- `cache_key = base_cache_key + "#t" + tree_idx`，每棵树独立 sibling owner / asyncio.Future。
+- vLLM seed：`seed = (base_seed + tree_idx * 1_000_003) & 0x7FFFFFFF`，保证不同树初始 rollout 真正发散。
+- counter rollback / forfeit 用 base_cache_key 而非 tree-specific key。
+- `branch_indices` 在树内编号，leaf 写回时仍是全局唯一 traj_id（uuid4）。

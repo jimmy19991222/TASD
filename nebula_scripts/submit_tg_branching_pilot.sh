@@ -15,14 +15,20 @@
 # Variants:
 #   baseline   : rollout.branching.enabled=False, vanilla GRPO (control).
 #   branching  : full pipeline (GRPO loss) with branch_token_loss_mode in
-#                {all, mask, only}. Use --loss-mode all|mask|only|all_three
-#                (default all_three).
+#                {all, mask, only, suffix}. Use --loss-mode all|mask|only|suffix|all_three
+#                (default suffix).
 #   sdpo       : full pipeline (SDPO loss) with branch_token_loss_mode in
-#                {all, mask, only}. Aligns
+#                {all, mask, only, suffix}. Aligns
 #                actor.self_distillation.teacher_context_mode with
 #                rollout.branching.teacher_context_mode so the on-policy
 #                teacher distribution is byte-identical between rollout and
 #                training time. Use --loss-mode same as above.
+#   grpo_tg    : N-trees branching (GRPO loss). One tree per pair, multiple
+#                independent trees per prompt. Reads N_TREES (default 4) +
+#                SPLIT_TRIGGER (default entropy_disagreement). Default
+#                topology n_trees=4, n_splits=1, rollout.n=8 — 4 independent
+#                pairs of leaves per prompt.
+#   sdpo_tg    : Same N-trees topology but with the SDPO loss arm.
 #   all        : baseline + branching (does NOT include sdpo by default —
 #                that's a heavier sweep; pass --variant sdpo explicitly).
 #   compare    : 3 GRPO branching + 3 SDPO branching = 6 jobs, NO baselines.
@@ -34,7 +40,10 @@
 # Env-overridable knobs (export before running):
 #   Branching:
 #     N_SPLITS               default 3   number of binary splits per prompt
-#     ROLLOUT_N              default 8   MUST equal 2**N_SPLITS (validated)
+#     N_TREES                default 1   number of independent trees per prompt
+#                                        (n_trees * 2**N_SPLITS must == ROLLOUT_N)
+#     ROLLOUT_N              default 8   MUST equal N_TREES * 2**N_SPLITS
+#     SPLIT_TRIGGER          default entropy  one of {entropy, entropy_disagreement}
 #     TOP_K                  default 50  vLLM logprobs depth (student & teacher)
 #                                        — also bumps engine max_logprobs
 #     ENTROPY_WINDOW         default 20  rolling z-score window
@@ -53,6 +62,11 @@
 #   N_SPLITS=2 ROLLOUT_N=4 bash ... --variant branching --loss-mode mask
 #   TEACHER_CONTEXT_MODE=marker bash ... --variant branching --loss-mode mask
 #   TOP_K=20 bash ... --variant branching            # tighter K, vLLM-default-cap-friendly
+#   # 4-tree N-trees pilot for GRPO + SDPO with disagreement trigger:
+#   N_TREES=4 N_SPLITS=1 ROLLOUT_N=8 SPLIT_TRIGGER=entropy_disagreement \
+#     bash nebula_scripts/submit_tg_branching_pilot.sh --variant grpo_tg
+#   N_TREES=4 N_SPLITS=1 ROLLOUT_N=8 SPLIT_TRIGGER=entropy_disagreement \
+#     bash nebula_scripts/submit_tg_branching_pilot.sh --variant sdpo_tg
 # =============================================================================
 
 # ── Nebula 账号配置 ──────────────────────────────────────────────────────
@@ -78,8 +92,8 @@ SAVE_HF_ONLY="${SAVE_HF_ONLY:-True}"
 
 # ── 参数解析 ──────────────────────────────────────────────────────────
 DRY_RUN=false
-VARIANT="all"        # all | baseline | branching
-LOSS_MODE="all_three" # all | mask | only | all_three (only for branching)
+VARIANT="all"        # all | baseline | branching | sdpo | grpo_tg | sdpo_tg | compare
+LOSS_MODE="all_three" # all | mask | only | suffix | all_three (only for branching)
 
 for ((i=1; i<=$#; i++)); do
     arg="${!i}"
@@ -106,14 +120,17 @@ TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"
 LRS=("${LR:-1e-5}")
 MINI_BATCH_SIZES=("${MINI_BATCH_SIZE:-32}")
 
-# rollout.n MUST equal 2**branching.n_splits when branching is enabled —
-# enforced via N_LEAVES below; mismatched values raise a clear error.
+# rollout.n MUST equal N_TREES * 2**branching.n_splits when branching is
+# enabled — enforced via N_TOTAL_LEAVES below; mismatched values raise a
+# clear error.
 N_SPLITS="${N_SPLITS:-3}"
+N_TREES="${N_TREES:-1}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
-N_LEAVES=$((1 << N_SPLITS))   # 2 ** N_SPLITS
-if [ "$ROLLOUT_N" != "$N_LEAVES" ]; then
-    echo "ERROR: ROLLOUT_N=$ROLLOUT_N must equal 2**N_SPLITS=$N_LEAVES (n_splits=$N_SPLITS)." 1>&2
-    echo "       Set both: e.g. 'N_SPLITS=2 ROLLOUT_N=4 bash $0 ...'" 1>&2
+N_LEAVES_PER_TREE=$((1 << N_SPLITS))   # 2 ** N_SPLITS
+N_TOTAL_LEAVES=$((N_TREES * N_LEAVES_PER_TREE))
+if [ "$ROLLOUT_N" != "$N_TOTAL_LEAVES" ]; then
+    echo "ERROR: ROLLOUT_N=$ROLLOUT_N must equal N_TREES * 2**N_SPLITS = $N_TOTAL_LEAVES (n_trees=$N_TREES, n_splits=$N_SPLITS)." 1>&2
+    echo "       Set all three: e.g. 'N_TREES=4 N_SPLITS=1 ROLLOUT_N=8 bash $0 ...'" 1>&2
     exit 2
 fi
 
@@ -132,6 +149,7 @@ ENTROPY_SIGMA_START="${ENTROPY_SIGMA_START:-2.0}"
 ENTROPY_SIGMA_FLOOR="${ENTROPY_SIGMA_FLOOR:-0.5}"
 ENTROPY_SIGMA_STEP="${ENTROPY_SIGMA_STEP:-0.5}"
 TEACHER_CONTEXT_MODE="${TEACHER_CONTEXT_MODE:-gt_marker}"
+SPLIT_TRIGGER="${SPLIT_TRIGGER:-entropy}"
 # adv_std_floor was an over-cautious add: GRPO advantage = (R-mean)/(std+eps)
 # is naturally bounded by sqrt(n) when std is small AND R_i ≠ mean, and
 # returns 0 (not ∞) when std=0 AND R_i=mean. The floor (0.05) silently
@@ -303,6 +321,58 @@ if [[ "$VARIANT" == "sdpo" ]]; then
         _submit_job "$SCRIPT_PATH" "$JOB_NAME" \
             "$(_common_env "$JOB_NAME" "$DATASET" "$MODEL_NAME" "$LR" "32") --env=ALPHA=${SDPO_ALPHA} --env=DONT_REPROMPT_ON_SELF_SUCCESS=${SDPO_DONT_REPROMPT_ON_SELF_SUCCESS} --env=BRANCHING_ENABLED=True --env=N_SPLITS=${N_SPLITS} --env=TOP_K=${TOP_K} --env=TEACHER_TOP_K=${TEACHER_TOP_K} --env=ENTROPY_WINDOW=${ENTROPY_WINDOW} --env=ENTROPY_SIGMA_START=${ENTROPY_SIGMA_START} --env=ENTROPY_SIGMA_FLOOR=${ENTROPY_SIGMA_FLOOR} --env=ENTROPY_SIGMA_STEP=${ENTROPY_SIGMA_STEP} --env=TEACHER_CONTEXT_MODE=${TEACHER_CONTEXT_MODE} --env=BRANCH_TOKEN_LOSS_MODE=${BTM} --env=ADV_STD_FLOOR=${ADV_STD_FLOOR}"
     done; done; done; done
+fi
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Variant: grpo_tg / sdpo_tg — N-trees teacher-guided branching.
+# Each prompt produces N_TREES INDEPENDENT trees, every tree owns 2**N_SPLITS
+# leaves. Default topology N_TREES=4, N_SPLITS=1 → 4 independent pairs / prompt
+# (rollout.n=8). Default loss-mode is ``suffix`` (only train tokens after the
+# last branch); default trigger is ``entropy_disagreement`` (split only when
+# teacher's argmax differs from student's actually sampled token).
+# ──────────────────────────────────────────────────────────────────────────────
+if [[ "$VARIANT" == "grpo_tg" || "$VARIANT" == "sdpo_tg" ]]; then
+    # Defaults tuned for the 4-tree pilot: BTM=suffix + disagreement trigger.
+    NTG_LOSS_MODE="${LOSS_MODE}"
+    if [[ "$NTG_LOSS_MODE" == "all_three" ]]; then
+        NTG_LOSS_MODES=("suffix")
+    else
+        NTG_LOSS_MODES=("$NTG_LOSS_MODE")
+    fi
+    NTG_SPLIT_TRIGGER="${SPLIT_TRIGGER:-entropy_disagreement}"
+
+    if [[ "$VARIANT" == "grpo_tg" ]]; then
+        SCRIPT_PATH="nebula_scripts/grpo/grpo_branching_sciknoweval_parametric.sh"
+        TAG_PREFIX="TGB-NT-GRPO"
+    else
+        SCRIPT_PATH="nebula_scripts/sdpo/sdpo_branching_sciknoweval_parametric.sh"
+        TAG_PREFIX="TGB-NT-SDPO"
+    fi
+
+    # Trigger tag: ``trigDis`` for entropy_disagreement, ``trigEnt`` otherwise.
+    if [[ "$NTG_SPLIT_TRIGGER" == "entropy_disagreement" ]]; then
+        TRIG_TAG="trigDis"
+    else
+        TRIG_TAG="trigEnt"
+    fi
+
+    for DATASET in "${DATASETS[@]}"; do
+    for MODEL_NAME in "${MODEL_NAMES[@]}"; do
+    for LR in "${LRS[@]}"; do
+    for MINI_BATCH_SIZE in "${MINI_BATCH_SIZES[@]}"; do
+    for BTM in "${NTG_LOSS_MODES[@]}"; do
+        DATASET_SHORT=$(echo "$DATASET" | tr '/' '-')
+        LR_TAG=$(echo "$LR" | tr '-' '_')
+        CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
+        JOB_NAME="${TAG_PREFIX}-${DATASET_SHORT}-${TEACHER_CONTEXT_MODE}-tT${N_TREES}-bsplit${N_SPLITS}-${TRIG_TAG}-btm${BTM}-mbs${MINI_BATCH_SIZE}-lr${LR_TAG}-${MODEL_NAME}-${CURRENT_TIME}"
+        if [[ "$VARIANT" == "grpo_tg" ]]; then
+            _submit_job "$SCRIPT_PATH" "$JOB_NAME" \
+                "$(_common_env "$JOB_NAME" "$DATASET" "$MODEL_NAME" "$LR" "$MINI_BATCH_SIZE") --env=BRANCHING_ENABLED=True --env=N_SPLITS=${N_SPLITS} --env=N_TREES=${N_TREES} --env=SPLIT_TRIGGER=${NTG_SPLIT_TRIGGER} --env=TOP_K=${TOP_K} --env=TEACHER_TOP_K=${TEACHER_TOP_K} --env=ENTROPY_WINDOW=${ENTROPY_WINDOW} --env=ENTROPY_SIGMA_START=${ENTROPY_SIGMA_START} --env=ENTROPY_SIGMA_FLOOR=${ENTROPY_SIGMA_FLOOR} --env=ENTROPY_SIGMA_STEP=${ENTROPY_SIGMA_STEP} --env=TEACHER_CONTEXT_MODE=${TEACHER_CONTEXT_MODE} --env=BRANCH_TOKEN_LOSS_MODE=${BTM} --env=ADV_STD_FLOOR=${ADV_STD_FLOOR}"
+        else
+            _submit_job "$SCRIPT_PATH" "$JOB_NAME" \
+                "$(_common_env "$JOB_NAME" "$DATASET" "$MODEL_NAME" "$LR" "32") --env=ALPHA=${SDPO_ALPHA} --env=DONT_REPROMPT_ON_SELF_SUCCESS=${SDPO_DONT_REPROMPT_ON_SELF_SUCCESS} --env=BRANCHING_ENABLED=True --env=N_SPLITS=${N_SPLITS} --env=N_TREES=${N_TREES} --env=SPLIT_TRIGGER=${NTG_SPLIT_TRIGGER} --env=TOP_K=${TOP_K} --env=TEACHER_TOP_K=${TEACHER_TOP_K} --env=ENTROPY_WINDOW=${ENTROPY_WINDOW} --env=ENTROPY_SIGMA_START=${ENTROPY_SIGMA_START} --env=ENTROPY_SIGMA_FLOOR=${ENTROPY_SIGMA_FLOOR} --env=ENTROPY_SIGMA_STEP=${ENTROPY_SIGMA_STEP} --env=TEACHER_CONTEXT_MODE=${TEACHER_CONTEXT_MODE} --env=BRANCH_TOKEN_LOSS_MODE=${BTM} --env=ADV_STD_FLOOR=${ADV_STD_FLOOR}"
+        fi
+    done; done; done; done; done
 fi
 
 echo ""

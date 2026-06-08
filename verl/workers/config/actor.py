@@ -185,6 +185,10 @@ class PolicyLossConfig(BaseConfig):
               off-policy bias of teacher-injected tokens.
             - ``only``: only branch tokens contribute (response_mask AND
               branch_token_mask). The "decision-token-only" hypothesis ablation.
+            - ``suffix``: only tokens AFTER the last branch token in each leaf
+              contribute. This isolates the unique student continuation segment
+              (post-final-fork), eliminating gradient cancellation on shared
+              prefixes where GRPO advantage sums to zero across siblings.
 
             No-op when ``branch_token_mask`` is absent from the data batch
             (i.e., branching rollout is disabled).
@@ -199,7 +203,7 @@ class PolicyLossConfig(BaseConfig):
     branch_token_loss_mode: str = "all"
 
     def __post_init__(self):
-        valid = {"all", "mask", "only"}
+        valid = {"all", "mask", "only", "suffix"}
         if self.branch_token_loss_mode not in valid:
             raise ValueError(
                 f"policy_loss.branch_token_loss_mode must be one of {valid}, "

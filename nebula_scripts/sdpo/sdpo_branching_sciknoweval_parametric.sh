@@ -36,6 +36,13 @@ fi
 # ── Branching 专属超参 ────────────────────────────────────────────────
 BRANCHING_ENABLED="${BRANCHING_ENABLED:-True}"
 N_SPLITS="${N_SPLITS:-3}"
+# N-trees topology: 1 prompt -> N_TREES independent trees, each with 2**N_SPLITS leaves.
+# ROLLOUT_N must equal N_TREES * 2**N_SPLITS.
+N_TREES="${N_TREES:-1}"
+# split_trigger in {entropy, entropy_disagreement}. The latter only splits at
+# positions where teacher's argmax-in-student-topK disagrees with the student's
+# actual sampled token (requires teacher_guided_rollout).
+SPLIT_TRIGGER="${SPLIT_TRIGGER:-entropy}"
 # Asymmetric K: student top_k=10 keeps branches in-distribution; teacher
 # top_k=50 ensures teacher returns enough logprobs to cover all of student's
 # 10 candidates (otherwise the intersection drops candidates silently).
@@ -108,6 +115,8 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.agent.default_agent_loop=${DEFAULT_AGENT_LOOP} \
     actor_rollout_ref.rollout.branching.enabled=${BRANCHING_ENABLED} \
     actor_rollout_ref.rollout.branching.n_splits=${N_SPLITS} \
+    actor_rollout_ref.rollout.branching.n_trees=${N_TREES} \
+    actor_rollout_ref.rollout.branching.split_trigger=${SPLIT_TRIGGER} \
     actor_rollout_ref.rollout.branching.top_k=${TOP_K} \
     actor_rollout_ref.rollout.branching.teacher_top_k=${TEACHER_TOP_K} \
     actor_rollout_ref.rollout.branching.entropy_window=${ENTROPY_WINDOW} \

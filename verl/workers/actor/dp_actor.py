@@ -569,17 +569,21 @@ class DataParallelPPOActor(BasePPOActor):
     ) -> tuple[torch.Tensor, dict]:
         """Apply the teacher-guided branching ablation to ``response_mask``.
 
-        Three modes:
-          ``all``  : default. mask is ignored; every response token contributes.
-          ``mask`` : zero-out branch tokens before aggregation
-                     (response_mask AND NOT branch_token_mask).
-          ``only`` : keep ONLY branch tokens (response_mask AND branch_token_mask).
+        Four modes:
+          ``all``    : default. mask is ignored; every response token contributes.
+          ``mask``   : zero-out branch tokens before aggregation
+                       (response_mask AND NOT branch_token_mask).
+          ``only``   : keep ONLY branch tokens (response_mask AND branch_token_mask).
+          ``suffix`` : keep only tokens AFTER the last branch token in each row.
+                       This isolates each leaf's unique student continuation,
+                       eliminating gradient cancellation on shared prefixes
+                       (where GRPO advantage sums to zero across siblings).
 
         For rows where ``is_branching_fallback`` is True (BranchingAgentLoop's
         owner pipeline raised, the row is a plain student rollout), the
         configured mode is OVERRIDDEN to ``all`` for that row only — otherwise
-        ``btm=only`` would silently zero out every fallback row's gradient
-        (mask is all-zero on fallback leaves; ``response_mask * 0 = 0``).
+        ``btm=only``/``suffix`` would silently zero out every fallback row's
+        gradient (mask is all-zero on fallback leaves).
 
         Returns ``(effective_response_mask, metrics)``. Diagnostic metrics
         are emitted REGARDLESS of mode so btm=all runs are still observable
@@ -594,11 +598,31 @@ class DataParallelPPOActor(BasePPOActor):
         # Per-row mode application: fallback rows always run as "all".
         if branch_loss_mode == "all":
             effective = response_mask
-        elif branch_loss_mode in ("mask", "only"):
+        elif branch_loss_mode in ("mask", "only", "suffix"):
             if branch_loss_mode == "mask":
                 masked = response_mask * (1 - btm)
-            else:  # "only"
+            elif branch_loss_mode == "only":
                 masked = response_mask * btm
+            else:  # "suffix"
+                # Build a per-row suffix mask: 1 for positions strictly AFTER
+                # the last branch token, 0 elsewhere. This keeps only the
+                # leaf's unique continuation segment (on-policy, non-shared).
+                T = btm.shape[1]
+                positions = torch.arange(T, device=btm.device).unsqueeze(0)  # [1, T]
+                # Weighted positions: btm * pos → max gives rightmost branch token idx.
+                # For rows with NO branch tokens, max of all-zeros = 0; we fix below.
+                has_branch = btm.any(dim=1)  # [B]
+                weighted = btm * positions  # [B, T]
+                last_branch_pos = weighted.max(dim=1).values.long()  # [B]
+                # Rows without branch tokens → set last_branch_pos = -1 so
+                # suffix_mask covers the full response (all positions > -1).
+                last_branch_pos = torch.where(
+                    has_branch, last_branch_pos,
+                    torch.tensor(-1, device=btm.device, dtype=last_branch_pos.dtype),
+                )
+                suffix_mask = (positions > last_branch_pos.unsqueeze(1)).to(response_mask.dtype)
+                masked = response_mask * suffix_mask
+
             if is_branching_fallback is not None and is_branching_fallback.numel() > 0:
                 # is_branching_fallback shape: [B]; broadcast to [B, T] selector.
                 ifb = is_branching_fallback.to(response_mask.device).to(response_mask.dtype)
@@ -609,7 +633,7 @@ class DataParallelPPOActor(BasePPOActor):
                 effective = masked
         else:
             raise ValueError(
-                f"branch_token_loss_mode must be one of {{all, mask, only}}, "
+                f"branch_token_loss_mode must be one of {{all, mask, only, suffix}}, "
                 f"got {branch_loss_mode!r}"
             )
 
@@ -618,10 +642,9 @@ class DataParallelPPOActor(BasePPOActor):
         with torch.no_grad():
             base_active = response_mask.sum().clamp_min(1.0)
             eff_active = effective.sum()
+            mode_id_map = {"all": 0, "mask": 1, "only": 2, "suffix": 3}
             metrics = {
-                "branching/loss_mode_id": float(
-                    {"all": 0, "mask": 1, "only": 2}[branch_loss_mode]
-                ),
+                "branching/loss_mode_id": float(mode_id_map[branch_loss_mode]),
                 "branching/active_token_ratio": (eff_active / base_active).item(),
                 "branching/branch_token_count": btm.sum().item(),
             }

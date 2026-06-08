@@ -283,6 +283,14 @@ branching:
   # Optional cap on tree depth. null = same as n_splits.
   max_branch_depth: null
 
+  # Number of independent branching trees per prompt. Total leaves = n_trees * 2**n_splits.
+  # rollout.n MUST equal n_trees * 2**n_splits. Default 1 = single-tree (backward compat).
+  n_trees: 1
+
+  # Split trigger strategy. "entropy" = legacy (first high-entropy position).
+  # "entropy_disagreement" = only split where teacher argmax != student actual token.
+  split_trigger: entropy
+
 # support logging rollout prob for debugging purpose
 # "Truncated importance sampling" requires rollout log probs, set to True when turning on Truncated importance sampling
 calculate_log_probs: False

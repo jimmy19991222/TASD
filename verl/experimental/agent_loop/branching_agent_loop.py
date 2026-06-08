@@ -64,17 +64,21 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 # ---------------------------------------------------------------------------
 # Module-level coordination across sibling agent-loop instances.
 # ---------------------------------------------------------------------------
-# Key   : deterministic id derived from (prompt_ids, generation_step).
+# Key   : deterministic id derived from (prompt_ids, generation_step, tree_idx).
 # Value : asyncio.Future resolving to a list of 2^n_splits AgentLoopOutput
-#         objects. The first sibling to enter run() creates the future and
-#         launches _run_branching_pipeline; the rest await the same future
-#         and pick their assigned leaf by branch_index.
+#         objects (one tree's worth of leaves). The first sibling that maps
+#         into a given (prompt, tree_idx) creates the future and launches
+#         _run_branching_pipeline; remaining siblings of the same tree await
+#         and pluck their per-tree leaf by branch_index. Different trees of
+#         the same prompt run INDEPENDENT student rollouts (different traj_id
+#         + sampling stochasticity), so each (prompt, tree_idx) gets its own
+#         owner / Future.
 #
 # IMPORTANT: This cache lives in the AgentLoopWorker process (one Ray actor).
 # A single PPO step's batch is dispatched through one AgentLoopWorker instance
-# at a time, so all 8 siblings of a uid land in the same dict. Across PPO
-# steps the cache grows unboundedly — _branching_cache_clear() is provided for
-# the manager to call between steps.
+# at a time, so all rollout.n siblings of a uid land in the same dict. Across
+# PPO steps the cache grows unboundedly — _branching_cache_clear() is provided
+# for the manager to call between steps.
 
 _BRANCHING_CACHE: dict[str, asyncio.Future] = {}
 _BRANCHING_CACHE_LOCK = asyncio.Lock()
@@ -86,7 +90,8 @@ def _branching_cache_clear() -> None:
 
 
 def _branching_cache_key(prompt_ids: list[int], generation_step: int) -> str:
-    """Deterministic cache key for sibling coordination.
+    """Deterministic BASE cache key shared by all sibling rows of a prompt
+    within a step. Tree-level coordination uses ``f"{base}#t{tree_idx}"``.
 
     The key must collide for sibling rows of the same prompt within a step and
     diverge across steps (so that teacher-prompt drift across PPO updates is
@@ -101,28 +106,37 @@ def _branching_cache_key(prompt_ids: list[int], generation_step: int) -> str:
     return h.hexdigest()
 
 
+def _tree_cache_key(base_key: str, tree_idx: int) -> str:
+    """Per-tree cache key. Each (prompt, tree_idx) pair gets its own owner."""
+    return f"{base_key}#t{int(tree_idx)}"
+
+
 # ---------------------------------------------------------------------------
 # Branch-index assignment.
 # ---------------------------------------------------------------------------
-# Each sibling row needs to know which leaf (0..2^n_splits - 1) it should
+# Each sibling row needs to know which (tree_idx, leaf_idx_in_tree) it should
 # return. We support two assignment modes:
-#   - kwargs["branch_index"]: caller-provided (e.g. via dataset metadata).
-#   - per-uid round-robin counter: when not provided, we derive it from a
-#     module-level monotonic counter keyed by the cache key. The first 8
-#     sibling rows for a given key are assigned indices 0..7 in arrival order.
+#   - kwargs["branch_index"]: caller-provided GLOBAL slot in
+#     [0, n_trees * 2^n_splits). Decomposes to tree_idx = slot // n_per_tree
+#     and leaf_idx_in_tree = slot % n_per_tree.
+#   - per-uid round-robin counter: when not provided, we derive the global
+#     slot from a module-level monotonic counter keyed by the BASE cache key.
+#     The first ``n_total`` sibling rows for a given prompt are assigned
+#     slots 0..n_total-1 in arrival order.
 
 _BRANCHING_INDEX_COUNTERS: dict[str, int] = {}
 _BRANCHING_INDEX_COUNTERS_LOCK = asyncio.Lock()
 
 
-async def _claim_branch_index(cache_key: str, n_leaves: int) -> int:
+async def _claim_branch_index(cache_key: str, n_total: int) -> int:
     async with _BRANCHING_INDEX_COUNTERS_LOCK:
         idx = _BRANCHING_INDEX_COUNTERS.get(cache_key, 0)
-        if idx >= n_leaves:
-            # Sibling pool exceeded the tree leaf count — happens if the user
-            # configured rollout.n > 2^n_splits. Wrap-around assigns extras
-            # round-robin; the trainer will still see rollout.n rows.
-            idx = idx % n_leaves
+        if idx >= n_total:
+            # Sibling pool exceeded the configured total leaf count — happens
+            # if the user configured rollout.n > n_trees * 2^n_splits.
+            # Wrap-around assigns extras round-robin; the trainer will still
+            # see rollout.n rows.
+            idx = idx % n_total
         _BRANCHING_INDEX_COUNTERS[cache_key] = _BRANCHING_INDEX_COUNTERS.get(cache_key, 0) + 1
         return idx
 
@@ -157,7 +171,23 @@ class BranchingAgentLoop(AgentLoopBase):
 
     @property
     def n_leaves(self) -> int:
+        """Number of leaves PER TREE (= 2^n_splits). Used by per-tree pipeline
+        / fallback paths. The total leaf count across all sibling rows of a
+        prompt is ``self.n_leaves_total``.
+        """
         return 2 ** int(self.branching_cfg.n_splits)
+
+    @property
+    def n_trees(self) -> int:
+        n = int(self.branching_cfg.get("n_trees", 1) or 1)
+        return max(1, n)
+
+    @property
+    def n_leaves_total(self) -> int:
+        """Total leaves across all trees of one prompt (= n_trees * n_leaves).
+        Equals ``rollout.n`` under the validated parametric config.
+        """
+        return self.n_trees * self.n_leaves
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         # Validate-time fast path: skip the entire branching pipeline so val
@@ -186,22 +216,33 @@ class BranchingAgentLoop(AgentLoopBase):
         # priv_ctx + student_response_so_far without recomputing the boundary.
         self._root_prompt_len = len(prompt_ids)
 
-        # Cache key shared across the 2^n_splits sibling rows of this prompt.
+        # Cache key shared across the sibling rows of this prompt. We claim a
+        # GLOBAL slot in [0, n_leaves_total) and decompose it into
+        # (tree_idx, leaf_idx_in_tree); each tree has its OWN cache key /
+        # owner / Future so trees run independent student rollouts.
         gen_step = int(kwargs.get("generation_step", 0))
-        cache_key = _branching_cache_key(prompt_ids, gen_step)
+        base_cache_key = _branching_cache_key(prompt_ids, gen_step)
 
-        # Each sibling row claims a leaf index. If rollout.n > 2^n_splits the
-        # extras wrap around (duplicate leaves); typical config aligns the two.
+        n_per_tree = self.n_leaves
+        n_total = self.n_leaves_total
+
+        # Each sibling row claims a global slot. If rollout.n > n_total the
+        # extras wrap around (duplicate slots); typical config aligns the two.
         # If branch_index is explicit (callers pre-assign), we don't bump the
         # counter — bumping with no consumer was redundant and risked drift
         # against claimed indices.
         explicit_index = int(kwargs.get("branch_index", -1))
         if explicit_index >= 0:
-            branch_index = explicit_index
+            global_slot = explicit_index
             counter_bumped = False
         else:
-            branch_index = await _claim_branch_index(cache_key, self.n_leaves)
+            global_slot = await _claim_branch_index(base_cache_key, n_total)
             counter_bumped = True
+
+        tree_idx = (global_slot // n_per_tree) % self.n_trees
+        leaf_idx_in_tree = global_slot % n_per_tree
+        branch_index = leaf_idx_in_tree
+        cache_key = _tree_cache_key(base_cache_key, tree_idx)
 
         metrics: dict[str, Any] = {}
         # Coordination: at most one sibling actually runs the pipeline; others await.
@@ -218,7 +259,7 @@ class BranchingAgentLoop(AgentLoopBase):
 
         if am_owner:
             # Wrap the pipeline in try/except so a single bad prompt cannot
-            # blast-radius into all 8 sibling rows + the entire batch chunk.
+            # blast-radius into all sibling rows + the entire batch chunk.
             # On failure the owner emits a fallback set of identical leaves and
             # surfaces the error via diagnostics rather than re-raising.
             try:
@@ -230,6 +271,7 @@ class BranchingAgentLoop(AgentLoopBase):
                         videos=videos,
                         multi_modal_data=multi_modal_data,
                         kwargs=kwargs,
+                        tree_idx=tree_idx,
                     )
                 future.set_result(leaves)
             except BaseException as e:  # noqa: BLE001
@@ -258,6 +300,8 @@ class BranchingAgentLoop(AgentLoopBase):
                         images=images,
                         videos=videos,
                         reason=f"{fallback_reason}:plain_rollout_ok",
+                        n_leaves=n_per_tree,
+                        tree_idx=tree_idx,
                     )
                     future.set_result(fallback_leaves)
                 except BaseException as plain_err:  # noqa: BLE001
@@ -283,12 +327,13 @@ class BranchingAgentLoop(AgentLoopBase):
             # Owner pipeline genuinely failed and even the fallback didn't fire
             # (or our row is non-owner and the owner's fallback also raised).
             # Roll back this sibling's counter claim so the next PPO step starts
-            # clean even if clear_branching_cache is somehow skipped.
+            # clean even if clear_branching_cache is somehow skipped. The
+            # counter lives on the BASE prompt key (shared across trees).
             if counter_bumped:
                 async with _BRANCHING_INDEX_COUNTERS_LOCK:
-                    if cache_key in _BRANCHING_INDEX_COUNTERS:
-                        _BRANCHING_INDEX_COUNTERS[cache_key] = max(
-                            0, _BRANCHING_INDEX_COUNTERS[cache_key] - 1
+                    if base_cache_key in _BRANCHING_INDEX_COUNTERS:
+                        _BRANCHING_INDEX_COUNTERS[base_cache_key] = max(
+                            0, _BRANCHING_INDEX_COUNTERS[base_cache_key] - 1
                         )
             raise
 
@@ -377,8 +422,15 @@ class BranchingAgentLoop(AgentLoopBase):
         videos: Optional[list[Any]],
         multi_modal_data: dict[str, Any],
         kwargs: dict[str, Any],
+        tree_idx: int = 0,
     ) -> list[AgentLoopOutput]:
         """Generate 2^n_splits shared-prefix leaves via teacher-guided branching.
+
+        ``tree_idx`` selects which independent tree this owner is running.
+        Different trees of the same prompt run with different ``traj_id`` and
+        a tree-specific seed offset injected into ``sampling_params``, so the
+        student initial rollouts diverge across trees even though they share
+        the same prompt prefix.
 
         Algorithm (see research/teacher_branching_rollout.md §4-§7):
 
@@ -406,13 +458,21 @@ class BranchingAgentLoop(AgentLoopBase):
         # `cfg.effective_max_branch_depth` raises ConfigAttributeError.
         _max_depth_override = cfg.get("max_branch_depth", None)
         max_depth = int(_max_depth_override) if _max_depth_override is not None else int(n_splits)
+        split_trigger = str(cfg.get("split_trigger", "entropy") or "entropy")
         traj_id = uuid4().hex
 
         priv_ctx_ids, priv_ctx_meta = await self._build_privileged_context(
             prompt_ids=prompt_ids, kwargs=kwargs, images=images, videos=videos,
         )
 
-        student_sp = self._student_sampling_params(sampling_params, max_tokens=None)
+        # Inject a tree-specific seed offset so independent trees produce
+        # divergent student initial rollouts even when run from the same
+        # base sampling_params + same prompt. Without this each owner relies
+        # solely on vLLM's internal randomness; with the explicit offset the
+        # divergence is deterministic and reproducible across runs.
+        student_sp = self._student_sampling_params(
+            sampling_params, max_tokens=None, tree_idx=int(tree_idx),
+        )
 
         # 1. Student initial chain.
         init_out = await self.server_manager.generate(
@@ -438,6 +498,8 @@ class BranchingAgentLoop(AgentLoopBase):
             "teacher_intersect_misses": 0,
             "split_attempts": 0,
             "splits_succeeded": 0,
+            "no_disagreement_count": 0,
+            "tree_idx": int(tree_idx),
         }
         root = await self._split_recursive(
             prefix_ids=list(prompt_ids),
@@ -455,9 +517,11 @@ class BranchingAgentLoop(AgentLoopBase):
             cfg=cfg,
             max_depth=max_depth,
             diag=diag,
+            split_trigger=split_trigger,
         )
 
-        # 3. Flatten + pad.
+        # 3. Flatten + pad. Each tree owns ``n_leaves`` leaves; pad up to that
+        # per-tree count when the tree was shallower than expected.
         leaves = self._flatten_tree_to_leaves(
             root=root, multi_modal_data=multi_modal_data, diag=diag, priv_ctx_meta=priv_ctx_meta,
         )
@@ -468,6 +532,7 @@ class BranchingAgentLoop(AgentLoopBase):
             multi_modal_data=multi_modal_data,
             images=images,
             videos=videos,
+            tree_idx=int(tree_idx),
         )
         return leaves
 
@@ -536,14 +601,33 @@ class BranchingAgentLoop(AgentLoopBase):
         sampling_params: dict[str, Any],
         *,
         max_tokens: Optional[int],
+        tree_idx: int = 0,
     ) -> dict[str, Any]:
         """Coerce sampling_params to the student-call shape: logprobs=K (int)
         and (optionally) override max_tokens. Caller passes max_tokens=None to
-        let vllm_async_server compute the default from response_length."""
+        let vllm_async_server compute the default from response_length.
+
+        When ``tree_idx > 0`` (multi-tree topology), we inject a deterministic
+        per-tree seed offset so independent trees of the same prompt produce
+        divergent student initial rollouts in a reproducible way. The offset
+        is added to any caller-provided ``seed`` (so an outer reproducibility
+        seed still composes); when no seed was provided we synthesise one from
+        the tree index alone.
+        """
         sp = dict(sampling_params)
         sp["logprobs"] = int(self.branching_cfg.top_k)
         if max_tokens is not None:
             sp["max_tokens"] = max_tokens
+        if int(tree_idx) > 0:
+            base_seed = sp.get("seed")
+            try:
+                base_seed_int = int(base_seed) if base_seed is not None else 0
+            except (TypeError, ValueError):
+                base_seed_int = 0
+            # Large prime stride keeps tree seeds well-separated even for
+            # n_trees up to a few hundred. Hash with prompt-independent
+            # constant so the stride is purely a function of tree_idx.
+            sp["seed"] = (base_seed_int + int(tree_idx) * 1_000_003) & 0x7FFFFFFF
         return sp
 
     def _teacher_sampling_params(self) -> dict[str, Any]:
@@ -590,6 +674,7 @@ class BranchingAgentLoop(AgentLoopBase):
         cfg,
         max_depth: int,
         diag: dict[str, int],
+        split_trigger: str = "entropy",
     ) -> BranchNode:
         n = len(segment_tokens)
         # Adaptive protect window: don't waste >25% of a short segment.
@@ -633,56 +718,115 @@ class BranchingAgentLoop(AgentLoopBase):
             return node
 
         diag["split_attempts"] += 1
-        p = positions[0]  # earliest by chronological sort
 
-        # Teacher branch-point query.
-        student_top = segment_top_logprobs[p] if p < len(segment_top_logprobs) else {}
-        teacher_top = await self._query_teacher_topk(
-            priv_ctx_ids=priv_ctx_ids,
-            prefix_ids=prefix_ids,
-            segment_tokens=segment_tokens,
-            branch_pos=p,
-            traj_id=traj_id,
-            images=images,
-            videos=videos,
-        )
-        if not student_top or teacher_top is None:
-            return node  # no signal to branch on
-
-        # Sort student candidates by descending logprob — teacher picks within
-        # the top ``teacher_pick_top_k`` (default = top_k, i.e. all candidates).
-        # Slicing here lets us request a deep student top-K for entropy
-        # estimation while still presenting only the high-probability core
-        # to the teacher for branch selection (avoids OOD branches).
-        student_topk_pairs = sorted(student_top.items(), key=lambda kv: -kv[1])
+        # ----- Candidate-position validation ------------------------------
+        # In ``entropy`` mode we only try the earliest spike (legacy behaviour).
+        # In ``entropy_disagreement`` mode we walk all spikes in chronological
+        # order and pick the FIRST position where the teacher's argmax within
+        # student's pick-k differs from the student's actually sampled token
+        # (i.e. teacher would have chosen differently). This filters out
+        # low-signal split points where teacher already agrees with student.
         _pick_k_override = cfg.get("teacher_pick_top_k", None)
         pick_k = int(_pick_k_override) if _pick_k_override is not None else int(cfg.top_k)
-        if pick_k > 0:
-            student_topk_pairs = student_topk_pairs[:pick_k]
+        require_distinct = bool(cfg.require_distinct_branches)
+        fallback_to_student = bool(cfg.fallback_to_student_topk)
 
-        # Coverage diagnostic: how many of student's pick_k candidates appear
-        # in teacher's top-K? If teacher_top_k is too small the intersection
-        # is thin and many student candidates are silently dropped from the
-        # argmax/argmin selection. We aggregate (intersect_total, pick_total)
-        # across all split decisions and surface coverage_ratio in SwanLab.
-        intersect_count = sum(1 for tok, _ in student_topk_pairs if tok in teacher_top)
-        diag["teacher_coverage_intersect_total"] = (
-            diag.get("teacher_coverage_intersect_total", 0) + intersect_count
-        )
-        diag["teacher_coverage_pick_total"] = (
-            diag.get("teacher_coverage_pick_total", 0) + len(student_topk_pairs)
-        )
+        if split_trigger == "entropy_disagreement":
+            candidate_positions = list(positions)
+        else:
+            candidate_positions = positions[:1]
 
-        choice = pick_teacher_branches(
-            student_topk_pairs, teacher_top,
-            fallback_to_student=bool(cfg.fallback_to_student_topk),
-        )
-        if choice == (None, None):
-            diag["teacher_intersect_misses"] += 1
+        chosen_p: Optional[int] = None
+        chosen_pairs: list[tuple[int, float]] = []
+        chosen_teacher_top: Optional[dict[int, float]] = None
+        chosen_pos_tok: Optional[int] = None
+        chosen_neg_tok: Optional[int] = None
+
+        for cand_p in candidate_positions:
+            cand_student_top = segment_top_logprobs[cand_p] if cand_p < len(segment_top_logprobs) else {}
+            if not cand_student_top:
+                continue
+            cand_teacher_top = await self._query_teacher_topk(
+                priv_ctx_ids=priv_ctx_ids,
+                prefix_ids=prefix_ids,
+                segment_tokens=segment_tokens,
+                branch_pos=cand_p,
+                traj_id=traj_id,
+                images=images,
+                videos=videos,
+            )
+            if cand_teacher_top is None:
+                continue
+
+            # Sort student candidates by descending logprob — teacher picks
+            # within the top ``teacher_pick_top_k`` (default = top_k, i.e. all
+            # candidates). Slicing here lets us request a deep student top-K
+            # for entropy estimation while still presenting only the high-
+            # probability core to the teacher for branch selection (avoids
+            # OOD branches).
+            student_topk_pairs = sorted(cand_student_top.items(), key=lambda kv: -kv[1])
+            if pick_k > 0:
+                student_topk_pairs = student_topk_pairs[:pick_k]
+
+            # Coverage diagnostic: how many of student's pick_k candidates
+            # appear in teacher's top-K? If teacher_top_k is too small the
+            # intersection is thin and many student candidates are silently
+            # dropped from the argmax/argmin selection. Aggregate across all
+            # split decisions so coverage_ratio surfaces in SwanLab.
+            intersect_count = sum(1 for tok, _ in student_topk_pairs if tok in cand_teacher_top)
+            diag["teacher_coverage_intersect_total"] = (
+                diag.get("teacher_coverage_intersect_total", 0) + intersect_count
+            )
+            diag["teacher_coverage_pick_total"] = (
+                diag.get("teacher_coverage_pick_total", 0) + len(student_topk_pairs)
+            )
+
+            # Disagreement check: skip positions where teacher's argmax (within
+            # student top-K) equals student's actually sampled token. No
+            # disagreement ⇒ splitting here would just duplicate effort.
+            if split_trigger == "entropy_disagreement":
+                scored = [
+                    (tok, cand_teacher_top[tok])
+                    for tok, _ in student_topk_pairs
+                    if tok in cand_teacher_top
+                ]
+                if not scored:
+                    # No teacher coverage of student's top-K; can't validate
+                    # disagreement reliably — skip this position.
+                    continue
+                teacher_argmax_token = max(scored, key=lambda kv: kv[1])[0]
+                if cand_p < len(segment_tokens):
+                    student_actual_token = int(segment_tokens[cand_p])
+                    if int(teacher_argmax_token) == student_actual_token:
+                        # Teacher agrees with student — no value in branching.
+                        continue
+
+            choice = pick_teacher_branches(
+                student_topk_pairs, cand_teacher_top,
+                fallback_to_student=fallback_to_student,
+            )
+            if choice == (None, None):
+                diag["teacher_intersect_misses"] += 1
+                continue
+            (cand_pos_tok, _), (cand_neg_tok, _) = choice
+            if require_distinct and cand_pos_tok == cand_neg_tok:
+                continue
+
+            chosen_p = cand_p
+            chosen_pairs = student_topk_pairs
+            chosen_teacher_top = cand_teacher_top
+            chosen_pos_tok = int(cand_pos_tok)
+            chosen_neg_tok = int(cand_neg_tok)
+            break
+
+        if chosen_p is None:
+            if split_trigger == "entropy_disagreement":
+                diag["no_disagreement_count"] = diag.get("no_disagreement_count", 0) + 1
             return node
-        (pos_tok, _), (neg_tok, _) = choice
-        if bool(cfg.require_distinct_branches) and pos_tok == neg_tok:
-            return node
+
+        p = chosen_p
+        pos_tok = chosen_pos_tok
+        neg_tok = chosen_neg_tok
         diag["splits_succeeded"] += 1
 
         # Pre-flight budget check: if any child would have zero room to fit even
@@ -767,6 +911,7 @@ class BranchingAgentLoop(AgentLoopBase):
                 cfg=cfg,
                 max_depth=max_depth,
                 diag=diag,
+                split_trigger=split_trigger,
             )
             # Mark the branch token position in the child's mask.
             if child_node.segment_branch_mask:
@@ -930,6 +1075,7 @@ class BranchingAgentLoop(AgentLoopBase):
         multi_modal_data: dict[str, Any],
         images: Optional[list[Any]] = None,
         videos: Optional[list[Any]] = None,
+        tree_idx: int = 0,
     ) -> list[AgentLoopOutput]:
         """Ensure exactly ``n`` leaves.
 
@@ -959,6 +1105,7 @@ class BranchingAgentLoop(AgentLoopBase):
             videos=videos,
             start_leaf_id=len(leaves),
             reason=f"tree_shallow_{len(leaves)}_of_{n}",
+            tree_idx=int(tree_idx),
         )
         leaves.extend(fill_leaves)
         return leaves[:n]
@@ -974,17 +1121,27 @@ class BranchingAgentLoop(AgentLoopBase):
         videos: Optional[list[Any]],
         start_leaf_id: int,
         reason: str,
+        tree_idx: int = 0,
     ) -> list[AgentLoopOutput]:
         """Generate ``count`` independent student rollouts to fill tree gaps.
 
         Unlike _fallback_n_independent (which always produces n_leaves), this
         generates exactly ``count`` rollouts. Each is a plain student generation
         tagged as is_branching_fallback=1 so dp_actor uses mode='all' for these
-        rows (their branch_token_mask is all-zeros).
+        rows (their branch_token_mask is all-zeros). When ``tree_idx > 0`` we
+        offset the seed so different trees of the same prompt fill with
+        divergent rollouts.
         """
         sp = dict(sampling_params)
         if sp.get("logprobs") is False or sp.get("logprobs") is None:
             sp["logprobs"] = 0
+        if int(tree_idx) > 0:
+            base_seed = sp.get("seed")
+            try:
+                base_seed_int = int(base_seed) if base_seed is not None else 0
+            except (TypeError, ValueError):
+                base_seed_int = 0
+            sp["seed"] = (base_seed_int + int(tree_idx) * 1_000_003) & 0x7FFFFFFF
 
         async def _one_call(_idx: int):
             return await self.server_manager.generate(
@@ -1073,10 +1230,17 @@ class BranchingAgentLoop(AgentLoopBase):
         images: Optional[list[Any]],
         videos: Optional[list[Any]],
         reason: str,
+        n_leaves: Optional[int] = None,
+        tree_idx: int = 0,
     ) -> list[AgentLoopOutput]:
         """Fire ``n_leaves`` INDEPENDENT student rollouts in PARALLEL and wrap
         each as a leaf. Used when the branching pipeline raises but a plain
         student rollout still works.
+
+        ``n_leaves`` defaults to the per-tree leaf count (``self.n_leaves``);
+        the run() owner path always passes the explicit per-tree count so the
+        fallback's leaf shape stays consistent with the per-tree owner /
+        sibling-row contract regardless of how many trees the prompt uses.
 
         Three properties matter:
           (a) Different vLLM request_ids → different rollouts → GRPO group
@@ -1094,6 +1258,15 @@ class BranchingAgentLoop(AgentLoopBase):
         sp = dict(sampling_params)
         if sp.get("logprobs") is False or sp.get("logprobs") is None:
             sp["logprobs"] = 0
+        if int(tree_idx) > 0:
+            base_seed = sp.get("seed")
+            try:
+                base_seed_int = int(base_seed) if base_seed is not None else 0
+            except (TypeError, ValueError):
+                base_seed_int = 0
+            sp["seed"] = (base_seed_int + int(tree_idx) * 1_000_003) & 0x7FFFFFFF
+
+        target_n = int(n_leaves) if n_leaves is not None else int(self.n_leaves)
 
         # Parallel fan-out, one call per leaf, each with its own request_id.
         # AsyncLLMServerManager's sticky LRU keys on request_id, so distinct
@@ -1107,7 +1280,7 @@ class BranchingAgentLoop(AgentLoopBase):
                 video_data=videos,
             )
 
-        outs = await asyncio.gather(*(_one_call(i) for i in range(self.n_leaves)))
+        outs = await asyncio.gather(*(_one_call(i) for i in range(target_n)))
 
         leaves: list[AgentLoopOutput] = []
         for idx, out in enumerate(outs):

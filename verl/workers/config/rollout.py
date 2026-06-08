@@ -122,6 +122,23 @@ class BranchingConfig(BaseConfig):
         max_branch_depth: Optional cap on tree depth (defaults to n_splits).
             Useful for ablations that want a deeper detector budget than the
             actual leaf count.
+        n_trees: Number of INDEPENDENT branching trees per prompt. The agent
+            loop produces ``n_trees * 2**n_splits`` leaves total; sibling
+            rows are routed to (tree_idx, leaf_idx) pairs so different trees
+            run independent student rollouts (different traj_id / seed) but
+            share the same prompt. Default 1 (single tree, backward compat).
+            With rollout.n=8, n_trees=4 + n_splits=1 yields 4 independent
+            pairs (2 leaves per tree). Validated against rollout.n equality.
+        split_trigger: How to choose the split position from the candidate
+            list returned by entropy detection.
+            - ``"entropy"`` (default): take the earliest entropy spike that
+              σ-relaxation flagged. Original behaviour.
+            - ``"entropy_disagreement"``: walk the spike candidates in order
+              and only split at the first position where the teacher's
+              argmax within student top-K differs from the student's actually
+              sampled token. Skips positions where teacher already agrees
+              with student, avoiding low-signal splits. Requires
+              ``teacher_guided_rollout`` (always True under this loop).
     """
 
     enabled: bool = False
@@ -180,6 +197,8 @@ class BranchingConfig(BaseConfig):
     fallback_to_student_topk: bool = True
     require_distinct_branches: bool = True
     max_branch_depth: Optional[int] = None
+    n_trees: int = 1
+    split_trigger: str = "entropy"
 
     def __post_init__(self):
         if self.enabled:
@@ -199,6 +218,20 @@ class BranchingConfig(BaseConfig):
                 raise ValueError(
                     f"branching.teacher_context_mode must be one of {valid_modes}, "
                     f"got {self.teacher_context_mode!r}"
+                )
+            if self.n_trees < 1:
+                raise ValueError(f"branching.n_trees must be >= 1, got {self.n_trees}")
+            valid_triggers = {"entropy", "entropy_disagreement"}
+            if self.split_trigger not in valid_triggers:
+                raise ValueError(
+                    f"branching.split_trigger must be one of {valid_triggers}, "
+                    f"got {self.split_trigger!r}"
+                )
+            if self.split_trigger == "entropy_disagreement" and not self.teacher_guided_rollout:
+                raise ValueError(
+                    "branching.split_trigger='entropy_disagreement' requires "
+                    "branching.teacher_guided_rollout=True (teacher logprobs are needed "
+                    "to detect teacher_argmax vs student_actual disagreement)."
                 )
 
     # NOTE: ``@property`` accessors are NOT visible when the dataclass is read
