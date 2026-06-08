@@ -137,8 +137,9 @@ class BranchingConfig(BaseConfig):
               and only split at the first position where the teacher's
               argmax within student top-K differs from the student's actually
               sampled token. Skips positions where teacher already agrees
-              with student, avoiding low-signal splits. Requires
-              ``teacher_guided_rollout`` (always True under this loop).
+              with student, avoiding low-signal splits. Always satisfiable
+              under BranchingAgentLoop, which is teacher-guided by
+              construction.
     """
 
     enabled: bool = False
@@ -227,12 +228,10 @@ class BranchingConfig(BaseConfig):
                     f"branching.split_trigger must be one of {valid_triggers}, "
                     f"got {self.split_trigger!r}"
                 )
-            if self.split_trigger == "entropy_disagreement" and not self.teacher_guided_rollout:
-                raise ValueError(
-                    "branching.split_trigger='entropy_disagreement' requires "
-                    "branching.teacher_guided_rollout=True (teacher logprobs are needed "
-                    "to detect teacher_argmax vs student_actual disagreement)."
-                )
+            # Note: BranchingAgentLoop is teacher-guided by construction
+            # (teacher logprobs are always queried at split candidates), so
+            # ``entropy_disagreement`` is always satisfiable when
+            # ``enabled=True``. No extra flag needed here.
 
     # NOTE: ``@property`` accessors are NOT visible when the dataclass is read
     # back through OmegaConf as a DictConfig (which is what happens at runtime
