@@ -59,6 +59,10 @@ BRANCH_TOKEN_LOSS_MODE="${BRANCH_TOKEN_LOSS_MODE:-mask}"
 ADV_STD_FLOOR="${ADV_STD_FLOOR:-0.05}"
 DEFAULT_AGENT_LOOP="${DEFAULT_AGENT_LOOP:-branching_agent}"
 TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-300}"
+# Two-stage branching (Stage 1 normal + Stage 2 branching)
+TWO_STAGE="${TWO_STAGE:-False}"
+STAGE1_N="${STAGE1_N:-4}"
+TWO_STAGE_TEACHER_MODE="${TWO_STAGE_TEACHER_MODE:-ref_or_marker}"
 
 # 数据集路径
 train_data_path="${OSS_ROOT}/datasets/${DATASET}/train.parquet"
@@ -125,6 +129,9 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.branching.entropy_sigma_floor=${ENTROPY_SIGMA_FLOOR} \
     actor_rollout_ref.rollout.branching.entropy_sigma_step=${ENTROPY_SIGMA_STEP} \
     actor_rollout_ref.rollout.branching.teacher_context_mode=${TEACHER_CONTEXT_MODE} \
+    actor_rollout_ref.rollout.branching.two_stage=${TWO_STAGE} \
+    actor_rollout_ref.rollout.branching.stage1_n=${STAGE1_N} \
+    actor_rollout_ref.rollout.branching.two_stage_teacher_mode=${TWO_STAGE_TEACHER_MODE} \
     algorithm.rollout_correction.rollout_is=token \
     algorithm.adv_std_floor=${ADV_STD_FLOOR} \
     trainer.total_epochs=30 \

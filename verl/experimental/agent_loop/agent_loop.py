@@ -540,6 +540,17 @@ class AgentLoopWorker:
             # showing the teacher the ground-truth answer at evaluation, where
             # deploy has neither teacher nor GT).
             kwargs.setdefault("validate", bool(trajectory.get("validate", False)))
+            # Two-stage branching: inject a scoring callback so the owner can
+            # evaluate Stage 1 responses to determine success before branching.
+            branching_cfg = self.config.actor_rollout_ref.rollout.get("branching", None)
+            if (
+                branching_cfg
+                and branching_cfg.get("two_stage", False)
+                and branching_cfg.get("two_stage_teacher_mode", "ref_or_marker") == "ref_or_marker"
+                and self.use_reward_loop
+                and not kwargs.get("validate", False)
+            ):
+                kwargs.setdefault("score_fn", self._build_two_stage_score_fn(kwargs))
             agent_loop = hydra.utils.instantiate(
                 config=agent_loop_config,
                 trainer_config=DictConfigWrap(config=self.config),
@@ -551,6 +562,82 @@ class AgentLoopWorker:
             )
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
             return await self._agent_loop_postprocess(output, **kwargs)
+
+    def _build_two_stage_score_fn(self, kwargs: dict[str, Any]):
+        """Build an async scoring callback for two-stage branching.
+
+        The returned coroutine accepts (prompt_ids, response_ids, raw_prompt)
+        and returns a float reward score. It constructs the minimal DataProto
+        needed by reward_loop_worker.compute_score and calls it remotely.
+        """
+        config = self.config.actor_rollout_ref.rollout
+        prompt_length = config.prompt_length
+        response_length = config.response_length
+
+        async def _score_fn(
+            prompt_ids: list[int],
+            response_ids: list[int],
+            raw_prompt: list[dict],
+            **extra,
+        ) -> float:
+            # Pad prompt (left) and response (right) to fixed lengths
+            self.tokenizer.padding_side = "left"
+            prompt_padded = self.tokenizer.pad(
+                {"input_ids": prompt_ids},
+                padding="max_length",
+                max_length=prompt_length,
+                return_tensors="pt",
+                return_attention_mask=True,
+            )
+            if prompt_padded["input_ids"].dim() == 1:
+                prompt_padded["input_ids"] = prompt_padded["input_ids"].unsqueeze(0)
+                prompt_padded["attention_mask"] = prompt_padded["attention_mask"].unsqueeze(0)
+
+            self.tokenizer.padding_side = "right"
+            response_padded = self.tokenizer.pad(
+                {"input_ids": response_ids[:response_length]},
+                padding="max_length",
+                max_length=response_length,
+                return_tensors="pt",
+                return_attention_mask=True,
+            )
+            if response_padded["input_ids"].dim() == 1:
+                response_padded["input_ids"] = response_padded["input_ids"].unsqueeze(0)
+                response_padded["attention_mask"] = response_padded["attention_mask"].unsqueeze(0)
+
+            prompts = prompt_padded["input_ids"]
+            responses = response_padded["input_ids"]
+            attention_mask = torch.cat([
+                prompt_padded["attention_mask"], response_padded["attention_mask"]
+            ], dim=1)
+            input_ids = torch.cat([prompts, responses], dim=1)
+            position_ids = compute_position_id_with_mask(attention_mask)
+
+            batch = TensorDict(
+                {
+                    "prompts": prompts,
+                    "responses": responses,
+                    "attention_mask": attention_mask,
+                    "input_ids": input_ids,
+                    "position_ids": position_ids,
+                },
+                batch_size=1,
+            )
+            # Build minimal non_tensor_batch with required fields
+            non_tensor_batch = {
+                "raw_prompt": np.array([raw_prompt], dtype=object),
+                "__num_turns__": np.array([2]),
+            }
+            # Pass through relevant fields from the original kwargs
+            for key in ("uid", "reward_model", "index"):
+                if key in kwargs:
+                    non_tensor_batch[key] = np.array([kwargs[key]], dtype=object)
+
+            data = DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+            result = await self.reward_loop_worker.compute_score.remote(data)
+            return float(result.get("reward_score", 0.0) or 0.0)
+
+        return _score_fn
 
     async def _agent_loop_postprocess(self, output, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""

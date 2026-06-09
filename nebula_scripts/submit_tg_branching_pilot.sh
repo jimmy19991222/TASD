@@ -29,6 +29,11 @@
 #                topology n_trees=4, n_splits=1, rollout.n=8 — 4 independent
 #                pairs of leaves per prompt.
 #   sdpo_tg    : Same N-trees topology but with the SDPO loss arm.
+#   sdpo_2s    : Two-stage branching (SDPO loss). Stage 1 produces STAGE1_N
+#                normal student rollouts → scored → successful used as teacher
+#                context for Stage 2 branching. Default topology:
+#                stage1_n=4, n_trees=2, n_splits=1, rollout.n=8.
+#                Submits two jobs: ref_or_marker and marker_only modes.
 #   all        : baseline + branching (does NOT include sdpo by default —
 #                that's a heavier sweep; pass --variant sdpo explicitly).
 #   compare    : 3 GRPO branching + 3 SDPO branching = 6 jobs, NO baselines.
@@ -93,7 +98,7 @@ TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-}"
 
 # ── 参数解析 ──────────────────────────────────────────────────────────
 DRY_RUN=false
-VARIANT="all"        # all | baseline | branching | sdpo | grpo_tg | sdpo_tg | compare
+VARIANT="all"        # all | baseline | branching | sdpo | grpo_tg | sdpo_tg | sdpo_2s | compare
 LOSS_MODE="all_three" # all | mask | only | suffix | all_three (only for branching)
 
 for ((i=1; i<=$#; i++)); do
@@ -129,7 +134,8 @@ N_TREES="${N_TREES:-1}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
 N_LEAVES_PER_TREE=$((1 << N_SPLITS))   # 2 ** N_SPLITS
 N_TOTAL_LEAVES=$((N_TREES * N_LEAVES_PER_TREE))
-if [ "$ROLLOUT_N" != "$N_TOTAL_LEAVES" ]; then
+# Two-stage variant computes its own ROLLOUT_N; skip validation for sdpo_2s.
+if [[ "$VARIANT" != "sdpo_2s" ]] && [ "$ROLLOUT_N" != "$N_TOTAL_LEAVES" ]; then
     echo "ERROR: ROLLOUT_N=$ROLLOUT_N must equal N_TREES * 2**N_SPLITS = $N_TOTAL_LEAVES (n_trees=$N_TREES, n_splits=$N_SPLITS)." 1>&2
     echo "       Set all three: e.g. 'N_TREES=4 N_SPLITS=1 ROLLOUT_N=8 bash $0 ...'" 1>&2
     exit 2
@@ -138,6 +144,13 @@ fi
 # SDPO-specific defaults (only used by the sdpo variant)
 SDPO_ALPHA="${SDPO_ALPHA:-0.5}"
 SDPO_DONT_REPROMPT_ON_SELF_SUCCESS="${SDPO_DONT_REPROMPT_ON_SELF_SUCCESS:-False}"
+
+# Two-stage branching defaults (only used by the sdpo_2s variant)
+TWO_STAGE_STAGE1_N="${STAGE1_N:-4}"
+TWO_STAGE_TEACHER_MODE="${TWO_STAGE_TEACHER_MODE:-ref_or_marker}"
+# Two-stage topology: n_trees=2, n_splits=1, stage1_n=4 → rollout.n = 4+4 = 8
+TWO_STAGE_N_TREES="${TWO_STAGE_N_TREES:-2}"
+TWO_STAGE_N_SPLITS="${TWO_STAGE_N_SPLITS:-1}"
 
 # Branching defaults — all env-overridable
 # Asymmetric K: student top_k bounds the candidate pool (kept tight to avoid
@@ -379,6 +392,51 @@ if [[ "$VARIANT" == "grpo_tg" || "$VARIANT" == "sdpo_tg" ]]; then
                 "$(_common_env "$JOB_NAME" "$DATASET" "$MODEL_NAME" "$LR" "32") --env=ALPHA=${SDPO_ALPHA} --env=DONT_REPROMPT_ON_SELF_SUCCESS=${SDPO_DONT_REPROMPT_ON_SELF_SUCCESS} --env=BRANCHING_ENABLED=True --env=N_SPLITS=${N_SPLITS} --env=N_TREES=${N_TREES} --env=SPLIT_TRIGGER=${NTG_SPLIT_TRIGGER} --env=TOP_K=${TOP_K} --env=TEACHER_TOP_K=${TEACHER_TOP_K} --env=ENTROPY_WINDOW=${ENTROPY_WINDOW} --env=ENTROPY_SIGMA_START=${ENTROPY_SIGMA_START} --env=ENTROPY_SIGMA_FLOOR=${ENTROPY_SIGMA_FLOOR} --env=ENTROPY_SIGMA_STEP=${ENTROPY_SIGMA_STEP} --env=TEACHER_CONTEXT_MODE=${TEACHER_CONTEXT_MODE} --env=BRANCH_TOKEN_LOSS_MODE=${BTM} --env=ADV_STD_FLOOR=${ADV_STD_FLOOR}"
         fi
     done; done; done; done; done
+fi
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Variant: sdpo_2s — Two-stage branching with SDPO loss.
+# Stage 1: STAGE1_N independent student rollouts (no teacher) → scored.
+# Stage 2: teacher-guided branching using successful Stage 1 as teacher context
+#           (ref_or_marker) or always static marker (marker_only).
+# Default topology: stage1_n=4, n_trees=2, n_splits=1, rollout.n=8.
+# Submits one job per TWO_STAGE_TEACHER_MODE value.
+# ──────────────────────────────────────────────────────────────────────────────
+if [[ "$VARIANT" == "sdpo_2s" ]]; then
+    # Compute ROLLOUT_N for two-stage: stage1_n + n_trees * 2^n_splits
+    _2S_LEAVES=$((TWO_STAGE_N_TREES * (1 << TWO_STAGE_N_SPLITS)))
+    _2S_ROLLOUT_N=$((TWO_STAGE_STAGE1_N + _2S_LEAVES))
+
+    # Two teacher modes to sweep
+    if [[ "$TWO_STAGE_TEACHER_MODE" == "both" ]]; then
+        _2S_MODES=("ref_or_marker" "marker_only")
+    else
+        _2S_MODES=("$TWO_STAGE_TEACHER_MODE")
+    fi
+
+    # Default BTM for two-stage is "suffix" (only train tokens after branch)
+    _2S_BTM="${LOSS_MODE}"
+    if [[ "$_2S_BTM" == "all_three" ]]; then
+        _2S_BTM="suffix"
+    fi
+
+    SCRIPT_PATH="nebula_scripts/sdpo/sdpo_branching_sciknoweval_parametric.sh"
+    for DATASET in "${DATASETS[@]}"; do
+    for MODEL_NAME in "${MODEL_NAMES[@]}"; do
+    for LR in "${LRS[@]}"; do
+    for TS_MODE in "${_2S_MODES[@]}"; do
+        DATASET_SHORT=$(echo "$DATASET" | tr '/' '-')
+        LR_TAG=$(echo "$LR" | tr '-' '_')
+        CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
+        if [[ "$TS_MODE" == "ref_or_marker" ]]; then
+            MODE_TAG="ref"
+        else
+            MODE_TAG="marker"
+        fi
+        JOB_NAME="TGB-2S-${MODE_TAG}-${_2S_BTM}-${DATASET_SHORT}-alpha${SDPO_ALPHA}-lr${LR_TAG}-${MODEL_NAME}-${CURRENT_TIME}"
+        _submit_job "$SCRIPT_PATH" "$JOB_NAME" \
+            "$(_common_env "$JOB_NAME" "$DATASET" "$MODEL_NAME" "$LR" "32") --env=ROLLOUT_N=${_2S_ROLLOUT_N} --env=ALPHA=${SDPO_ALPHA} --env=DONT_REPROMPT_ON_SELF_SUCCESS=${SDPO_DONT_REPROMPT_ON_SELF_SUCCESS} --env=BRANCHING_ENABLED=True --env=N_SPLITS=${TWO_STAGE_N_SPLITS} --env=N_TREES=${TWO_STAGE_N_TREES} --env=TOP_K=${TOP_K} --env=TEACHER_TOP_K=${TEACHER_TOP_K} --env=ENTROPY_WINDOW=${ENTROPY_WINDOW} --env=ENTROPY_SIGMA_START=${ENTROPY_SIGMA_START} --env=ENTROPY_SIGMA_FLOOR=${ENTROPY_SIGMA_FLOOR} --env=ENTROPY_SIGMA_STEP=${ENTROPY_SIGMA_STEP} --env=TEACHER_CONTEXT_MODE=${TEACHER_CONTEXT_MODE} --env=BRANCH_TOKEN_LOSS_MODE=${_2S_BTM} --env=ADV_STD_FLOOR=${ADV_STD_FLOOR} --env=TWO_STAGE=True --env=STAGE1_N=${TWO_STAGE_STAGE1_N} --env=TWO_STAGE_TEACHER_MODE=${TS_MODE}"
+    done; done; done; done
 fi
 
 echo ""

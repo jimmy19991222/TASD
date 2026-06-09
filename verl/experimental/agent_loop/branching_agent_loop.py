@@ -48,7 +48,7 @@ from verl.experimental.agent_loop.agent_loop import (
 )
 from verl.tools.utils.tool_registry import initialize_tools_from_config
 from verl.utils.profiler import simple_timer
-from verl.utils.teacher_prompt import build_marker_text, build_ref_gt_messages
+from verl.utils.teacher_prompt import build_marker_text, build_ref_context_messages, build_ref_gt_messages
 from verl.workers.rollout.vllm_rollout.branching_utils import (
     BranchNode,
     collect_leaves,
@@ -185,9 +185,22 @@ class BranchingAgentLoop(AgentLoopBase):
     @property
     def n_leaves_total(self) -> int:
         """Total leaves across all trees of one prompt (= n_trees * n_leaves).
+        When ``two_stage=True``, includes the Stage 1 normal rollouts:
+        stage1_n + n_trees * n_leaves.
         Equals ``rollout.n`` under the validated parametric config.
         """
-        return self.n_trees * self.n_leaves
+        branching_leaves = self.n_trees * self.n_leaves
+        if self._two_stage:
+            return self._stage1_n + branching_leaves
+        return branching_leaves
+
+    @property
+    def _two_stage(self) -> bool:
+        return bool(self.branching_cfg.get("two_stage", False))
+
+    @property
+    def _stage1_n(self) -> int:
+        return int(self.branching_cfg.get("stage1_n", 4) or 4)
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         # Validate-time fast path: skip the entire branching pipeline so val
@@ -216,15 +229,29 @@ class BranchingAgentLoop(AgentLoopBase):
         # priv_ctx + student_response_so_far without recomputing the boundary.
         self._root_prompt_len = len(prompt_ids)
 
+        gen_step = int(kwargs.get("generation_step", 0))
+        base_cache_key = _branching_cache_key(prompt_ids, gen_step)
+        n_total = self.n_leaves_total
+
+        # --- Two-stage mode: single owner per prompt (not per-tree) ---
+        if self._two_stage:
+            return await self._run_two_stage_coordination(
+                base_cache_key=base_cache_key,
+                n_total=n_total,
+                prompt_ids=prompt_ids,
+                sampling_params=sampling_params,
+                images=images,
+                videos=videos,
+                multi_modal_data=multi_modal_data,
+                kwargs=kwargs,
+            )
+
+        # --- Original per-tree mode ---
         # Cache key shared across the sibling rows of this prompt. We claim a
         # GLOBAL slot in [0, n_leaves_total) and decompose it into
         # (tree_idx, leaf_idx_in_tree); each tree has its OWN cache key /
         # owner / Future so trees run independent student rollouts.
-        gen_step = int(kwargs.get("generation_step", 0))
-        base_cache_key = _branching_cache_key(prompt_ids, gen_step)
-
         n_per_tree = self.n_leaves
-        n_total = self.n_leaves_total
 
         # Each sibling row claims a global slot. If rollout.n > n_total the
         # extras wrap around (duplicate slots); typical config aligns the two.
@@ -408,6 +435,387 @@ class BranchingAgentLoop(AgentLoopBase):
             num_turns=2,
             metrics=AgentLoopMetrics(**metrics),
         )
+
+    # ------------------------------------------------------------------
+    # Two-stage coordination: Stage 1 normal + Stage 2 branching.
+    # ------------------------------------------------------------------
+
+    async def _run_two_stage_coordination(
+        self,
+        *,
+        base_cache_key: str,
+        n_total: int,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        images: Optional[list[Any]],
+        videos: Optional[list[Any]],
+        multi_modal_data: dict[str, Any],
+        kwargs: dict[str, Any],
+    ) -> AgentLoopOutput:
+        """Two-stage coordination: a single owner per prompt runs the entire
+        two-stage pipeline (Stage 1 normal rollouts + Stage 2 branching).
+        All sibling rows await the single cache entry and pick their slot.
+        """
+        # In two-stage mode we use the BASE cache key (not per-tree) since
+        # one owner produces ALL outputs for the prompt.
+        cache_key = f"{base_cache_key}#2stage"
+
+        explicit_index = int(kwargs.get("branch_index", -1))
+        if explicit_index >= 0:
+            global_slot = explicit_index
+            counter_bumped = False
+        else:
+            global_slot = await _claim_branch_index(base_cache_key, n_total)
+            counter_bumped = True
+
+        metrics: dict[str, Any] = {}
+        async with _BRANCHING_CACHE_LOCK:
+            future = _BRANCHING_CACHE.get(cache_key)
+            if future is None:
+                future = asyncio.get_running_loop().create_future()
+                _BRANCHING_CACHE[cache_key] = future
+                am_owner = True
+            else:
+                am_owner = False
+
+        if am_owner:
+            try:
+                with simple_timer("two_stage_pipeline", metrics):
+                    all_outputs = await self._run_two_stage_pipeline(
+                        prompt_ids=prompt_ids,
+                        sampling_params=sampling_params,
+                        images=images,
+                        videos=videos,
+                        multi_modal_data=multi_modal_data,
+                        kwargs=kwargs,
+                    )
+                future.set_result(all_outputs)
+            except BaseException as e:  # noqa: BLE001
+                logger.exception(
+                    "Two-stage pipeline failed (cache_key=%s); "
+                    "attempting plain student rollout fallback.", cache_key,
+                )
+                try:
+                    plain_sp = dict(sampling_params)
+                    plain_sp.pop("logprobs", None)
+                    plain_sp["logprobs"] = False
+                    fallback_leaves = await self._fallback_n_independent(
+                        prompt_ids=prompt_ids,
+                        sampling_params=plain_sp,
+                        multi_modal_data=multi_modal_data,
+                        images=images,
+                        videos=videos,
+                        reason=f"two_stage_exception:{type(e).__name__}",
+                        n_leaves=n_total,
+                    )
+                    future.set_result(fallback_leaves)
+                except BaseException as plain_err:  # noqa: BLE001
+                    logger.exception(
+                        "Fallback also failed for two-stage cache_key=%s.", cache_key,
+                    )
+                    future.set_exception(plain_err)
+                    raise
+
+        try:
+            all_outputs = await future
+        except BaseException:
+            if counter_bumped:
+                async with _BRANCHING_INDEX_COUNTERS_LOCK:
+                    if base_cache_key in _BRANCHING_INDEX_COUNTERS:
+                        _BRANCHING_INDEX_COUNTERS[base_cache_key] = max(
+                            0, _BRANCHING_INDEX_COUNTERS[base_cache_key] - 1
+                        )
+            raise
+
+        # Wrap-around for safety
+        slot = global_slot % len(all_outputs) if all_outputs else 0
+        if not (0 <= slot < len(all_outputs)):
+            raise RuntimeError(
+                f"Two-stage: slot={slot} out of range (have {len(all_outputs)} outputs)"
+            )
+        leaf = all_outputs[slot]
+        leaf.metrics = AgentLoopMetrics(**metrics) if am_owner else AgentLoopMetrics()
+        return leaf
+
+    async def _run_two_stage_pipeline(
+        self,
+        *,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        images: Optional[list[Any]],
+        videos: Optional[list[Any]],
+        multi_modal_data: dict[str, Any],
+        kwargs: dict[str, Any],
+    ) -> list[AgentLoopOutput]:
+        """Execute the full two-stage pipeline:
+        Stage 1: generate stage1_n independent student rollouts
+        Stage 2: build teacher context (ref or marker) → branching
+        Returns stage1_n + n_trees*n_leaves outputs.
+        """
+        cfg = self.branching_cfg
+        stage1_n = self._stage1_n
+        two_stage_teacher_mode = str(cfg.get("two_stage_teacher_mode", "ref_or_marker"))
+
+        # --- Stage 1: Normal student rollouts ---
+        stage1_outputs = await self._generate_stage1_rollouts(
+            prompt_ids=prompt_ids,
+            sampling_params=sampling_params,
+            images=images,
+            videos=videos,
+            multi_modal_data=multi_modal_data,
+        )
+
+        # --- Determine teacher context for Stage 2 ---
+        successful_response_text: Optional[str] = None
+        if two_stage_teacher_mode == "ref_or_marker":
+            score_fn = kwargs.get("score_fn")
+            if score_fn is not None:
+                threshold = float(cfg.get("success_reward_threshold", 1.0))
+                scores = await asyncio.gather(*[
+                    score_fn(
+                        prompt_ids=out.prompt_ids,
+                        response_ids=out.response_ids,
+                        raw_prompt=kwargs.get("raw_prompt", []),
+                    )
+                    for out in stage1_outputs
+                ])
+                # Pick the first successful response
+                for i, s in enumerate(scores):
+                    if s >= threshold:
+                        successful_response_text = self.tokenizer.decode(
+                            stage1_outputs[i].response_ids,
+                            skip_special_tokens=True,
+                        )
+                        break
+
+        # --- Build privileged context for branching ---
+        if successful_response_text:
+            priv_ctx_ids, priv_ctx_meta = await self._build_ref_privileged_context(
+                prompt_ids=prompt_ids,
+                successful_response_text=successful_response_text,
+                kwargs=kwargs,
+                images=images,
+                videos=videos,
+            )
+        else:
+            # Fallback to static marker (no ground_truth dependency)
+            priv_ctx_ids, priv_ctx_meta = await self._build_privileged_context(
+                prompt_ids=prompt_ids, kwargs=kwargs, images=images, videos=videos,
+            )
+            # Override mode to marker if the configured mode needs GT but we don't want GT
+            # The _build_privileged_context will use whatever teacher_context_mode is set;
+            # for two-stage marker_only, teacher_context_mode should be "marker" in config.
+
+        # --- Stage 2: Branching with the chosen teacher context ---
+        branched_outputs: list[AgentLoopOutput] = []
+        for tree_idx in range(self.n_trees):
+            tree_leaves = await self._run_branching_with_priv_ctx(
+                prompt_ids=prompt_ids,
+                sampling_params=sampling_params,
+                images=images,
+                videos=videos,
+                multi_modal_data=multi_modal_data,
+                kwargs=kwargs,
+                tree_idx=tree_idx,
+                priv_ctx_ids=priv_ctx_ids,
+                priv_ctx_meta=priv_ctx_meta,
+            )
+            branched_outputs.extend(tree_leaves)
+
+        # Combine: [stage1_outputs..., branched_outputs...]
+        all_outputs = stage1_outputs + branched_outputs
+        return all_outputs
+
+    async def _generate_stage1_rollouts(
+        self,
+        *,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        images: Optional[list[Any]],
+        videos: Optional[list[Any]],
+        multi_modal_data: dict[str, Any],
+    ) -> list[AgentLoopOutput]:
+        """Generate stage1_n independent student rollouts in parallel."""
+        stage1_n = self._stage1_n
+        sp = dict(sampling_params)
+        sp.pop("logprobs", None)
+        sp["logprobs"] = False  # Stage 1 doesn't need logprobs
+
+        async def _gen_one(idx: int):
+            return await self.server_manager.generate(
+                request_id=uuid4().hex,
+                prompt_ids=prompt_ids,
+                sampling_params=dict(sp),
+                image_data=images,
+                video_data=videos,
+            )
+
+        outs = await asyncio.gather(*(_gen_one(i) for i in range(stage1_n)))
+
+        leaves: list[AgentLoopOutput] = []
+        for idx, out in enumerate(outs):
+            tokens = list(out.token_ids)[: self.response_length]
+            if not tokens:
+                eos_id = (
+                    getattr(self.tokenizer, "eos_token_id", None)
+                    or getattr(self.tokenizer, "pad_token_id", None)
+                    or 0
+                )
+                tokens = [int(eos_id)]
+            lps = list((out.log_probs or [0.0] * len(tokens))[: self.response_length])
+            if len(lps) < len(tokens):
+                lps = lps + [0.0] * (len(tokens) - len(lps))
+            leaves.append(AgentLoopOutput(
+                prompt_ids=list(prompt_ids),
+                response_ids=tokens,
+                response_mask=[1] * len(tokens),
+                response_logprobs=lps,
+                multi_modal_data=multi_modal_data,
+                num_turns=2,
+                metrics=AgentLoopMetrics(),
+                extra_fields={
+                    "branch_token_mask": [0] * len(tokens),
+                    "is_branching_fallback": 0,
+                    "is_two_stage_stage1": 1,
+                    "leaf_id": idx,
+                    "leaf_depth": 0,
+                    "branching_diag": {},
+                    "priv_ctx_meta": {},
+                    "branching_fallback": "",
+                },
+            ))
+        return leaves
+
+    async def _build_ref_privileged_context(
+        self,
+        *,
+        prompt_ids: list[int],
+        successful_response_text: str,
+        kwargs: dict[str, Any],
+        images: Optional[list[Any]],
+        videos: Optional[list[Any]],
+    ) -> tuple[list[int], dict[str, Any]]:
+        """Build privileged context using a successful Stage 1 response,
+        formatted identically to SDPO training-side ref mode (reprompt with
+        solution section).
+        """
+        cfg = self.branching_cfg
+        raw_prompt = list(kwargs.get("raw_prompt", []))
+
+        messages = build_ref_context_messages(
+            raw_prompt=raw_prompt,
+            successful_response_text=successful_response_text,
+            self_distillation_cfg=cfg,
+        )
+        if not messages:
+            # Fallback to plain prompt
+            return list(prompt_ids), {
+                "mode": "ref", "ref_available": False, "marker_len": 0,
+            }
+
+        ref_ids = await self.apply_chat_template(
+            messages, tools=self.tool_schemas, images=images, videos=videos,
+        )
+        cap = int(cfg.get("max_reprompt_len", 10240) or 10240)
+        if len(ref_ids) > cap:
+            ref_ids = ref_ids[-cap:]
+        return list(ref_ids), {
+            "mode": "ref",
+            "ref_available": True,
+            "ref_ids_len": len(ref_ids),
+            "marker_len": 0,
+        }
+
+    async def _run_branching_with_priv_ctx(
+        self,
+        *,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        images: Optional[list[Any]],
+        videos: Optional[list[Any]],
+        multi_modal_data: dict[str, Any],
+        kwargs: dict[str, Any],
+        tree_idx: int,
+        priv_ctx_ids: list[int],
+        priv_ctx_meta: dict[str, Any],
+    ) -> list[AgentLoopOutput]:
+        """Run the branching pipeline for a single tree using pre-built
+        privileged context (from two-stage). This is a slimmed version of
+        _run_branching_pipeline that skips _build_privileged_context.
+        """
+        cfg = self.branching_cfg
+        K = int(cfg.top_k)
+        n_splits = int(cfg.n_splits)
+        _max_depth_override = cfg.get("max_branch_depth", None)
+        max_depth = int(_max_depth_override) if _max_depth_override is not None else int(n_splits)
+        split_trigger = str(cfg.get("split_trigger", "entropy") or "entropy")
+        traj_id = uuid4().hex
+
+        student_sp = self._student_sampling_params(
+            sampling_params, max_tokens=None, tree_idx=int(tree_idx),
+        )
+
+        # Student initial chain
+        init_out = await self.server_manager.generate(
+            request_id=traj_id,
+            prompt_ids=prompt_ids,
+            sampling_params=student_sp,
+            image_data=images,
+            video_data=videos,
+        )
+        init_tokens = list(init_out.token_ids)
+        init_top = list(init_out.top_logprobs or [])
+        if not init_top:
+            return self._fallback_n_copies(
+                prompt_ids=prompt_ids, response_tokens=init_tokens,
+                response_logprobs=init_out.log_probs, multi_modal_data=multi_modal_data,
+                reason="two_stage_no_top_logprobs",
+            )
+        init_entropies = [entropy_from_topk_logprobs(d) for d in init_top]
+
+        # Recursive split
+        diag = {
+            "sigma_relaxations": 0,
+            "teacher_intersect_misses": 0,
+            "split_attempts": 0,
+            "splits_succeeded": 0,
+            "no_disagreement_count": 0,
+            "tree_idx": int(tree_idx),
+            "two_stage": 1,
+        }
+        root = await self._split_recursive(
+            prefix_ids=list(prompt_ids),
+            segment_tokens=init_tokens,
+            segment_entropies=init_entropies,
+            segment_top_logprobs=init_top,
+            segment_realized_logprobs=list(init_out.log_probs or [0.0] * len(init_tokens)),
+            depth=0,
+            target=n_splits,
+            traj_id=traj_id,
+            priv_ctx_ids=priv_ctx_ids,
+            student_sp=student_sp,
+            images=images,
+            videos=videos,
+            cfg=cfg,
+            max_depth=max_depth,
+            diag=diag,
+            split_trigger=split_trigger,
+        )
+
+        # Flatten + pad
+        leaves = self._flatten_tree_to_leaves(
+            root=root, multi_modal_data=multi_modal_data, diag=diag, priv_ctx_meta=priv_ctx_meta,
+        )
+        leaves = await self._pad_leaves_to_n(
+            leaves, self.n_leaves,
+            prompt_ids=prompt_ids,
+            sampling_params=sampling_params,
+            multi_modal_data=multi_modal_data,
+            images=images,
+            videos=videos,
+            tree_idx=int(tree_idx),
+        )
+        return leaves
 
     # ------------------------------------------------------------------
     # Pipeline entry — owner row only (siblings await the cache).

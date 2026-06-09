@@ -140,6 +140,19 @@ class BranchingConfig(BaseConfig):
               with student, avoiding low-signal splits. Always satisfiable
               under BranchingAgentLoop, which is teacher-guided by
               construction.
+        two_stage: When True, each prompt group is split into Stage 1
+            (plain student rollouts, ``stage1_n`` count) and Stage 2
+            (teacher-guided branching, ``n_trees * 2^n_splits`` count).
+            Total responses per group = stage1_n + n_trees * 2^n_splits.
+        stage1_n: Number of independent student rollouts in Stage 1.
+        two_stage_teacher_mode: How to build teacher context for Stage 2.
+            - ``"ref_or_marker"``: use a successful Stage 1 rollout as
+              teacher context (SDPO ref-style reprompt); fall back to
+              static marker if all Stage 1 responses fail.
+            - ``"marker_only"``: always use the static verified-correct
+              marker regardless of Stage 1 outcomes.
+        success_reward_threshold: Minimum reward score for a Stage 1
+            rollout to be considered "successful" for ref teacher context.
     """
 
     enabled: bool = False
@@ -200,6 +213,16 @@ class BranchingConfig(BaseConfig):
     max_branch_depth: Optional[int] = None
     n_trees: int = 1
     split_trigger: str = "entropy"
+    # --- Two-stage branching ---
+    # When enabled, rollout is split into Stage 1 (normal student rollout)
+    # and Stage 2 (teacher-guided branching). Stage 1 produces ``stage1_n``
+    # independent student responses which are scored; if any succeed their
+    # text becomes the teacher context for Stage 2 branching (ref mode),
+    # otherwise we fall back to the static marker.
+    two_stage: bool = False
+    stage1_n: int = 4
+    two_stage_teacher_mode: str = "ref_or_marker"  # "ref_or_marker" | "marker_only"
+    success_reward_threshold: float = 1.0
 
     def __post_init__(self):
         if self.enabled:
@@ -228,6 +251,16 @@ class BranchingConfig(BaseConfig):
                     f"branching.split_trigger must be one of {valid_triggers}, "
                     f"got {self.split_trigger!r}"
                 )
+            # Two-stage validation
+            if self.two_stage:
+                if self.stage1_n < 1:
+                    raise ValueError(f"branching.stage1_n must be >= 1, got {self.stage1_n}")
+                valid_ts_modes = {"ref_or_marker", "marker_only"}
+                if self.two_stage_teacher_mode not in valid_ts_modes:
+                    raise ValueError(
+                        f"branching.two_stage_teacher_mode must be one of {valid_ts_modes}, "
+                        f"got {self.two_stage_teacher_mode!r}"
+                    )
             # Note: BranchingAgentLoop is teacher-guided by construction
             # (teacher logprobs are always queried at split candidates), so
             # ``entropy_disagreement`` is always satisfiable when

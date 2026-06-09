@@ -44,6 +44,7 @@ __all__ = [
     "resolve_right_marker",
     "build_marker_text",
     "build_ref_gt_messages",
+    "build_ref_context_messages",
 ]
 
 
@@ -147,6 +148,68 @@ def build_ref_gt_messages(
     )
 
     solution_section = solution_template.format(successful_previous_attempt=ground_truth)
+    feedback_section = feedback_template.format(feedback_raw=feedback) if feedback else ""
+    reprompt_text = reprompt_template.format(
+        prompt=prompt_text,
+        solution=solution_section,
+        feedback=feedback_section,
+    )
+    return system_messages + [{"role": "user", "content": reprompt_text}]
+
+
+def build_ref_context_messages(
+    *,
+    raw_prompt: Sequence[dict],
+    successful_response_text: str,
+    self_distillation_cfg,
+    feedback: str = "",
+) -> list[dict]:
+    """Rebuild a chat-template message list with a *successful peer rollout*
+    slotted in as the SDPO ``solution`` section of the reprompt.
+
+    This mirrors :func:`build_ref_gt_messages` but uses an actual successful
+    rollout response text instead of ground_truth. The resulting teacher
+    prompt is format-identical to what the training-side
+    ``_build_self_distillation_batch_ref`` produces when solution_source is
+    ``"peer_rollout"``, ensuring the teacher distribution seen at branching
+    time (rollout) aligns with the teacher distribution used for the SDPO
+    loss (training).
+
+    Args:
+        raw_prompt: original chat-template messages (system + user).
+        successful_response_text: decoded text of a successful Stage 1
+            rollout response.
+        self_distillation_cfg: reads ``reprompt_template``,
+            ``solution_template``.
+        feedback: optional environment feedback string. Defaults to empty.
+    """
+    if not raw_prompt:
+        return []
+    if not successful_response_text:
+        return list(raw_prompt)
+
+    system_messages = list(raw_prompt[:-1])
+    last_user = raw_prompt[-1]
+    if not isinstance(last_user, dict) or "content" not in last_user:
+        return list(raw_prompt)
+    prompt_text = last_user["content"]
+
+    solution_template = _safe_get(
+        self_distillation_cfg, "solution_template",
+        "\nCorrect solution:\n\n{successful_previous_attempt}\n\n",
+    )
+    feedback_template = _safe_get(
+        self_distillation_cfg, "feedback_template",
+        "\nThe following is feedback from your unsuccessful earlier attempt:\n\n{feedback_raw}\n\n",
+    )
+    reprompt_template = _safe_get(
+        self_distillation_cfg, "reprompt_template",
+        "{prompt}{solution}{feedback}\n\nCorrectly solve the original question.\n",
+    )
+
+    solution_section = solution_template.format(
+        successful_previous_attempt=successful_response_text
+    )
     feedback_section = feedback_template.format(feedback_raw=feedback) if feedback else ""
     reprompt_text = reprompt_template.format(
         prompt=prompt_text,
