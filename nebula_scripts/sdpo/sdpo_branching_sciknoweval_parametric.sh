@@ -58,6 +58,7 @@ TEACHER_CONTEXT_MODE="${TEACHER_CONTEXT_MODE:-gt_marker}"
 BRANCH_TOKEN_LOSS_MODE="${BRANCH_TOKEN_LOSS_MODE:-mask}"
 ADV_STD_FLOOR="${ADV_STD_FLOOR:-0.05}"
 DEFAULT_AGENT_LOOP="${DEFAULT_AGENT_LOOP:-branching_agent}"
+TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-300}"
 
 # 数据集路径
 train_data_path="${OSS_ROOT}/datasets/${DATASET}/train.parquet"
@@ -127,7 +128,7 @@ python -m verl.trainer.main_ppo \
     algorithm.rollout_correction.rollout_is=token \
     algorithm.adv_std_floor=${ADV_STD_FLOOR} \
     trainer.total_epochs=30 \
-    trainer.total_training_steps=300 \
+    trainer.total_training_steps=${TOTAL_TRAINING_STEPS} \
     trainer.save_freq=${SAVE_FREQ} \
     trainer.max_actor_ckpt_to_keep=null \
     trainer.test_freq=${TEST_FREQ} \

@@ -18,6 +18,8 @@ check_env ROLLOUT_N
 check_env MODEL_NAME
 
 SEED="${SEED:-42}"
+TEACHER_CONTEXT_MODE="${TEACHER_CONTEXT_MODE:-}"
+TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-250}"
 
 # Checkpoint / validation cadence (env-overridable)
 TEST_FREQ="${TEST_FREQ:-10}"
@@ -67,6 +69,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.self_distillation.alpha=${ALPHA} \
     actor_rollout_ref.actor.self_distillation.dont_reprompt_on_self_success=${DONT_REPROMPT_ON_SELF_SUCCESS} \
     actor_rollout_ref.actor.self_distillation.include_environment_feedback=False \
+    ${TEACHER_CONTEXT_MODE:+actor_rollout_ref.actor.self_distillation.teacher_context_mode=${TEACHER_CONTEXT_MODE}} \
     actor_rollout_ref.actor.checkpoint.save_contents=${SAVE_CONTENTS_HYDRA} \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.rollout.n=${ROLLOUT_N} \
@@ -75,7 +78,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
     algorithm.rollout_correction.rollout_is=token \
     trainer.total_epochs=30 \
-    trainer.total_training_steps=250 \
+    trainer.total_training_steps=${TOTAL_TRAINING_STEPS} \
     trainer.save_freq=${SAVE_FREQ} \
     trainer.max_actor_ckpt_to_keep=null \
     trainer.test_freq=${TEST_FREQ} \

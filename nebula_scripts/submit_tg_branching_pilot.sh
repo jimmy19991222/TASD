@@ -89,6 +89,7 @@ TEST_FREQ="${TEST_FREQ:-10}"
 SAVE_FREQ="${SAVE_FREQ:-10}"
 VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-True}"
 SAVE_HF_ONLY="${SAVE_HF_ONLY:-True}"
+TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-}"
 
 # ── 参数解析 ──────────────────────────────────────────────────────────
 DRY_RUN=false
@@ -212,7 +213,12 @@ _common_env() {
     local MODEL_NAME="$3"
     local LR="$4"
     local MINI_BATCH_SIZE="$5"
-    echo "--env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=DATASET=${DATASET} --env=MODEL_NAME=${MODEL_NAME} --env=LR=${LR} --env=MINI_BATCH_SIZE=${MINI_BATCH_SIZE} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=SEED=${SEED} --env=TEST_FREQ=${TEST_FREQ} --env=SAVE_FREQ=${SAVE_FREQ} --env=VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN} --env=SAVE_HF_ONLY=${SAVE_HF_ONLY} --env=GIT_BRANCH=${GIT_BRANCH} --env=GIT_COMMIT=${GIT_COMMIT}"
+    local envs="--env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=DATASET=${DATASET} --env=MODEL_NAME=${MODEL_NAME} --env=LR=${LR} --env=MINI_BATCH_SIZE=${MINI_BATCH_SIZE} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=SEED=${SEED} --env=TEST_FREQ=${TEST_FREQ} --env=SAVE_FREQ=${SAVE_FREQ} --env=VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN} --env=SAVE_HF_ONLY=${SAVE_HF_ONLY} --env=GIT_BRANCH=${GIT_BRANCH} --env=GIT_COMMIT=${GIT_COMMIT}"
+    # Conditionally append TOTAL_TRAINING_STEPS only if set (non-empty).
+    if [ -n "${TOTAL_TRAINING_STEPS}" ]; then
+        envs="${envs} --env=TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS}"
+    fi
+    echo "$envs"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
