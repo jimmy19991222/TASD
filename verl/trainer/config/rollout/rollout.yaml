@@ -291,6 +291,12 @@ branching:
   # "entropy_disagreement" = only split where teacher argmax != student actual token.
   split_trigger: entropy
 
+  # Two-stage branching: stage-1 does independent rollouts, stage-2 does branching.
+  two_stage: False
+  stage1_n: 4
+  two_stage_teacher_mode: ref_or_marker
+  success_reward_threshold: 1.0
+
 # support logging rollout prob for debugging purpose
 # "Truncated importance sampling" requires rollout log probs, set to True when turning on Truncated importance sampling
 calculate_log_probs: False
