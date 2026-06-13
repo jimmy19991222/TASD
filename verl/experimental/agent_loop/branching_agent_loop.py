@@ -635,11 +635,25 @@ class BranchingAgentLoop(AgentLoopBase):
         videos: Optional[list[Any]],
         multi_modal_data: dict[str, Any],
     ) -> list[AgentLoopOutput]:
-        """Generate stage1_n independent student rollouts in parallel."""
+        """Generate stage1_n independent student rollouts in parallel.
+
+        Each rollout is generated with ``logprobs=top_k`` so we can detect
+        the entropy spike position (same detection as Stage 2 branching).
+        The detected branch point is marked in ``branch_token_mask`` so the
+        existing suffix loss mode zeros out the prefix and only trains
+        tokens after the branch point — keeping Stage 1 consistent with
+        Stage 2 branching.
+        """
+        cfg = self.branching_cfg
+        K = int(cfg.top_k)
         stage1_n = self._stage1_n
-        sp = dict(sampling_params)
-        sp.pop("logprobs", None)
-        sp["logprobs"] = False  # Stage 1 doesn't need logprobs
+
+        # Use student sampling params with logprobs=top_k (same as Stage 2).
+        sp = self._student_sampling_params(sampling_params, max_tokens=None)
+
+        # Entropy detection params for branch-point identification.
+        pw_override = cfg.get("entropy_protect_window", None)
+        pw = int(pw_override) if pw_override is not None else int(cfg.entropy_window)
 
         async def _gen_one(idx: int):
             return await self.server_manager.generate(
@@ -665,6 +679,26 @@ class BranchingAgentLoop(AgentLoopBase):
             lps = list((out.log_probs or [0.0] * len(tokens))[: self.response_length])
             if len(lps) < len(tokens):
                 lps = lps + [0.0] * (len(tokens) - len(lps))
+
+            # Detect entropy spike to find the branch point (same as Stage 2).
+            branch_mask = [0] * len(tokens)
+            top_logprobs = list(out.top_logprobs or [])[: self.response_length]
+            if top_logprobs and len(top_logprobs) > pw + 1:
+                entropies = [entropy_from_topk_logprobs(d) for d in top_logprobs]
+                positions, _, _ = find_decision_positions_with_sigma_relaxation(
+                    entropies,
+                    target_count=1,
+                    window_size=int(cfg.entropy_window),
+                    protect_window=pw,
+                    sigma_start=float(cfg.entropy_sigma_start),
+                    sigma_step=float(cfg.entropy_sigma_step),
+                    sigma_floor=float(cfg.entropy_sigma_floor),
+                )
+                if positions:
+                    branch_pos = positions[0]
+                    if branch_pos < len(branch_mask):
+                        branch_mask[branch_pos] = 1
+
             leaves.append(AgentLoopOutput(
                 prompt_ids=list(prompt_ids),
                 response_ids=tokens,
@@ -674,7 +708,7 @@ class BranchingAgentLoop(AgentLoopBase):
                 num_turns=2,
                 metrics=AgentLoopMetrics(),
                 extra_fields={
-                    "branch_token_mask": [0] * len(tokens),
+                    "branch_token_mask": branch_mask,
                     "is_branching_fallback": 0,
                     "is_two_stage_stage1": 1,
                     "leaf_id": idx,
