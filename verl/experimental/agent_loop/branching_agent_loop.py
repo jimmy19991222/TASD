@@ -668,7 +668,10 @@ class BranchingAgentLoop(AgentLoopBase):
             leaves.append(AgentLoopOutput(
                 prompt_ids=list(prompt_ids),
                 response_ids=tokens,
-                response_mask=[1] * len(tokens),
+                # Zero mask: Stage 1 rollouts serve only as teacher-context
+                # providers (ref_or_marker mode) or reward probes (marker_only).
+                # They do NOT contribute to the policy gradient.
+                response_mask=[0] * len(tokens),
                 response_logprobs=lps,
                 multi_modal_data=multi_modal_data,
                 num_turns=2,
