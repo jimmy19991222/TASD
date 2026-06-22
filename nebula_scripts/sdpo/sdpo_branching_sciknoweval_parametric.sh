@@ -63,6 +63,10 @@ TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-300}"
 TWO_STAGE="${TWO_STAGE:-False}"
 STAGE1_N="${STAGE1_N:-4}"
 TWO_STAGE_TEACHER_MODE="${TWO_STAGE_TEACHER_MODE:-ref_or_marker}"
+# Success threshold for Stage 1 scoring (default 1.0 = perfect score required)
+SUCCESS_THRESHOLD="${SUCCESS_THRESHOLD:-1.0}"
+# Entropy regularization (nonzero adds entropy bonus to policy loss)
+ENTROPY_COEFF="${ENTROPY_COEFF:-0}"
 
 # 数据集路径
 train_data_path="${OSS_ROOT}/datasets/${DATASET}/train.parquet"
@@ -85,6 +89,11 @@ export TORCH_WARN_ACCUMULATE_GRAD_STREAM=0
 pip install -e . --no-deps --no-build-isolation --quiet 2>/dev/null || true
 
 mkdir -p "${SWANLAB_LOG_DIR}" 2>/dev/null || true
+
+ENTROPY_HYDRA_ARGS=""
+if [ "${ENTROPY_COEFF}" != "0" ]; then
+    ENTROPY_HYDRA_ARGS="actor_rollout_ref.actor.entropy_coeff=${ENTROPY_COEFF} actor_rollout_ref.actor.calculate_entropy=True"
+fi
 
 # IMPORTANT: when branching is enabled we align actor.self_distillation.teacher_context_mode
 # with rollout.branching.teacher_context_mode so the SDPO training-time teacher
@@ -132,6 +141,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.branching.two_stage=${TWO_STAGE} \
     actor_rollout_ref.rollout.branching.stage1_n=${STAGE1_N} \
     actor_rollout_ref.rollout.branching.two_stage_teacher_mode=${TWO_STAGE_TEACHER_MODE} \
+    actor_rollout_ref.rollout.branching.success_reward_threshold=${SUCCESS_THRESHOLD} \
     algorithm.rollout_correction.rollout_is=token \
     algorithm.adv_std_floor=${ADV_STD_FLOOR} \
     trainer.total_epochs=30 \
@@ -146,4 +156,5 @@ python -m verl.trainer.main_ppo \
     trainer.project_name="${PROJECT_NAME:-TG-Branching}" \
     trainer.experiment_name="${JOB_NAME:-tg_branching_sdpo_sweep}" \
     trainer.group_name="TG-Branching-SDPO-${DATASET//\//-}" \
-    "trainer.logger=[console,swanlab]"
+    "trainer.logger=[console,swanlab]" \
+    ${ENTROPY_HYDRA_ARGS}

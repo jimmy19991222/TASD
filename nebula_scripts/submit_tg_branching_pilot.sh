@@ -98,7 +98,7 @@ TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-}"
 
 # ── 参数解析 ──────────────────────────────────────────────────────────
 DRY_RUN=false
-VARIANT="all"        # all | baseline | branching | sdpo | grpo_tg | sdpo_tg | sdpo_2s | compare
+VARIANT="all"        # all | baseline | branching | sdpo | grpo_tg | sdpo_tg | sdpo_2s | grpo_2s | compare
 LOSS_MODE="all_three" # all | mask | only | suffix | all_three (only for branching)
 
 for ((i=1; i<=$#; i++)); do
@@ -135,7 +135,7 @@ ROLLOUT_N="${ROLLOUT_N:-8}"
 N_LEAVES_PER_TREE=$((1 << N_SPLITS))   # 2 ** N_SPLITS
 N_TOTAL_LEAVES=$((N_TREES * N_LEAVES_PER_TREE))
 # Two-stage variant computes its own ROLLOUT_N; skip validation for sdpo_2s.
-if [[ "$VARIANT" != "sdpo_2s" ]] && [ "$ROLLOUT_N" != "$N_TOTAL_LEAVES" ]; then
+if [[ "$VARIANT" != "sdpo_2s" && "$VARIANT" != "grpo_2s" ]] && [ "$ROLLOUT_N" != "$N_TOTAL_LEAVES" ]; then
     echo "ERROR: ROLLOUT_N=$ROLLOUT_N must equal N_TREES * 2**N_SPLITS = $N_TOTAL_LEAVES (n_trees=$N_TREES, n_splits=$N_SPLITS)." 1>&2
     echo "       Set all three: e.g. 'N_TREES=4 N_SPLITS=1 ROLLOUT_N=8 bash $0 ...'" 1>&2
     exit 2
@@ -230,6 +230,12 @@ _common_env() {
     # Conditionally append TOTAL_TRAINING_STEPS only if set (non-empty).
     if [ -n "${TOTAL_TRAINING_STEPS}" ]; then
         envs="${envs} --env=TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS}"
+    fi
+    if [ -n "${SUCCESS_THRESHOLD}" ]; then
+        envs="${envs} --env=SUCCESS_THRESHOLD=${SUCCESS_THRESHOLD}"
+    fi
+    if [ -n "${ENTROPY_COEFF}" ]; then
+        envs="${envs} --env=ENTROPY_COEFF=${ENTROPY_COEFF}"
     fi
     echo "$envs"
 }
@@ -437,6 +443,47 @@ if [[ "$VARIANT" == "sdpo_2s" ]]; then
         _submit_job "$SCRIPT_PATH" "$JOB_NAME" \
             "$(_common_env "$JOB_NAME" "$DATASET" "$MODEL_NAME" "$LR" "32") --env=ROLLOUT_N=${_2S_ROLLOUT_N} --env=ALPHA=${SDPO_ALPHA} --env=DONT_REPROMPT_ON_SELF_SUCCESS=${SDPO_DONT_REPROMPT_ON_SELF_SUCCESS} --env=BRANCHING_ENABLED=True --env=N_SPLITS=${TWO_STAGE_N_SPLITS} --env=N_TREES=${TWO_STAGE_N_TREES} --env=TOP_K=${TOP_K} --env=TEACHER_TOP_K=${TEACHER_TOP_K} --env=ENTROPY_WINDOW=${ENTROPY_WINDOW} --env=ENTROPY_SIGMA_START=${ENTROPY_SIGMA_START} --env=ENTROPY_SIGMA_FLOOR=${ENTROPY_SIGMA_FLOOR} --env=ENTROPY_SIGMA_STEP=${ENTROPY_SIGMA_STEP} --env=TEACHER_CONTEXT_MODE=${TEACHER_CONTEXT_MODE} --env=BRANCH_TOKEN_LOSS_MODE=${_2S_BTM} --env=ADV_STD_FLOOR=${ADV_STD_FLOOR} --env=TWO_STAGE=True --env=STAGE1_N=${TWO_STAGE_STAGE1_N} --env=TWO_STAGE_TEACHER_MODE=${TS_MODE}"
     done; done; done; done
+fi
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Variant: grpo_2s — Two-stage branching with GRPO loss.
+# Same Stage 1 → Stage 2 pipeline as sdpo_2s but using GRPO loss (more stable
+# with branching — no entropy explosion observed in Pilot).
+# Default topology: stage1_n=4, n_trees=2, n_splits=1, rollout.n=8.
+# ──────────────────────────────────────────────────────────────────────────────
+if [[ "$VARIANT" == "grpo_2s" ]]; then
+    _2S_LEAVES=$((TWO_STAGE_N_TREES * (1 << TWO_STAGE_N_SPLITS)))
+    _2S_ROLLOUT_N=$((TWO_STAGE_STAGE1_N + _2S_LEAVES))
+
+    if [[ "$TWO_STAGE_TEACHER_MODE" == "both" ]]; then
+        _2S_MODES=("ref_or_marker" "marker_only")
+    else
+        _2S_MODES=("$TWO_STAGE_TEACHER_MODE")
+    fi
+
+    _2S_BTM="${LOSS_MODE}"
+    if [[ "$_2S_BTM" == "all_three" ]]; then
+        _2S_BTM="suffix"
+    fi
+
+    SCRIPT_PATH="nebula_scripts/grpo/grpo_branching_sciknoweval_parametric.sh"
+    for DATASET in "${DATASETS[@]}"; do
+    for MODEL_NAME in "${MODEL_NAMES[@]}"; do
+    for LR in "${LRS[@]}"; do
+    for MINI_BATCH_SIZE in "${MINI_BATCH_SIZES[@]}"; do
+    for TS_MODE in "${_2S_MODES[@]}"; do
+        DATASET_SHORT=$(echo "$DATASET" | tr '/' '-')
+        LR_TAG=$(echo "$LR" | tr '-' '_')
+        CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
+        if [[ "$TS_MODE" == "ref_or_marker" ]]; then
+            MODE_TAG="ref"
+        else
+            MODE_TAG="marker"
+        fi
+        JOB_NAME="TGB-2S-GRPO-${MODE_TAG}-${_2S_BTM}-${DATASET_SHORT}-mbs${MINI_BATCH_SIZE}-lr${LR_TAG}-${MODEL_NAME}-${CURRENT_TIME}"
+        _submit_job "$SCRIPT_PATH" "$JOB_NAME" \
+            "$(_common_env "$JOB_NAME" "$DATASET" "$MODEL_NAME" "$LR" "$MINI_BATCH_SIZE") --env=ROLLOUT_N=${_2S_ROLLOUT_N} --env=BRANCHING_ENABLED=True --env=N_SPLITS=${TWO_STAGE_N_SPLITS} --env=N_TREES=${TWO_STAGE_N_TREES} --env=TOP_K=${TOP_K} --env=TEACHER_TOP_K=${TEACHER_TOP_K} --env=ENTROPY_WINDOW=${ENTROPY_WINDOW} --env=ENTROPY_SIGMA_START=${ENTROPY_SIGMA_START} --env=ENTROPY_SIGMA_FLOOR=${ENTROPY_SIGMA_FLOOR} --env=ENTROPY_SIGMA_STEP=${ENTROPY_SIGMA_STEP} --env=TEACHER_CONTEXT_MODE=${TEACHER_CONTEXT_MODE} --env=BRANCH_TOKEN_LOSS_MODE=${_2S_BTM} --env=ADV_STD_FLOOR=${ADV_STD_FLOOR} --env=TWO_STAGE=True --env=STAGE1_N=${TWO_STAGE_STAGE1_N} --env=TWO_STAGE_TEACHER_MODE=${TS_MODE}"
+    done; done; done; done; done
 fi
 
 echo ""
