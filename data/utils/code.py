@@ -1,3 +1,4 @@
+from __future__ import annotations
 import re
 
 I = r"(?:input[ \t]*(?:format|specification|section)|input[ \t]*(?:and|/|&)[ \t]*output|input)"

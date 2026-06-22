@@ -69,6 +69,16 @@ SUCCESS_THRESHOLD="${SUCCESS_THRESHOLD:-1.0}"
 # Entropy regularization (nonzero adds entropy bonus to policy loss)
 ENTROPY_COEFF="${ENTROPY_COEFF:-0}"
 
+# Validation metric — derived from DATASET by default
+# sciknoweval/biology → data_source=sciknoweval → val-core/sciknoweval/acc/mean@16
+# math500            → data_source=math500     → val-core/math500/acc/mean@16
+_DATASET_BASENAME="${DATASET##*/}"
+_DEFAULT_METRIC_DS="${_DATASET_BASENAME}"
+if [[ "$DATASET" == sciknoweval/* ]]; then
+    _DEFAULT_METRIC_DS="sciknoweval"
+fi
+SAVE_BEST_METRIC="${SAVE_BEST_METRIC:-val-core/${_DEFAULT_METRIC_DS}/acc/mean@16}"
+
 # 数据集路径
 train_data_path="${OSS_ROOT}/datasets/${DATASET}/train.parquet"
 val_data_path="${OSS_ROOT}/datasets/${DATASET}/test.parquet"
@@ -139,7 +149,7 @@ python -m verl.trainer.main_ppo \
     trainer.save_freq=${SAVE_FREQ} \
     trainer.max_actor_ckpt_to_keep=null \
     trainer.test_freq=${TEST_FREQ} \
-    trainer.save_best_metric="val-core/sciknoweval/acc/mean@16" \
+    trainer.save_best_metric="${SAVE_BEST_METRIC}" \
     trainer.n_gpus_per_node=4 \
     trainer.val_before_train=${VAL_BEFORE_TRAIN} \
     trainer.default_local_dir="${save_path}" \
