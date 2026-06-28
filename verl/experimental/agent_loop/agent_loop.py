@@ -184,6 +184,20 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     path (owner pipeline raised, we used a plain student rollout instead),
     else 0. Used by dp_actor to override branch_token_loss_mode='all' for
     fallback rows so they don't get silently zero-gradient under btm=only."""
+    is_two_stage_stage1: Optional[torch.Tensor] = None
+    """Per-row LongTensor [1]; 1 if this rollout was generated in Stage 1 of
+    the two-stage pipeline (independent student rollouts), 0 if Stage 2
+    (teacher-guided branching). Used for DPO reward shaping."""
+    leaf_id: Optional[torch.Tensor] = None
+    """Per-row LongTensor [1]; leaf index within the branching tree.
+    Even = pos branch (teacher's preferred direction), odd = neg branch."""
+    teacher_branch_logprob: Optional[torch.Tensor] = None
+    """Per-row FloatTensor [1]; teacher's logprob of the branch token chosen
+    for this sample. Used for DPO reward shaping: sign depends on leaf_id
+    parity (pos vs neg branch)."""
+    teacher_sibling_logprob: Optional[torch.Tensor] = None
+    """Per-row FloatTensor [1]; teacher's logprob of the SIBLING's branch token.
+    DPO preference = teacher_branch_logprob - teacher_sibling_logprob."""
     multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None
     """Multi-modal inputs for processors (e.g., pixel_values, image_grid_thw)."""
     extra_fields: dict[str, Any] = {}
@@ -729,6 +743,25 @@ class AgentLoopWorker:
                 dtype=torch.long,
             )
 
+        # DPO fields: is_two_stage_stage1, leaf_id, teacher_branch_logprob
+        is_two_stage_stage1 = None
+        leaf_id = None
+        teacher_branch_logprob = None
+        teacher_sibling_logprob = None
+        if output.extra_fields:
+            _is_s1 = output.extra_fields.get("is_two_stage_stage1", None)
+            if _is_s1 is not None:
+                is_two_stage_stage1 = torch.tensor([int(_is_s1)], dtype=torch.long)
+            _leaf_id = output.extra_fields.get("leaf_id", None)
+            if _leaf_id is not None:
+                leaf_id = torch.tensor([int(_leaf_id)], dtype=torch.long)
+            _t_lp = output.extra_fields.get("teacher_branch_logprob", None)
+            if _t_lp is not None:
+                teacher_branch_logprob = torch.tensor([float(_t_lp)], dtype=torch.float32)
+            _t_sib_lp = output.extra_fields.get("teacher_sibling_logprob", None)
+            if _t_sib_lp is not None:
+                teacher_sibling_logprob = torch.tensor([float(_t_sib_lp)], dtype=torch.float32)
+
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
         attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
         input_ids = torch.cat([prompt_output["input_ids"], response_output["input_ids"]], dim=1)
@@ -780,6 +813,10 @@ class AgentLoopWorker:
             routed_experts=routed_experts,
             branch_token_mask=branch_token_mask,
             is_branching_fallback=is_branching_fallback,
+            is_two_stage_stage1=is_two_stage_stage1,
+            leaf_id=leaf_id,
+            teacher_branch_logprob=teacher_branch_logprob,
+            teacher_sibling_logprob=teacher_sibling_logprob,
             multi_modal_inputs=multi_modal_inputs,
             multi_modal_data=output.multi_modal_data,
             reward_score=output.reward_score,
@@ -903,6 +940,10 @@ class AgentLoopWorker:
             response_length = inputs[0].response_ids.shape[-1]
             btm_chunks = []
             ifb_chunks = []
+            s1_chunks = []
+            lid_chunks = []
+            tlp_chunks = []
+            tslp_chunks = []
             for input in inputs:
                 if input.branch_token_mask is not None:
                     btm_chunks.append(input.branch_token_mask)
@@ -914,8 +955,29 @@ class AgentLoopWorker:
                     ifb_chunks.append(input.is_branching_fallback)
                 else:
                     ifb_chunks.append(torch.zeros(1, dtype=torch.long))
+                # DPO fields: zero-fill missing entries for robustness
+                if getattr(input, "is_two_stage_stage1", None) is not None:
+                    s1_chunks.append(input.is_two_stage_stage1)
+                else:
+                    s1_chunks.append(torch.zeros(1, dtype=torch.long))
+                if getattr(input, "leaf_id", None) is not None:
+                    lid_chunks.append(input.leaf_id)
+                else:
+                    lid_chunks.append(torch.zeros(1, dtype=torch.long))
+                if getattr(input, "teacher_branch_logprob", None) is not None:
+                    tlp_chunks.append(input.teacher_branch_logprob)
+                else:
+                    tlp_chunks.append(torch.full((1,), float("nan"), dtype=torch.float32))
+                if getattr(input, "teacher_sibling_logprob", None) is not None:
+                    tslp_chunks.append(input.teacher_sibling_logprob)
+                else:
+                    tslp_chunks.append(torch.full((1,), float("nan"), dtype=torch.float32))
             optional_outputs["branch_token_mask"] = torch.cat(btm_chunks, dim=0)
             optional_outputs["is_branching_fallback"] = torch.cat(ifb_chunks, dim=0)
+            optional_outputs["is_two_stage_stage1"] = torch.cat(s1_chunks, dim=0)
+            optional_outputs["leaf_id"] = torch.cat(lid_chunks, dim=0)
+            optional_outputs["teacher_branch_logprob"] = torch.cat(tlp_chunks, dim=0)
+            optional_outputs["teacher_sibling_logprob"] = torch.cat(tslp_chunks, dim=0)
 
         batch = TensorDict(
             {

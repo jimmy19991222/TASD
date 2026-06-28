@@ -67,6 +67,8 @@ TWO_STAGE_TEACHER_MODE="${TWO_STAGE_TEACHER_MODE:-ref_or_marker}"
 SUCCESS_THRESHOLD="${SUCCESS_THRESHOLD:-1.0}"
 # Entropy regularization (nonzero adds entropy bonus to policy loss)
 ENTROPY_COEFF="${ENTROPY_COEFF:-0}"
+# DPO reward shaping: teacher preference signal for Stage 2 samples
+DPO_COEFFICIENT="${DPO_COEFFICIENT:-0}"
 
 # Validation metric — derived from DATASET by default
 _DATASET_BASENAME="${DATASET##*/}"
@@ -152,6 +154,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.branching.success_reward_threshold=${SUCCESS_THRESHOLD} \
     algorithm.rollout_correction.rollout_is=token \
     algorithm.adv_std_floor=${ADV_STD_FLOOR} \
+    +actor_rollout_ref.actor.policy_loss.dpo_coefficient=${DPO_COEFFICIENT} \
     trainer.total_epochs=30 \
     trainer.total_training_steps=${TOTAL_TRAINING_STEPS} \
     trainer.save_freq=${SAVE_FREQ} \

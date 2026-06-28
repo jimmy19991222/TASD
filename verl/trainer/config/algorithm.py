@@ -619,3 +619,8 @@ class AlgoConfig(BaseConfig):
     # small positive number (e.g. 0.05) to clip the denominator. 0.0 (default)
     # preserves legacy behaviour.
     adv_std_floor: float = 0.0
+    # DPO reward shaping for two-stage branching: adds λ × (teacher_lp(self) -
+    # teacher_lp(sibling)) to the token-level reward for Stage 2 samples.
+    # This produces DPO-equivalent gradients through GRPO advantage normalization
+    # without needing explicit sample pairing in batching. 0.0 disables.
+    dpo_coefficient: float = 0.0

@@ -72,7 +72,9 @@ class Role(Enum):
 def need_reference_policy(
     config: DictConfig,
 ) -> bool:
-    return config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss
+    return (config.algorithm.use_kl_in_reward
+            or config.actor_rollout_ref.actor.use_kl_loss
+            or config.actor_rollout_ref.actor.policy_loss.get('dpo_use_ref', False))
 
 
 def need_reward_model(

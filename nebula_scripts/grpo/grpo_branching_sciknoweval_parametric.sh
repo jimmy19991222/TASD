@@ -68,6 +68,9 @@ TWO_STAGE_TEACHER_MODE="${TWO_STAGE_TEACHER_MODE:-ref_or_marker}"
 SUCCESS_THRESHOLD="${SUCCESS_THRESHOLD:-1.0}"
 # Entropy regularization (nonzero adds entropy bonus to policy loss)
 ENTROPY_COEFF="${ENTROPY_COEFF:-0}"
+# DPO reward shaping: teacher preference signal for Stage 2 samples
+DPO_COEFFICIENT="${DPO_COEFFICIENT:-0}"
+DPO_USE_REF="${DPO_USE_REF:-False}"
 
 # Validation metric — derived from DATASET by default
 # sciknoweval/biology → data_source=sciknoweval → val-core/sciknoweval/acc/mean@16
@@ -144,6 +147,8 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.branching.success_reward_threshold=${SUCCESS_THRESHOLD} \
     algorithm.rollout_correction.rollout_is=token \
     algorithm.adv_std_floor=${ADV_STD_FLOOR} \
+    +actor_rollout_ref.actor.policy_loss.dpo_coefficient=${DPO_COEFFICIENT} \
+    +actor_rollout_ref.actor.policy_loss.dpo_use_ref=${DPO_USE_REF} \
     trainer.total_epochs=30 \
     trainer.total_training_steps=${TOTAL_TRAINING_STEPS} \
     trainer.save_freq=${SAVE_FREQ} \

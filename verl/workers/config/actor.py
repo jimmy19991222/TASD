@@ -201,6 +201,11 @@ class PolicyLossConfig(BaseConfig):
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
     branch_token_loss_mode: str = "all"
+    # On-policy DPO loss for Stage 2 pos/neg branch pairs. When > 0, replaces
+    # pg_loss entirely with DPO loss on suffix tokens after branch points.
+    # Stage 1 samples contribute zero gradient (exploration only).
+    dpo_coefficient: float = 0.0
+    dpo_use_ref: bool = False
 
     def __post_init__(self):
         valid = {"all", "mask", "only", "suffix"}

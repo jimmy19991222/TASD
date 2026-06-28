@@ -176,6 +176,7 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     return data, metrics
 
 
+
 def compute_response_mask(data: DataProto):
     """Compute the attention mask for the response part of the sequence.
 

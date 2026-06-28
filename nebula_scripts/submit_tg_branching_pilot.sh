@@ -237,6 +237,9 @@ _common_env() {
     if [ -n "${ENTROPY_COEFF}" ]; then
         envs="${envs} --env=ENTROPY_COEFF=${ENTROPY_COEFF}"
     fi
+    if [ -n "${DPO_COEFFICIENT}" ]; then
+        envs="${envs} --env=DPO_COEFFICIENT=${DPO_COEFFICIENT}"
+    fi
     echo "$envs"
 }
 

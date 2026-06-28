@@ -296,6 +296,12 @@ class BranchNode:
     is_leaf: bool = True
     depth: int = 0
     leaf_id: Optional[int] = None  # assigned in finalize()
+    # DPO: teacher logprobs at the branch point for reward shaping.
+    # teacher_branch_logprob = teacher logprob of THIS child's branch token.
+    # teacher_sibling_logprob = teacher logprob of the SIBLING's branch token.
+    # DPO preference signal = teacher_branch_logprob - teacher_sibling_logprob.
+    teacher_branch_logprob: Optional[float] = None
+    teacher_sibling_logprob: Optional[float] = None
 
     def full_token_sequence(self) -> list[int]:
         return list(self.prefix_tokens) + list(self.segment_tokens)

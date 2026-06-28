@@ -1289,6 +1289,9 @@ class BranchingAgentLoop(AgentLoopBase):
         node.branch_position = p
         # Generate the two child continuations.
         children: list[BranchNode] = []
+        # DPO: teacher logprobs for both branch tokens (pos and neg).
+        _pos_lp = float(chosen_teacher_top.get(int(pos_tok), float("-inf")))
+        _neg_lp = float(chosen_teacher_top.get(int(neg_tok), float("-inf")))
         for chosen_token in (pos_tok, neg_tok):
             child_prefix = list(prefix_ids) + list(segment_tokens[:p]) + [int(chosen_token)]
             # Response budget remaining: total response_length minus all
@@ -1315,6 +1318,8 @@ class BranchingAgentLoop(AgentLoopBase):
                     depth=depth + 1,
                     is_leaf=True,
                 )
+                child_node.teacher_branch_logprob = _pos_lp if chosen_token == pos_tok else _neg_lp
+                child_node.teacher_sibling_logprob = _neg_lp if chosen_token == pos_tok else _pos_lp
                 children.append(child_node)
                 continue
             child_sp = self._student_sampling_params(student_sp, max_tokens=remaining)
@@ -1358,6 +1363,9 @@ class BranchingAgentLoop(AgentLoopBase):
             # Mark the branch token position in the child's mask.
             if child_node.segment_branch_mask:
                 child_node.segment_branch_mask[0] = 1
+            # DPO: store teacher logprobs for reward shaping.
+            child_node.teacher_branch_logprob = _pos_lp if chosen_token == pos_tok else _neg_lp
+            child_node.teacher_sibling_logprob = _neg_lp if chosen_token == pos_tok else _pos_lp
             children.append(child_node)
 
         node.children = children
@@ -1437,6 +1445,10 @@ class BranchingAgentLoop(AgentLoopBase):
         path_logprobs: list[float] = []
         path_branch_mask: list[int] = []
         leaf_counter = [0]
+        # DPO: track teacher logprobs from the split-node parent to leaf outputs.
+        # Each leaf inherits from its immediate parent child-of-split.
+        path_teacher_branch_logprob: list[Optional[float]] = []
+        path_teacher_sibling_logprob: list[Optional[float]] = []
 
         def _visit(node: BranchNode) -> None:
             saved = (
@@ -1447,6 +1459,9 @@ class BranchingAgentLoop(AgentLoopBase):
             path_entropies.extend(node.segment_entropies)
             path_logprobs.extend(node.segment_logprobs)
             path_branch_mask.extend(node.segment_branch_mask)
+            # Push this node's teacher logprobs onto the path stack.
+            path_teacher_branch_logprob.append(node.teacher_branch_logprob)
+            path_teacher_sibling_logprob.append(node.teacher_sibling_logprob)
 
             if node.is_leaf:
                 node.leaf_id = leaf_counter[0]
@@ -1469,6 +1484,18 @@ class BranchingAgentLoop(AgentLoopBase):
                     leaf_tokens = [int(eos_id)]
                     leaf_lps = [0.0]
                     leaf_mask = [0]
+                # DPO: the teacher logprobs for the branch token are the last
+                # non-None values pushed by ancestor nodes.
+                t_logprob: Optional[float] = None
+                for v in reversed(path_teacher_branch_logprob):
+                    if v is not None:
+                        t_logprob = v
+                        break
+                t_sibling_logprob: Optional[float] = None
+                for v in reversed(path_teacher_sibling_logprob):
+                    if v is not None:
+                        t_sibling_logprob = v
+                        break
                 outputs.append(
                     AgentLoopOutput(
                         prompt_ids=root.prefix_tokens,
@@ -1483,6 +1510,8 @@ class BranchingAgentLoop(AgentLoopBase):
                             "is_branching_fallback": 0,
                             "leaf_id": node.leaf_id,
                             "leaf_depth": node.depth,
+                            "teacher_branch_logprob": t_logprob,
+                            "teacher_sibling_logprob": t_sibling_logprob,
                             "branching_diag": dict(diag),
                             "priv_ctx_meta": dict(priv_ctx_meta),
                             "branching_fallback": "",
@@ -1498,6 +1527,8 @@ class BranchingAgentLoop(AgentLoopBase):
             del path_entropies[le:]
             del path_logprobs[lp:]
             del path_branch_mask[lb:]
+            path_teacher_branch_logprob.pop()
+            path_teacher_sibling_logprob.pop()
 
         _visit(root)
         # Sanity check via the structural collector.
