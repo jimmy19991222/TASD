@@ -206,6 +206,18 @@ class PolicyLossConfig(BaseConfig):
     # Stage 1 samples contribute zero gradient (exploration only).
     dpo_coefficient: float = 0.0
     dpo_use_ref: bool = False
+    # Teacher-Guided β: adaptive β based on teacher margin at branch points
+    # β_i = β_base · clamp(α · margin_i, β_min, β_max)
+    # where margin_i = teacher_logp(chosen) - teacher_logp(rejected)
+    dpo_teacher_guided_beta: bool = False
+    dpo_teacher_beta_alpha: float = 1.0
+    dpo_teacher_beta_min: float = 0.1
+    dpo_teacher_beta_max: float = 3.0
+    # Stage 1 middle-version DPO pairing: use Stage 1 student chain as the
+    # "middle" version in a 3-way ranking (argmax > stage1 > argmin), turning
+    # 1 DPO pair into 2 pairs per branch point.
+    dpo_stage1_pair: bool = False
+    dpo_stage1_pair_weight: float = 1.0  # weight for Stage 1 pair loss
 
     def __post_init__(self):
         valid = {"all", "mask", "only", "suffix"}

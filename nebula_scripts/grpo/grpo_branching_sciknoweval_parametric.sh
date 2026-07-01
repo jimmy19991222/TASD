@@ -79,6 +79,10 @@ DPO_TEACHER_GUIDED_BETA="${DPO_TEACHER_GUIDED_BETA:-False}"
 DPO_TEACHER_BETA_ALPHA="${DPO_TEACHER_BETA_ALPHA:-1.0}"
 DPO_TEACHER_BETA_MIN="${DPO_TEACHER_BETA_MIN:-0.1}"
 DPO_TEACHER_BETA_MAX="${DPO_TEACHER_BETA_MAX:-3.0}"
+# Stage 1 middle-version DPO pairing: use Stage 1 student chain as "middle"
+# version in 3-way ranking (argmax > stage1 > argmin), turning 1 pair into 2
+DPO_STAGE1_PAIR="${DPO_STAGE1_PAIR:-False}"
+STAGE1_PAIR_WEIGHT="${STAGE1_PAIR_WEIGHT:-1.0}"
 
 # Validation metric — derived from DATASET by default
 # sciknoweval/biology → data_source=sciknoweval → val-core/sciknoweval/acc/mean@16
@@ -161,6 +165,8 @@ python -m verl.trainer.main_ppo \
     +actor_rollout_ref.actor.policy_loss.dpo_teacher_beta_alpha=${DPO_TEACHER_BETA_ALPHA} \
     +actor_rollout_ref.actor.policy_loss.dpo_teacher_beta_min=${DPO_TEACHER_BETA_MIN} \
     +actor_rollout_ref.actor.policy_loss.dpo_teacher_beta_max=${DPO_TEACHER_BETA_MAX} \
+    +actor_rollout_ref.actor.policy_loss.dpo_stage1_pair=${DPO_STAGE1_PAIR} \
+    +actor_rollout_ref.actor.policy_loss.dpo_stage1_pair_weight=${STAGE1_PAIR_WEIGHT} \
     trainer.total_epochs=30 \
     trainer.total_training_steps=${TOTAL_TRAINING_STEPS} \
     trainer.save_freq=${SAVE_FREQ} \
