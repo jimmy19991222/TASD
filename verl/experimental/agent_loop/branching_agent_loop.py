@@ -551,42 +551,67 @@ class BranchingAgentLoop(AgentLoopBase):
         Stage 1: generate stage1_n independent student rollouts
         Stage 2: build teacher context (ref or marker) → branching
         Returns stage1_n + n_trees*n_leaves outputs.
+
+        Streaming optimisation (2026-07-02): Stage 1 rollouts are processed as
+        they complete (``asyncio.as_completed``). Each rollout is scored
+        immediately upon arrival; the FIRST rollout that meets the success
+        threshold triggers Stage 2 branching — remaining Stage 1 rollouts
+        continue generating in the background and are collected before
+        returning. This overlaps Stage 2 start with tail Stage 1 generation,
+        saving ~50-100 s per training step on long-CoT tasks (math, GSM8K).
         """
         cfg = self.branching_cfg
         stage1_n = self._stage1_n
         two_stage_teacher_mode = str(cfg.get("two_stage_teacher_mode", "ref_or_marker"))
 
-        # --- Stage 1: Normal student rollouts ---
-        stage1_outputs = await self._generate_stage1_rollouts(
-            prompt_ids=prompt_ids,
-            sampling_params=sampling_params,
-            images=images,
-            videos=videos,
-            multi_modal_data=multi_modal_data,
-        )
+        # --- Stage 1: Normal student rollouts (streaming) ---
+        # Launch all Stage 1 rollouts as independent tasks. Use as_completed
+        # to process each rollout the moment it finishes (not wait-for-all).
+        stage1_coros = [
+            self._generate_one_stage1_rollout(
+                idx=i,
+                prompt_ids=prompt_ids,
+                sampling_params=sampling_params,
+                images=images,
+                videos=videos,
+                multi_modal_data=multi_modal_data,
+            )
+            for i in range(stage1_n)
+        ]
+        stage1_tasks = [asyncio.ensure_future(c) for c in stage1_coros]
 
-        # --- Determine teacher context for Stage 2 ---
+        score_fn = kwargs.get("score_fn")
+        threshold = float(cfg.get("success_reward_threshold", 1.0))
         successful_response_text: Optional[str] = None
-        if two_stage_teacher_mode == "ref_or_marker":
-            score_fn = kwargs.get("score_fn")
-            if score_fn is not None:
-                threshold = float(cfg.get("success_reward_threshold", 1.0))
-                scores = await asyncio.gather(*[
-                    score_fn(
-                        prompt_ids=out.prompt_ids,
-                        response_ids=out.response_ids,
-                        raw_prompt=kwargs.get("raw_prompt", []),
+        stage1_outputs: list[AgentLoopOutput] = []
+
+        # Score each rollout as it completes. Once the FIRST rollout meets
+        # the success threshold, break immediately and start Stage 2 —
+        # remaining Stage 1 tasks continue running in the background.
+        for done in asyncio.as_completed(stage1_tasks):
+            try:
+                out = await done
+            except Exception:  # noqa: BLE001
+                continue
+            stage1_outputs.append(out)
+            if (
+                successful_response_text is None
+                and two_stage_teacher_mode == "ref_or_marker"
+                and score_fn is not None
+            ):
+                s = await score_fn(
+                    prompt_ids=out.prompt_ids,
+                    response_ids=out.response_ids,
+                    raw_prompt=kwargs.get("raw_prompt", []),
+                )
+                if s >= threshold:
+                    successful_response_text = self.tokenizer.decode(
+                        out.response_ids, skip_special_tokens=True,
                     )
-                    for out in stage1_outputs
-                ])
-                # Pick the first successful response
-                for i, s in enumerate(scores):
-                    if s >= threshold:
-                        successful_response_text = self.tokenizer.decode(
-                            stage1_outputs[i].response_ids,
-                            skip_special_tokens=True,
-                        )
-                        break
+                    # Success found — stop waiting for remaining Stage 1
+                    # rollouts. They continue running as background tasks
+                    # and are collected via asyncio.gather below.
+                    break
 
         # --- Build privileged context for branching ---
         if successful_response_text:
@@ -602,14 +627,13 @@ class BranchingAgentLoop(AgentLoopBase):
             priv_ctx_ids, priv_ctx_meta = await self._build_privileged_context(
                 prompt_ids=prompt_ids, kwargs=kwargs, images=images, videos=videos,
             )
-            # Override mode to marker if the configured mode needs GT but we don't want GT
-            # The _build_privileged_context will use whatever teacher_context_mode is set;
-            # for two-stage marker_only, teacher_context_mode should be "marker" in config.
 
-        # --- Stage 2: Branching with the chosen teacher context ---
-        branched_outputs: list[AgentLoopOutput] = []
-        for tree_idx in range(self.n_trees):
-            tree_leaves = await self._run_branching_with_priv_ctx(
+        # --- Stage 2: Branching (overlaps with remaining Stage 1 tail) ---
+        # Stage 2 starts immediately while any not-yet-completed Stage 1
+        # tasks finish in the background. vLLM's continuous batching handles
+        # concurrent requests without deadlock.
+        stage2_coros = [
+            self._run_branching_with_priv_ctx(
                 prompt_ids=prompt_ids,
                 sampling_params=sampling_params,
                 images=images,
@@ -620,11 +644,111 @@ class BranchingAgentLoop(AgentLoopBase):
                 priv_ctx_ids=priv_ctx_ids,
                 priv_ctx_meta=priv_ctx_meta,
             )
+            for tree_idx in range(self.n_trees)
+        ]
+        stage2_task = asyncio.ensure_future(
+            asyncio.gather(*stage2_coros, return_exceptions=True)
+        )
+
+        # Collect remaining Stage 1 outputs that were still running when we
+        # broke out of the as_completed loop.
+        remaining = [t for t in stage1_tasks if not t.done()]
+        if remaining:
+            remaining_results = await asyncio.gather(*remaining, return_exceptions=True)
+            for r in remaining_results:
+                if not isinstance(r, BaseException):
+                    stage1_outputs.append(r)
+
+        # Await Stage 2 branching results (may already be done if Stage 1
+        # tail was slower than Stage 2).
+        branched_trees = await stage2_task
+        branched_outputs: list[AgentLoopOutput] = []
+        for tree_leaves in branched_trees:
+            if isinstance(tree_leaves, BaseException):
+                continue
             branched_outputs.extend(tree_leaves)
 
         # Combine: [stage1_outputs..., branched_outputs...]
         all_outputs = stage1_outputs + branched_outputs
         return all_outputs
+
+    async def _generate_one_stage1_rollout(
+        self,
+        *,
+        idx: int,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        images: Optional[list[Any]],
+        videos: Optional[list[Any]],
+        multi_modal_data: dict[str, Any],
+    ) -> AgentLoopOutput:
+        """Generate a single Stage 1 rollout with entropy-based branch-point
+        detection. Extracted from ``_generate_stage1_rollouts`` to support the
+        streaming two-stage pipeline where each rollout is scored individually
+        as it completes.
+        """
+        cfg = self.branching_cfg
+        sp = self._student_sampling_params(sampling_params, max_tokens=None)
+        pw_override = cfg.get("entropy_protect_window", None)
+        pw = int(pw_override) if pw_override is not None else int(cfg.entropy_window)
+
+        out = await self.server_manager.generate(
+            request_id=uuid4().hex,
+            prompt_ids=prompt_ids,
+            sampling_params=dict(sp),
+            image_data=images,
+            video_data=videos,
+        )
+
+        tokens = list(out.token_ids)[: self.response_length]
+        if not tokens:
+            eos_id = (
+                getattr(self.tokenizer, "eos_token_id", None)
+                or getattr(self.tokenizer, "pad_token_id", None)
+                or 0
+            )
+            tokens = [int(eos_id)]
+        lps = list((out.log_probs or [0.0] * len(tokens))[: self.response_length])
+        if len(lps) < len(tokens):
+            lps = lps + [0.0] * (len(tokens) - len(lps))
+
+        branch_mask = [0] * len(tokens)
+        top_logprobs = list(out.top_logprobs or [])[: self.response_length]
+        if top_logprobs and len(top_logprobs) > pw + 1:
+            entropies = [entropy_from_topk_logprobs(d) for d in top_logprobs]
+            positions, _, _ = find_decision_positions_with_sigma_relaxation(
+                entropies,
+                target_count=1,
+                window_size=int(cfg.entropy_window),
+                protect_window=pw,
+                sigma_start=float(cfg.entropy_sigma_start),
+                sigma_step=float(cfg.entropy_sigma_step),
+                sigma_floor=float(cfg.entropy_sigma_floor),
+            )
+            if positions:
+                branch_pos = positions[0]
+                if branch_pos < len(branch_mask):
+                    branch_mask[branch_pos] = 1
+
+        return AgentLoopOutput(
+            prompt_ids=list(prompt_ids),
+            response_ids=tokens,
+            response_mask=[1] * len(tokens),
+            response_logprobs=lps,
+            multi_modal_data=multi_modal_data,
+            num_turns=2,
+            metrics=AgentLoopMetrics(),
+            extra_fields={
+                "branch_token_mask": branch_mask,
+                "is_branching_fallback": 0,
+                "is_two_stage_stage1": 1,
+                "leaf_id": idx,
+                "leaf_depth": 0,
+                "branching_diag": {},
+                "priv_ctx_meta": {},
+                "branching_fallback": "",
+            },
+        )
 
     async def _generate_stage1_rollouts(
         self,

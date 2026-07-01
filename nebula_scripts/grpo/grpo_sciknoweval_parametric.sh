@@ -75,7 +75,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.rollout.n=${ROLLOUT_N} \
     actor_rollout_ref.rollout.val_kwargs.n=16 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=${TENSOR_MODEL_PARALLEL_SIZE:-1} \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
     algorithm.rollout_correction.rollout_is=token \
     trainer.total_epochs=30 \

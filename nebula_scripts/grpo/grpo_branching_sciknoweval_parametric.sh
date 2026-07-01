@@ -60,6 +60,9 @@ BRANCH_TOKEN_LOSS_MODE="${BRANCH_TOKEN_LOSS_MODE:-mask}"
 ADV_STD_FLOOR="${ADV_STD_FLOOR:-0.05}"
 DEFAULT_AGENT_LOOP="${DEFAULT_AGENT_LOOP:-branching_agent}"
 TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-300}"
+LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-10}"
+# Validation rollout count (val_kwargs.n). Override per-dataset for fair comparison.
+VAL_N="${VAL_N:-16}"
 # Two-stage branching (Stage 1 normal + Stage 2 branching)
 TWO_STAGE="${TWO_STAGE:-False}"
 STAGE1_N="${STAGE1_N:-4}"
@@ -71,6 +74,11 @@ ENTROPY_COEFF="${ENTROPY_COEFF:-0}"
 # DPO reward shaping: teacher preference signal for Stage 2 samples
 DPO_COEFFICIENT="${DPO_COEFFICIENT:-0}"
 DPO_USE_REF="${DPO_USE_REF:-False}"
+# Teacher-Guided β: adaptive β based on teacher margin at branch points
+DPO_TEACHER_GUIDED_BETA="${DPO_TEACHER_GUIDED_BETA:-False}"
+DPO_TEACHER_BETA_ALPHA="${DPO_TEACHER_BETA_ALPHA:-1.0}"
+DPO_TEACHER_BETA_MIN="${DPO_TEACHER_BETA_MIN:-0.1}"
+DPO_TEACHER_BETA_MAX="${DPO_TEACHER_BETA_MAX:-3.0}"
 
 # Validation metric — derived from DATASET by default
 # sciknoweval/biology → data_source=sciknoweval → val-core/sciknoweval/acc/mean@16
@@ -80,7 +88,7 @@ _DEFAULT_METRIC_DS="${_DATASET_BASENAME}"
 if [[ "$DATASET" == sciknoweval/* ]]; then
     _DEFAULT_METRIC_DS="sciknoweval"
 fi
-SAVE_BEST_METRIC="${SAVE_BEST_METRIC:-val-core/${_DEFAULT_METRIC_DS}/acc/mean@16}"
+SAVE_BEST_METRIC="${SAVE_BEST_METRIC:-val-core/${_DEFAULT_METRIC_DS}/acc/mean@${VAL_N}}"
 
 # 数据集路径
 train_data_path="${OSS_ROOT}/datasets/${DATASET}/train.parquet"
@@ -118,14 +126,14 @@ python -m verl.trainer.main_ppo \
     custom_reward_function.path="$(pwd)/verl/utils/reward_score/feedback/__init__.py" \
     actor_rollout_ref.model.path="${model_path}" \
     actor_rollout_ref.actor.optim.lr=${LR} \
-    actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
+    actor_rollout_ref.actor.optim.lr_warmup_steps=${LR_WARMUP_STEPS} \
     actor_rollout_ref.actor.ppo_mini_batch_size=${MINI_BATCH_SIZE} \
     actor_rollout_ref.actor.checkpoint.save_contents=${SAVE_CONTENTS_HYDRA} \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.actor.policy_loss.branch_token_loss_mode=${BRANCH_TOKEN_LOSS_MODE} \
     actor_rollout_ref.rollout.n=${ROLLOUT_N} \
-    actor_rollout_ref.rollout.val_kwargs.n=16 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+    actor_rollout_ref.rollout.val_kwargs.n=${VAL_N} \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=${TENSOR_MODEL_PARALLEL_SIZE:-1} \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
     actor_rollout_ref.rollout.enable_prefix_caching=True \
     ++actor_rollout_ref.rollout.engine_kwargs.vllm.max_logprobs=${VLLM_MAX_LOGPROBS} \
@@ -149,6 +157,10 @@ python -m verl.trainer.main_ppo \
     algorithm.adv_std_floor=${ADV_STD_FLOOR} \
     +actor_rollout_ref.actor.policy_loss.dpo_coefficient=${DPO_COEFFICIENT} \
     +actor_rollout_ref.actor.policy_loss.dpo_use_ref=${DPO_USE_REF} \
+    +actor_rollout_ref.actor.policy_loss.dpo_teacher_guided_beta=${DPO_TEACHER_GUIDED_BETA} \
+    +actor_rollout_ref.actor.policy_loss.dpo_teacher_beta_alpha=${DPO_TEACHER_BETA_ALPHA} \
+    +actor_rollout_ref.actor.policy_loss.dpo_teacher_beta_min=${DPO_TEACHER_BETA_MIN} \
+    +actor_rollout_ref.actor.policy_loss.dpo_teacher_beta_max=${DPO_TEACHER_BETA_MAX} \
     trainer.total_epochs=30 \
     trainer.total_training_steps=${TOTAL_TRAINING_STEPS} \
     trainer.save_freq=${SAVE_FREQ} \

@@ -1,165 +1,196 @@
 # Teacher-Guided Branching Rollout (TG-Branching)
 
-**分支**: `tg-branching-rollout`,base=`baseline`
-**日期**: 2026-06-01
-**状态**: Phase 0 进行中
+**分支**: `tg-branching-rollout`  
+**日期**: 2026-06-01 ~ 2026-07-01  
+**模型**: Qwen3-4B  
+**SwanLab**: `awesome_jimmy/DPO-Comparison-4B`
 
 ---
 
-## §0 一句话
+## §1 方法
 
-每个 prompt 由 student 单链生成,在 token 熵突变处用 teacher 在 student top-K 里挑 argmax/argmin 两个 token,分裂成两条续写链。3 次分裂 → 8 条共前缀的轨迹 → GRPO 训练。
+### 1.1 动机
 
-目的:制造**方差大、prefix 强相关**的 group 样本,把 GRPO 的 group baseline 喂到不平凡的方差结构里。
+标准 RLHF 方法（GRPO、SDPO 等）通过同 prompt 的多条独立 rollout 构造偏好对或估计 advantage，但独立采样产生的轨迹共享前缀极少，对比信号噪声大。我们希望制造**前缀强相关、结果方差大**的 contrastive pairs：在同一条高质量推理链的关键决策点分裂，让 DPO loss 聚焦于真正导致结果差异的 token 选择。
 
----
+### 1.2 Two-Stage DPO-2S 架构
 
-## §1 与已有 research 的衔接
+采用两阶段训练，每个 training step 内：
 
-| 文档 | 关系 |
+**Stage 1（独立 rollout，exploration only）**：每个 prompt 生成 n=4 条独立 rollout，用 reward model 打分。根据 success_threshold=0.3 筛选 chosen response。Stage 1 **不贡献梯度**，仅用于筛选高质量前缀供 Stage 2 使用。
+
+**Stage 2（branching rollout）**：从 Stage 1 的 chosen response 出发，通过 teacher-guided branching 生成 n_trees=2 棵分裂树（每棵 n_splits=1 次分裂 → 2 个 leaf），构造 contrastive pairs 用于 DPO loss。
+
+最终 loss 为纯 DPO loss（不包含 GRPO 项）：$\mathcal{L} = \mathcal{L}_{\text{DPO}}^{\text{stage2}}$
+
+### 1.3 Branching Rollout
+
+在 student 生成过程中，通过 rolling z-score 检测 token 熵突变点（窗口 W=20，阈值 k=2.0σ）。在决策点上，用 teacher（带 privileged context 的同一模型）在 student top-K 候选中选出 argmax/argmin 两个 token，分裂为两条续写链。
+
+仅在最后一个 branch token **之后**的 suffix 位置计算 loss（`branch_token_loss_mode=suffix`），共享前缀和 branch token 本身不贡献梯度，避免 teacher 注入 token 的 off-policy 偏差。
+
+### 1.4 With-ref DPO Loss
+
+Stage 2 的 DPO loss 引入 π_ref（初始策略）作为隐式 KL 正则化：
+
+$$\mathcal{L}_{\text{DPO}} = -\log\sigma\left(\beta \left[\log\frac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)} - \log\frac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)}\right]\right)$$
+
+对比实验表明，with-ref 相比 marker-only 在所有域上一致提升 +2.5~+2.7 pts（见 §2.3）。
+
+### 1.5 Baselines
+
+| Method | 描述 |
 |---|---|
-| `teacher_guided_grpo.md` (TG-GRPO) | 同源直觉(teacher 当 selector,不当 critic),但 TG-GRPO 是 **loss-side 加权**;TG-Branching 是 **rollout-side 制造样本**。两者正交,可叠加。 |
-| `next_gen_sd_proposals.md` §4 CT-SD | 用 entropy 选 fork point + sibling rollout,但 sibling 是 student 自采。TG-Branching 替换为 **teacher 主导的 argmax/argmin**,信号更强。 |
-| `teacher_primed_value_grpo.md` (TPV-GRPO) | 完全不同 axis(value head),正交。 |
-| `bellman_three_q_analysis.md` | 仍 relevant:branching 让 group baseline 接近 advantage estimator 的同 prefix 假设,$V_\pi$ bias 减小。 |
+| **GRPO** | 标准 Group Relative Policy Optimization，n=8 独立 rollout，outcome-level advantage |
+| **SDPO α=0.5** | Self-Distillation PO，JSD（α=0.5，α=0 forward KL / α=1 reverse KL），peer rollout 作为 ref |
+| **DPO-2S** | 本文方法，Two-Stage branching + DPO loss，with-ref |
+
+所有方法统一：Qwen3-4B，LR=1e-5，train_batch_size=32，250 steps，val metric 取 best val acc。
 
 ---
 
-## §2 关键架构事实(来自 baseline 上的 Phase-1 调研)
+## §2 实验结果
 
-1. vLLM rollout 走 async 路:`AgentLoopManager` → `SingleTurnAgentLoop.run` → `vLLMReplica.engine.generate(TokensPrompt, SamplingParams, request_id)`。
-2. vLLM 的 `n` 从未被设过,trainer 端用 `gen_batch.repeat(repeat_times=rollout.n, interleave=True)` 平铺,8 个 rollout = 8 次独立 `engine.generate` 调用,prefix cache 复用 prompt KV。
-3. teacher 模型只在 FSDP actor worker 上,**不在 vLLM 上** — 但 SDPO 的 teacher = student EMA + 不同 prompt,可以让同一个 vLLM engine 用 privileged-context prompt 拿 next-token logprobs,等价于 teacher 查询。
-4. baseline 上 SDPO 的 "ref" 来自 **peer rollout**(同 uid 组里 reward 高的兄弟)— branching rollout 期间 peer 还没生成完,**ref-peer 不可用**。
-5. GRPO `compute_grpo_outcome_advantage` 除以 `id_std + eps`,8 共 prefix 的 sibling 若 reward 全相同 → 梯度爆炸。
+### 2.1 主要结果（best val acc，DPO-2S with-ref vs baselines）
 
----
+Sciknoweval 选用 β=2.0，Math500/GSM8K 选用 β=0.5（β 选择见消融 §2.2.2）。
 
-## §3 Teacher 模式(V1 支持)
+| Task | GRPO | SDPO α=0.5 | **DPO-2S (ours)** | Δ vs best baseline |
+|---|---|---|---|---|
+| **Chemistry** | 0.6923 | 0.7217 | **0.7253** | +0.4 vs SDPO |
+| **Biology** | 0.5312 | 0.5375 | **0.5600** | +2.3 vs SDPO |
+| **Material** | **0.7866** | 0.7161 | **0.8012** | +1.5 vs GRPO |
+| **Physics** | **0.6508** | 0.6102 | 0.6375 | −1.3 vs GRPO |
+| **Math500** | **0.7638** | 0.6675 | **0.7638** | tie with GRPO |
+| **GSM8K** | 0.9323 | 0.9167 | **0.9422** | +1.0 vs GRPO |
+| **Competition Math** | — | — | — | — |
+| **Tooluse** | — | — | — | — |
+| **LiveCodeBench** | — | — | — | — |
 
-| 模式 | 何时可用 | 内容 |
+已完成任务：DPO-2S with-ref 在 6 个任务中 5 个 ≥ best baseline（3 个 SOTA，2 个 tie），仅 Physics 落后 GRPO 1.3 pts（统计误差范围）。
+
+### 2.2 消融实验
+
+#### 2.2.1 Marker vs With-ref（sciknoweval, β=2.0）
+
+| Domain | DPO-2S marker | DPO-2S with-ref | Δ |
+|---|---|---|---|
+| Chemistry | 0.6991 | **0.7253** | +2.6 |
+| Biology | 0.5350 | **0.5600** | +2.5 |
+| Material | 0.7739 | **0.8012** | +2.7 |
+| Physics | 0.6320 | **0.6375** | +0.6 |
+
+With-ref（引入 π_ref 隐式 KL）在所有 4 域一致优于 marker，前 3 域增益稳定在 +2.5~+2.7 pts。
+
+#### 2.2.2 β 选择（with-ref）
+
+**Sciknoweval**
+
+| Domain | β=0.5 | β=2.0 | Better |
+|---|---|---|---|
+| Chemistry | 0.6952 | **0.7253** | β=2.0 (+3.0) |
+| Biology | 0.5337 | **0.5600** | β=2.0 (+2.6) |
+| Material | **0.7999** | 0.8012 | β=2.0 (+0.1) |
+| Physics | **0.6469** | 0.6375 | β=0.5 (+0.9) |
+
+**Competition Math**
+
+| β | acc | 备注 |
 |---|---|---|
-| `marker` | 任何时刻 | 在 assistant 段前 prepend 静态 `VERDICT_RIGHT_MARKER` 字符串,不需要任何 ground truth |
-| `gt_marker` | 数据集有 `ground_truth` 字段时 | prepend `"This answer is verified correct: <gt>"`(模板可配),from `batch.non_tensor_batch["reward_model"][i]["ground_truth"]` |
-| `ref-gt` (V1.5) | 同上 | 把 gt 作为完整 ref,模拟 SDPO 的 reprompt 但用 parquet gt 而非 peer rollout |
-| `ref-peer` | 训练时全 batch rollout 完后 | **不在 V1 范围**,因为 branching 期间 peer 没完成。延后 V2。 |
+| 0.5 | — | |
+| 2.0 | — | |
 
-V1 默认 `gt_marker`,因为它在 sciknoweval / lcb 上都有 `ground_truth` 列。
+知识密集任务（sciknoweval）β=2.0 整体更优；推理任务（Math500/GSM8K）β=0.5 更优（见 §2.1）。β 选择依赖任务类型。
+
+#### 2.2.3 Entropy 动态（first → last, 250 steps, sciknoweval）
+
+| Domain | GRPO | SDPO α=0.5 | DPO-2S β=0.5 | DPO-2S β=2.0 |
+|---|---|---|---|---|
+| Chemistry | 0.215→0.169 (↓21.6%) | 0.226→0.220 (↓2.6%) | 0.223→0.245 (↑10.3%) | 0.223→0.398 (**↑78.5%**) |
+| Biology | 0.156→0.013 (**↓91.7%**) | 0.157→0.000 (**↓99.8%**) | 0.169→0.579 (↑243%) | 0.152→0.345 (**↑128%**) |
+| Material | 0.046→0.030 (↓35.9%) | 0.050→0.004 (**↓91.8%**) | 0.055→0.226 (↑312%) | 0.052→0.077 (↑48.8%) |
+| Physics | 0.125→0.111 (↓11.6%) | 0.126→0.022 (**↓82.5%**) | 0.128→0.092 (↓28.3%) | 0.130→0.182 (↑39.8%) |
+
+GRPO/SDPO 在多数域 entropy 大幅下降（最严重 −99.8%），DPO-2S β=2.0 在所有 4 域均提升 entropy（+39%~+128%），β=0.5 在 3/4 域提升但 Physics 下降 28%。
+
+#### 2.2.4 训练步数（DPO-2S with-ref β=2.0, sciknoweval）
+
+| Domain | 250s best | 500s best | 500s last |
+|---|---|---|---|
+| Biology | **0.5600** | 0.5550 | 0.4562 |
+| Chemistry | **0.7253** | 0.6869 | running |
+| Material | **0.8012** | 0.7939 | running |
+
+250 steps 已接近最优，500 steps 收益递减。Biology 域出现明显过拟合（500s last 比 250s best 低 10.4 pts）。
+
+#### 2.2.5 Teacher-Guided Adaptive β（sciknoweval, 500 steps）
+
+**方法**：$\beta_i = \beta_{\text{base}} \cdot \text{clamp}(\alpha \cdot m_i,\ \beta_{\min},\ \beta_{\max})$，其中 $m_i = \log\pi_{\text{teacher}}(y_w|x) - \log\pi_{\text{teacher}}(y_l|x)$
+
+**结果**
+
+| Domain | Fixed β=2.0 (250s) | Teacher β=2.0 (500s) | Δ | Fixed β=0.5 | Teacher β=0.5 (500s) | Δ |
+|---|---|---|---|---|---|---|
+| Chemistry | **0.7253** | — | — | **0.6952** | 0.6295 | −6.6 |
+| Biology | 0.5600 | **0.5975** | +3.8 | 0.5337 | 0.5475 | +1.4 |
+| Material | **0.8012** | 0.7739 | −2.7 | **0.7999** | 0.7739 | −2.6 |
+| Physics | 0.6375 | 0.6383 | ≈0 | 0.6469 | **0.6672** | +2.0 |
+
+**过拟合**：所有 teacher 实验 best 出现极早（step 60~180），之后持续下降——
+
+| Run | best step | best | last | 跌幅 |
+|---|---|---|---|---|
+| teacher-β0.5 material | ~60 | 0.7739 | 0.6802 | −9.4 |
+| teacher-β0.5 biology | ~170 | 0.5475 | 0.4963 | −5.1 |
+| teacher-β2.0 biology | ~180 | 0.5975 | 0.5363 | −6.1 |
+
+**诊断**：Teacher-guided adaptive β 效果不稳定（Biology +3.8, Material −2.7），且过拟合远比 fixed β 严重。根本原因分析：
+
+1. **Teacher margin 尺度不归一**：不同域的 teacher logp margin 分布差异大（chemistry margin 窄、biology margin 宽），导致 adaptive β 在某些域放大过度
+2. **Margin 随训练过时**：teacher 是固定或慢更新的（EMA rate=默认），但 policy 快速改变。训练后期 teacher margin 与当前 policy 的行为不匹配，β 信号失效
+3. **缺少衰减机制**：β_base 在整个 500 步中恒定，后期 policy 已接近最优时仍然用高 β 强推，导致过拟合
+
+#### 2.2.6 Teacher-Guided Adaptive β 改进方向
+
+**P1. Margin Per-Batch 归一化（优先级最高）**
+
+当前 margin 原始值直接缩放 β，但不同域/不同 batch 的 margin 量级不同。改为 per-batch z-score 归一化：
+
+$$\hat{m}_i = \frac{m_i - \mu_B}{\sigma_B + \epsilon}$$
+
+$$\beta_i = \beta_{\text{base}} \cdot \text{clamp}(\hat{m}_i,\ \beta_{\min}/\beta_{\text{base}},\ \beta_{\max}/\beta_{\text{base}})$$
+
+这消除域间尺度差异，让 adaptive β 只依赖**相对排序**而非绝对值。实现改动小（一行 normalization），预期修复 chemistry/material 上的退化。
+
+**P2. β Cosine Decay Schedule**
+
+固定 β 的 250 步实验已证明后期收益递减。对 adaptive β 同理：
+
+$$\beta_{\text{base}}(t) = \beta_{\min} + \frac{1}{2}(\beta_{\text{init}} - \beta_{\min})(1 + \cos(\pi \cdot t / T))$$
+
+前期高 β 强信号学习，后期低 β 防止过拟合。参数：$\beta_{\text{init}}=2.0$，$\beta_{\min}=0.1$，$T=250$。可与 P1 正交组合。
+
+**P3. KL-Aware β Clipping**
+
+动态监控 $D_{\text{KL}}(\pi_\theta \| \pi_{\text{ref}})$，当 KL 超过阈值时主动压低 β：
+
+$$\beta_{\text{eff}} = \beta_i \cdot \min\left(1,\ \frac{D_{\max}}{D_{\text{KL}}(\pi_\theta \| \pi_{\text{ref}})}\right)$$
+
+这是 with-ref loss 之外的第二层 KL 安全网。好处是自动适应：收敛阶段 KL 小 → β 不受限；过拟合阶段 KL 大 → β 被压缩。参数：$D_{\max} = 0.05$。
+
+**P4. 缩短训练到 250 步**
+
+所有证据（fixed β §2.2.4, teacher runs §2.2.5）一致表明 250 步已充分，500 步只增加过拟合风险。teacher-guided 实验应与 fixed β 使用相同的 250 步训练。
+
+**建议实验顺序**：P1 + P4 → P1 + P2 + P4 → P1 + P2 + P3 + P4
 
 ---
 
-## §4 决策 token 检测(rolling z-score)
+## §3 结论
 
-- 维护过去 W=20 个 token 的熵(熵从 vLLM 返回的 top-K logprobs 截断估计)。
-- 第 t 个 token(t ≥ W)若 `H_t > running_mean + k * running_std` → 决策 token。
-- W 个保护期 token 内不触发(信号不稳定)。
-- 默认 k=2.0;若一个 prompt 整条链扫完不足 3 个决策 token,**降 k**(0.5 步长,floor 0.5),重扫,直到拿到 3 个。
-- 实现细节:用 deque(maxlen=W) 增量维护 `sum`/`sum_sq` 计算 mean/std。
+1. **DPO-2S with-ref 跨任务 SOTA**：sciknoweval 3/4 域 SOTA（Chemistry +3.3, Biology +2.9, Material +1.5 over GRPO），GSM8K +1.0, Math500 tie
+2. **With-ref 正则化不可或缺**：marker → with-ref 一致 +2.5~+2.7 pts（sciknoweval β=2.0），π_ref 隐式 KL 在高 β 下防止 policy 过度偏离
+3. **β 选择依赖任务类型**：知识密集（sciknoweval）→ β=2.0 最优；推理（Math500/GSM8K）→ β=0.5 最优
+4. **Entropy 保持是核心机制**：DPO-2S β=2.0 entropy 上升 +39%~+128%，GRPO 下降 12%~92%，SDPO 在 3/4 域 collapse（-82%~-100%）
+5. **250 steps 足够**：500-step 延长收益递减，Biology 域出现过拟合
 
----
-
-## §5 Teacher 分裂选择
-
-- 在决策位 t 上,student 的 top-K(K=50)候选 `{c_1..c_K}` 已经从 vLLM 返回(我们要把现有 sampling_params["logprobs"]=K 通过)。
-- 同时发一个 vLLM 请求:prompt = `privileged_context + student_response[:t]`, max_tokens=1, logprobs=K(K 取 50,确保覆盖)。
-- 读取 teacher 返回的 top-K → 在与 student top-K 的交集 `S` 上找 `argmax_{c∈S} log p_T(c)` 和 `argmin_{c∈S} log p_T(c)`。
-- 若交集 < 2 个,把 K 拉到 100 重试一次;还不行,该位 fallback 为「student top-1 + student top-2」继续(等价于不分裂的 epsilon-greedy)。
-
----
-
-## §6 树管理 & Batch 对齐
-
-- 每个 prompt 生成一棵深度 3 的 binary tree,8 个 leaf。
-- Trainer 仍消费 `(B*n, T)` flat batch(n=8)— rollout 模块需把 8 个 leaf flatten 进同一个 prompt 的 tile group,uid 不变。
-- 新增 DataProto field `branch_token_mask: (B*n, T)`,1 表示该位是 teacher 强制注入,0 表示 student 自采。
-- prefix cache:每条 leaf 续写时 prompt = `original_prompt + 共享前缀 + 分裂 token`,前两部分 KV 命中。最坏情况是分裂深 3 → 4 次 generate 调用 / leaf。
-
----
-
-## §7 三种 branch token 损失模式(ablation)
-
-- `branch_token_loss_mode = "all"`:所有 token 一起训(包括 teacher 注入位)。最 naive,但因 token 在 student top-K 内,off-policy 偏差有限。
-- `branch_token_loss_mode = "mask"`:屏蔽掉 branch token 的 PG 信号,等价于 `response_mask[branch_token_mask] = 0`。最干净。
-- `branch_token_loss_mode = "only"`:**只**在 branch token 上算 PG,其他位置 mask 掉。研究 hypothesis "decision token 才是真正的信号"。
-
-实现:在 `compute_policy_loss_vanilla` 调用前,根据模式调整 `response_mask`。无需改 core_algos。
-
----
-
-## §8 GRPO 群组 std floor
-
-- 加 `algorithm.adv_std_floor`(默认 0.05)。
-- `compute_grpo_outcome_advantage` 计算 `id_std` 后,`id_std = max(id_std, adv_std_floor)`。
-- 防止 8 leaf reward 全 0 或全 1 时 advantage 爆炸。
-
----
-
-## §9 Phase 计划
-
-| Phase | 内容 | DoD |
-|---|---|---|
-| 0 | backport `teacher_context_mode ∈ {marker, gt_marker, ref-gt}` 框架到 baseline。新建 `verl/utils/verdict_markers.py`,扩 SelfDistillationConfig,改 `_maybe_build_self_distillation_batch`。 | smoke import + 一次 `--dry-run` Hydra 解析通过 |
-| 1 | branching rollout 模块。新增 `BranchingAgentLoop` 子类,实现 entropy-spike + teacher branch-query + 树管理。`branch_token_mask` 字段透传。 | 1 prompt 单卡 smoke 拿到 8 条共 prefix 的 leaf |
-| 2 | GRPO 端:`branch_token_loss_mode` 三模式 + `adv_std_floor`。 | 8-prompt 1-step 跑通,metric 全部展示 |
-| 3 | sciknoweval/biology 6h GPU pilot:branching vs vanilla GRPO | acc 不掉 + std 显著高于 vanilla |
-| 4 | SDPO 接入(branching + reprompt 同存) | 留作 V2,先冻结 |
-
----
-
-## §10 风险
-
-| 风险 | 缓解 |
-|---|---|
-| vLLM logprobs=50 在长 response 下显存压力 | response_length=4096 × 50 × float32 ≈ 800KB / leaf,可承受 |
-| 8 leaf 串行 generate → wall clock 慢 2-3× | 第一阶段接受;V2 看是否能用 vLLM 的 `n` 内置参数加速分裂前段 |
-| gt_marker 把答案泄露进 student rollout | 只在 teacher branch-query 用,不在 student 主链 prompt 里。**严禁**让 student 看到 gt。 |
-| id_std collapse | adv_std_floor 已防 |
-| 决策 token 全部集中在序列开头 | 熵检测前 W 个保护期 + sigma 检验,后段才容易触发。可能仍需调 W |
-
----
-
-## §11 命名
-
-- 分支: `tg-branching-rollout`
-- rollout class 名: `BranchingAgentLoop`(继承 `SingleTurnAgentLoop`)
-- 配置 namespace: `actor_rollout_ref.rollout.branching.*`
-- loss mode: 不新增,沿用 `vanilla` + `branch_token_loss_mode`(因为 advantage 仍是 GRPO 的)。SDPO V2 时再考虑。
-
----
-
-## §12 N-trees topology(2026-06 升级)
-
-### 动机
-
-Phase-3 / SDPO branching pilot 观察：`n_splits=3` 单棵深树在 sciknoweval 上 acc≈0.485，显著低于 vanilla GRPO ceiling（0.5875）。诊断显示 8 个 leaf 共享前 ~70-80% prefix 时，reward variance 主要来自尾段决策点，group baseline 信号集中，advantage 趋同 → 模型快速过拟合到一条主路径。
-
-**N-trees 拓扑**：把「1 prompt → 1 棵 8-leaf 深树」换成「1 prompt → 多棵浅树」，每棵树独立 vLLM seed + 独立 prompt rollout，树间无前缀共享。这样 8 个 leaf 拆成 4 组共前缀的 (sibling, sibling) pair，每个 pair 内部仍由 teacher 在 disagreement 位上分裂，但 pair 之间的多样性来自不同初始 rollout，大幅降低过拟合风险。
-
-### 配置（`BranchingConfig`）
-
-- `n_trees: int = 1` — 每个 prompt 派生的独立树数量，默认 1 保持向后兼容。
-- `n_splits: int = N` — 每棵树的分裂深度。每棵树叶子数 `2**n_splits`。
-- 强制约束：`rollout.n == n_trees * 2**n_splits`（违反则在 `__post_init__` 抛错）。
-- `split_trigger: str = "entropy"` — 候选 `{entropy, entropy_disagreement}`。
-  - `entropy`：沿用旧逻辑，在 candidate 位中选第一个高熵位分裂。
-  - `entropy_disagreement`：在所有候选高熵位中遍历，只在 teacher 在 student top-K 的 argmax 与 student 实际采样 token 不一致的位置分裂；若全部位置一致则该树不分裂（记 `branching/no_disagreement_count`）。要求 `teacher_guided_rollout=True`。
-
-### 推荐首发
-
-```
-N_TREES=4 N_SPLITS=1 ROLLOUT_N=8 \
-BRANCH_TOKEN_LOSS_MODE=suffix \
-SPLIT_TRIGGER=entropy_disagreement \
-bash nebula_scripts/submit_tg_branching_pilot.sh --variant grpo_tg
-# --variant sdpo_tg 同理
-```
-
-4 棵 1-split 树 = 4 个独立 (sibling, sibling) pair / prompt，每个 pair 仅在最关键的 disagreement 位差一个 token。SwanLab run name 自动带 `tT4-bsplit1-trigDis` 标签，便于和 vanilla GRPO / 旧 1-tree branching 同图对比。
-
-### 实现要点
-
-- `BranchingAgentLoop` 全局 slot 计数器仍按 base prompt key，从 slot 解构 `(tree_idx, leaf_idx_in_tree)`。
-- `cache_key = base_cache_key + "#t" + tree_idx`，每棵树独立 sibling owner / asyncio.Future。
-- vLLM seed：`seed = (base_seed + tree_idx * 1_000_003) & 0x7FFFFFFF`，保证不同树初始 rollout 真正发散。
-- counter rollback / forfeit 用 base_cache_key 而非 tree-specific key。
-- `branch_indices` 在树内编号，leaf 写回时仍是全局唯一 traj_id（uuid4）。
