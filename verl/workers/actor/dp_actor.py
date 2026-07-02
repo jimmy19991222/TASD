@@ -752,11 +752,9 @@ class DataParallelPPOActor(BasePPOActor):
         # 0=chosen (teacher-preferred) / 1=rejected. This does NOT rely on the
         # two siblings being consecutive in the batch (the old assumption, which
         # broke once balance_batch shuffled rows and size-1 micro-batching split
-        # the pair apart). We also key by prompt (sample_index) so per-prompt-
-        # local pair ids never collide if a micro-batch holds >1 prompt.
-        def _as_int(x):
-            return int(x.item()) if hasattr(x, "item") else int(x)
-
+        # the pair apart). We also key by prompt (sample_index, a uid string)
+        # so per-prompt-local pair ids never collide if a micro-batch holds
+        # >1 prompt.
         chosen_pos: list[int] = []
         rejected_pos: list[int] = []
         if dpo_pair_id is not None and dpo_role is not None:
@@ -767,7 +765,7 @@ class DataParallelPPOActor(BasePPOActor):
                 role = int(dpo_role[i].item())
                 if pid < 0 or role < 0:
                     continue
-                pkey = (_as_int(sample_index[i]) if sample_index is not None else 0, pid)
+                pkey = (str(sample_index[i].item()) if sample_index is not None else "0", pid)
                 pair_map[pkey][role] = i
             for _pkey, roles in pair_map.items():
                 if 0 in roles and 1 in roles:
@@ -838,7 +836,7 @@ class DataParallelPPOActor(BasePPOActor):
             stage1_rep: dict = {}
             for i in range(len(sample_index)):
                 if int(is_two_stage_stage1[i].item()) == 1:
-                    key = _as_int(sample_index[i])
+                    key = str(sample_index[i])
                     if key not in stage1_rep:
                         stage1_rep[key] = i
 
@@ -848,7 +846,7 @@ class DataParallelPPOActor(BasePPOActor):
             s1_logp_best_list = []  # "best > middle" pairs
             s1_logp_worst_list = []  # "middle > worst" pairs
             for c_i, r_i in zip(chosen_pos, rejected_pos):
-                key = _as_int(sample_index[c_i])
+                key = str(sample_index[c_i])
                 if key not in stage1_rep:
                     continue
                 s1_idx = stage1_rep[key]
@@ -1092,15 +1090,15 @@ class DataParallelPPOActor(BasePPOActor):
             data.non_tensor_batch.get("multi_modal_inputs")
         )
         non_tensor_select_keys = []
-        # DPO prompt grouping: "index" (dataset row id, shared by a prompt's
-        # rollouts) is the outer key that makes (index, dpo_pair_id) globally
+        # DPO prompt grouping: "uid" (unique per prompt, shared by a prompt's
+        # rollouts) is the outer key that makes (uid, dpo_pair_id) globally
         # unique. Needed both for Stage 1 3-way pairing AND for regrouping
         # micro-batches so a (chosen, rejected) pair lands in one forward.
-        if (self.config.policy_loss.get("dpo_stage1_pair", False) or dpo_active) and "index" in data.non_tensor_batch:
-            non_tensor_select_keys.append("index")
+        if (self.config.policy_loss.get("dpo_stage1_pair", False) or dpo_active) and "uid" in data.non_tensor_batch:
+            non_tensor_select_keys.append("uid")
         if has_multi_modal_inputs:
             non_tensor_select_keys.append("multi_modal_inputs")
-        if self.use_prefix_grouper and "uid" in data.non_tensor_batch.keys():
+        if self.use_prefix_grouper and "uid" in data.non_tensor_batch.keys() and "uid" not in non_tensor_select_keys:
             non_tensor_select_keys.append("uid")
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
@@ -1109,13 +1107,13 @@ class DataParallelPPOActor(BasePPOActor):
         # stay inside a single mini-batch (and later a single micro-batch) so
         # the pairwise loss can be formed. balance_batch (trainer-side) reorders
         # rows to balance token load and can scatter a prompt's rollouts across
-        # mini-batch boundaries. Regroup rows by "index" (dataset row id shared
-        # by a prompt's rollouts) so each prompt is contiguous; with
+        # mini-batch boundaries. Regroup rows by "uid" (unique per prompt,
+        # shared by a prompt's rollouts) so each prompt is contiguous; with
         # ppo_mini_batch_size a multiple of rollout.n each mini-batch then holds
         # whole prompts. No-op for non-DPO runs.
-        if (dpo_active and "index" in data.non_tensor_batch
+        if (dpo_active and "uid" in data.non_tensor_batch
                 and "is_two_stage_stage1" in data.batch.keys()):
-            _idx_arr = data.non_tensor_batch["index"]
+            _idx_arr = data.non_tensor_batch["uid"]
             _groups: dict = {}
             for _i in range(len(_idx_arr)):
                 _groups.setdefault(_idx_arr[_i], []).append(_i)
@@ -1134,7 +1132,7 @@ class DataParallelPPOActor(BasePPOActor):
         }
         did_update = False
         for _ in range(self.config.ppo_epochs):
-            for batch_idx, mini_batch in enumerate(mini_batches):
+            for _batch_idx, mini_batch in enumerate(mini_batches):
                 # On-policy DPO needs a (chosen, rejected) sibling pair in the
                 # SAME forward pass to form the pairwise loss. With the default
                 # ppo_micro_batch_size_per_gpu=1 the two siblings land in
@@ -1148,16 +1146,16 @@ class DataParallelPPOActor(BasePPOActor):
                     dpo_active
                     and not self.config.use_dynamic_bsz
                     and "is_two_stage_stage1" in mini_batch.batch.keys()
-                    and "index" in mini_batch.non_tensor_batch
+                    and "uid" in mini_batch.non_tensor_batch
                 )
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
                 elif dpo_regroup:
-                    index_arr = mini_batch.non_tensor_batch["index"]
+                    uid_arr = mini_batch.non_tensor_batch["uid"]
                     groups: dict = {}
-                    for i in range(len(index_arr)):
-                        groups.setdefault(index_arr[i], []).append(i)
+                    for i in range(len(uid_arr)):
+                        groups.setdefault(uid_arr[i], []).append(i)
                     micro_batches = [mini_batch.select_idxs(idxs) for idxs in groups.values()]
                     # Average the per-prompt losses across the mini-batch.
                     self.gradient_accumulation = max(1, len(micro_batches))
@@ -1351,7 +1349,7 @@ class DataParallelPPOActor(BasePPOActor):
                                 teacher_beta_max=self.config.policy_loss.get("dpo_teacher_beta_max", 3.0),
                                 dpo_stage1_pair=self.config.policy_loss.get("dpo_stage1_pair", False),
                                 stage1_pair_weight=self.config.policy_loss.get("dpo_stage1_pair_weight", 1.0),
-                                sample_index=model_inputs.get("index", None),
+                                sample_index=model_inputs.get("uid", None),
                                 dpo_pair_id=model_inputs.get("dpo_pair_id", None),
                                 dpo_role=model_inputs.get("dpo_role", None),
                             )
