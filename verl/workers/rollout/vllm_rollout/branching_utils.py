@@ -197,6 +197,23 @@ def find_decision_positions_with_sigma_relaxation(
     if len(last_positions) > target_count:
         last_positions = sorted(last_positions, key=lambda p: -entropies[p])[:target_count]
         last_positions.sort()  # restore chronological order
+
+    # Fallback: if sigma relaxation found fewer than target_count, fill remaining
+    # slots with the highest-entropy positions past protect_window. This handles
+    # low-entropy sequences (e.g. structured tool-use output) where even the
+    # floor sigma can't find any z-score spike.
+    if len(last_positions) < target_count:
+        existing = set(last_positions)
+        candidates = [
+            (entropies[p], p)
+            for p in range(protect_window, len(entropies))
+            if p not in existing
+        ]
+        candidates.sort(reverse=True)
+        for _, p in candidates[: target_count - len(last_positions)]:
+            last_positions.append(p)
+        last_positions.sort()
+
     return last_positions, max(sigma, sigma_floor), relaxations
 
 
