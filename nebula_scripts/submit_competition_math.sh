@@ -57,7 +57,7 @@ PROJECT_NAME="DPO-Comparison-4B"
 DATASET="competition_math"
 ROLLOUT_N=8
 TOTAL_STEPS=300
-TENSOR_MODEL_PARALLEL_SIZE=2   # TP=2 for faster vLLM on long math CoT
+TENSOR_MODEL_PARALLEL_SIZE=1   # TP=1 (TP=2 fails: ray colocate gives 1 GPU per worker)
 
 # Branching defaults
 TOP_K=10
