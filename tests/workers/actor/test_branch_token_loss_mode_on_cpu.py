@@ -244,6 +244,131 @@ def test_branch_token_loss_mode_helper_returns_unchanged_when_mask_absent():
     print("test_branch_token_loss_mode_helper_returns_unchanged_when_mask_absent PASS")
 
 
+# ---------------------------------------------------------------------------
+# 3. On-policy DPO pairing (dpo_pair_id / dpo_role)
+#    Replicates the metadata-based pairing in
+#    branching_agent_loop._run_two_stage_pipeline (tagging) and
+#    dp_actor._compute_on_policy_dpo_loss (pairing) element-wise. Regression
+#    guard for the bug where ppo_micro_batch_size_per_gpu=1 + consecutive-order
+#    pairing meant dpo_n_pairs was always 0 (DPO silently ran as GRPO).
+# ---------------------------------------------------------------------------
+
+
+def _tag_dpo_pairs(branched):
+    """branched: list of dicts with keys is_two_stage_stage1, is_branching_fallback,
+    teacher_branch_logprob, teacher_sibling_logprob. Mutates in place, mirrors
+    the rollout-side tagging. Returns the list."""
+    for o in branched:
+        o.setdefault("dpo_pair_id", -1)
+        o.setdefault("dpo_role", -1)
+    valid = [
+        o for o in branched
+        if o.get("teacher_branch_logprob") is not None
+        and int(o.get("is_branching_fallback", 0)) == 0
+        and int(o.get("is_two_stage_stage1", 0)) == 0
+    ]
+    for pair_idx in range(len(valid) // 2):
+        a, b = valid[2 * pair_idx], valid[2 * pair_idx + 1]
+        for o in (a, b):
+            tb, ts = o["teacher_branch_logprob"], o.get("teacher_sibling_logprob")
+            o["dpo_pair_id"] = pair_idx
+            o["dpo_role"] = 0 if (ts is None or tb >= ts) else 1
+        if a["dpo_role"] == b["dpo_role"]:
+            b["dpo_role"] = 1 - a["dpo_role"]
+    return branched
+
+
+def _form_pairs(rows):
+    """rows: list of dicts with is_two_stage_stage1, dpo_pair_id, dpo_role, index.
+    Mirrors dp_actor pairing. Returns (chosen_pos, rejected_pos)."""
+    stage2 = [i for i, r in enumerate(rows) if r["is_two_stage_stage1"] == 0]
+    pair_map = defaultdict(dict)
+    for i in stage2:
+        pid, role = int(rows[i]["dpo_pair_id"]), int(rows[i]["dpo_role"])
+        if pid < 0 or role < 0:
+            continue
+        pair_map[(rows[i]["index"], pid)][role] = i
+    chosen, rejected = [], []
+    for _k, roles in pair_map.items():
+        if 0 in roles and 1 in roles:
+            chosen.append(roles[0])
+            rejected.append(roles[1])
+    return chosen, rejected
+
+
+def test_dpo_tagging_marks_chosen_and_rejected():
+    branched = [
+        {"is_two_stage_stage1": 0, "is_branching_fallback": 0, "teacher_branch_logprob": -0.2, "teacher_sibling_logprob": -1.5},
+        {"is_two_stage_stage1": 0, "is_branching_fallback": 0, "teacher_branch_logprob": -1.5, "teacher_sibling_logprob": -0.2},
+        {"is_two_stage_stage1": 0, "is_branching_fallback": 0, "teacher_branch_logprob": -0.1, "teacher_sibling_logprob": -2.0},
+        {"is_two_stage_stage1": 0, "is_branching_fallback": 0, "teacher_branch_logprob": -2.0, "teacher_sibling_logprob": -0.1},
+    ]
+    _tag_dpo_pairs(branched)
+    assert [o["dpo_pair_id"] for o in branched] == [0, 0, 1, 1]
+    assert [o["dpo_role"] for o in branched] == [0, 1, 0, 1]
+    print("test_dpo_tagging_marks_chosen_and_rejected PASS")
+
+
+def test_dpo_pairing_fires_with_size1_microbatch_regrouped():
+    """One prompt = 4 Stage 1 + 2 (chosen, rejected) pairs. After regrouping the
+    whole prompt into one micro-batch, pairing must yield n_pairs=2 (the old
+    size-1 path yielded 0)."""
+    rows = (
+        [{"is_two_stage_stage1": 1, "dpo_pair_id": -1, "dpo_role": -1, "index": 42} for _ in range(4)]
+        + [
+            {"is_two_stage_stage1": 0, "dpo_pair_id": 0, "dpo_role": 0, "index": 42},
+            {"is_two_stage_stage1": 0, "dpo_pair_id": 0, "dpo_role": 1, "index": 42},
+            {"is_two_stage_stage1": 0, "dpo_pair_id": 1, "dpo_role": 0, "index": 42},
+            {"is_two_stage_stage1": 0, "dpo_pair_id": 1, "dpo_role": 1, "index": 42},
+        ]
+    )
+    chosen, rejected = _form_pairs(rows)
+    assert len(chosen) == 2, (chosen, rejected)
+    assert chosen == [4, 6] and rejected == [5, 7], (chosen, rejected)
+    print("test_dpo_pairing_fires_with_size1_microbatch_regrouped PASS")
+
+
+def test_dpo_pairing_is_order_independent():
+    """balance_batch may shuffle rows; metadata-based pairing must still recover
+    exactly the same (chosen, rejected) sibling pairs."""
+    import random
+
+    base = [
+        {"is_two_stage_stage1": 1, "dpo_pair_id": -1, "dpo_role": -1, "index": 7},
+        {"is_two_stage_stage1": 0, "dpo_pair_id": 0, "dpo_role": 0, "index": 7},
+        {"is_two_stage_stage1": 0, "dpo_pair_id": 0, "dpo_role": 1, "index": 7},
+        {"is_two_stage_stage1": 0, "dpo_pair_id": 1, "dpo_role": 0, "index": 7},
+        {"is_two_stage_stage1": 0, "dpo_pair_id": 1, "dpo_role": 1, "index": 7},
+    ]
+    rng = random.Random(0)
+    for _ in range(20):
+        perm = base[:]
+        rng.shuffle(perm)
+        chosen, rejected = _form_pairs(perm)
+        assert len(chosen) == 2
+        for c, r in zip(chosen, rejected):
+            assert perm[c]["dpo_pair_id"] == perm[r]["dpo_pair_id"]
+            assert perm[c]["dpo_role"] == 0 and perm[r]["dpo_role"] == 1
+    print("test_dpo_pairing_is_order_independent PASS")
+
+
+def test_dpo_pairing_ignores_fallback_and_two_prompts_dont_collide():
+    """Fallback leaves (pair_id=-1) are skipped, and two prompts sharing local
+    pair_id=0 do NOT merge because (index, pair_id) is the key."""
+    rows = [
+        {"is_two_stage_stage1": 0, "dpo_pair_id": 0, "dpo_role": 0, "index": 1},
+        {"is_two_stage_stage1": 0, "dpo_pair_id": 0, "dpo_role": 1, "index": 1},
+        {"is_two_stage_stage1": 0, "dpo_pair_id": -1, "dpo_role": -1, "index": 1},  # fallback
+        {"is_two_stage_stage1": 0, "dpo_pair_id": 0, "dpo_role": 0, "index": 2},
+        {"is_two_stage_stage1": 0, "dpo_pair_id": 0, "dpo_role": 1, "index": 2},
+    ]
+    chosen, rejected = _form_pairs(rows)
+    assert len(chosen) == 2, (chosen, rejected)
+    # pair from index=1 -> (0,1); pair from index=2 -> (3,4); fallback row 2 skipped
+    assert set(zip(chosen, rejected)) == {(0, 1), (3, 4)}, (chosen, rejected)
+    print("test_dpo_pairing_ignores_fallback_and_two_prompts_dont_collide PASS")
+
+
 def main() -> None:
     test_branch_token_loss_mode_all()
     test_branch_token_loss_mode_mask_zeros_branch_tokens()
@@ -259,8 +384,13 @@ def main() -> None:
     test_sdpo_and_grpo_share_branch_token_loss_mode_helper()
     test_branch_token_loss_mode_helper_returns_unchanged_when_mask_absent()
 
+    test_dpo_tagging_marks_chosen_and_rejected()
+    test_dpo_pairing_fires_with_size1_microbatch_regrouped()
+    test_dpo_pairing_is_order_independent()
+    test_dpo_pairing_ignores_fallback_and_two_prompts_dont_collide()
+
     print()
-    print("ALL 11 PHASE-2/3 TESTS PASS")
+    print("ALL 15 PHASE-2/3 TESTS PASS")
 
 
 if __name__ == "__main__":

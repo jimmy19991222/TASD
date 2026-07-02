@@ -671,6 +671,8 @@ class DataParallelPPOActor(BasePPOActor):
         dpo_stage1_pair: bool = False,
         stage1_pair_weight: float = 1.0,
         sample_index: torch.Tensor | None = None,
+        dpo_pair_id: torch.Tensor | None = None,
+        dpo_role: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """On-policy DPO loss for Stage 2 pos/neg branch pairs.
 
@@ -684,8 +686,10 @@ class DataParallelPPOActor(BasePPOActor):
             L_S1 = -log σ(β × (avg_logp_argmax - avg_logp_stage1))
                  + -log σ(β × (avg_logp_stage1 - avg_logp_argmin))
 
-        Stage 2 samples are naturally ordered: [tree0_pos, tree0_neg, tree1_pos, ...]
-        so we pair them by consecutive positions.
+        Stage 2 (chosen, rejected) siblings are paired via the stable
+        (sample_index, dpo_pair_id) key + dpo_role (0=chosen, 1=rejected), which
+        is robust to batch reordering. If that metadata is absent we fall back to
+        the legacy assumption that Stage 2 samples are consecutive [pos, neg].
 
         Args:
             log_prob: [B, T] current policy logprobs
@@ -703,6 +707,10 @@ class DataParallelPPOActor(BasePPOActor):
             dpo_stage1_pair: whether to construct Stage 1 3-way pairs
             stage1_pair_weight: weight for Stage 1 pair loss
             sample_index: [B] prompt index for grouping Stage 1/Stage 2 samples
+            dpo_pair_id: [B] per-prompt-local id shared by a (chosen, rejected)
+                sibling pair; -1 for non-pair rows. With sample_index this keys
+                pairs robustly regardless of batch order.
+            dpo_role: [B] 0=chosen, 1=rejected, -1=not a pair member.
 
         Returns:
             (loss, metrics) tuple
@@ -739,54 +747,67 @@ class DataParallelPPOActor(BasePPOActor):
         suffix_len = suffix_mask.sum(dim=1).clamp_min(1.0)  # [B]
         avg_logp = logp_sum / suffix_len  # [B]
 
-        # Extract Stage 2 avg logprobs
-        stage2_avg_logp = avg_logp[stage2_indices]  # [N_stage2]
+        # ---- Build (chosen, rejected) pairs from STABLE metadata ----------
+        # Each Stage 2 sibling pair shares a dpo_pair_id; dpo_role marks
+        # 0=chosen (teacher-preferred) / 1=rejected. This does NOT rely on the
+        # two siblings being consecutive in the batch (the old assumption, which
+        # broke once balance_batch shuffled rows and size-1 micro-batching split
+        # the pair apart). We also key by prompt (sample_index) so per-prompt-
+        # local pair ids never collide if a micro-batch holds >1 prompt.
+        def _as_int(x):
+            return int(x.item()) if hasattr(x, "item") else int(x)
 
-        # Pair by consecutive positions: [0,1] = pair0, [2,3] = pair1, etc.
-        n_pairs = len(stage2_indices) // 2
+        chosen_pos: list[int] = []
+        rejected_pos: list[int] = []
+        if dpo_pair_id is not None and dpo_role is not None:
+            from collections import defaultdict
+            pair_map: dict = defaultdict(dict)
+            for i in stage2_indices.tolist():
+                pid = int(dpo_pair_id[i].item())
+                role = int(dpo_role[i].item())
+                if pid < 0 or role < 0:
+                    continue
+                pkey = (_as_int(sample_index[i]) if sample_index is not None else 0, pid)
+                pair_map[pkey][role] = i
+            for _pkey, roles in pair_map.items():
+                if 0 in roles and 1 in roles:
+                    chosen_pos.append(roles[0])
+                    rejected_pos.append(roles[1])
+        else:
+            # Legacy fallback: assume consecutive [chosen, rejected] ordering.
+            s2 = stage2_indices.tolist()
+            for p in range(len(s2) // 2):
+                chosen_pos.append(int(s2[2 * p]))
+                rejected_pos.append(int(s2[2 * p + 1]))
+
+        n_pairs = len(chosen_pos)
         if n_pairs == 0:
             return torch.tensor(0.0, device=device, requires_grad=True), {"actor/dpo_loss": 0.0, "actor/dpo_n_pairs": 0.0}
 
-        paired_logp = stage2_avg_logp[:2 * n_pairs].reshape(n_pairs, 2)
-        logp_chosen = paired_logp[:, 0]  # [n_pairs] — pos branch (teacher's preferred)
-        logp_rejected = paired_logp[:, 1]  # [n_pairs] — neg branch
+        chosen_idx = torch.tensor(chosen_pos, device=device, dtype=torch.long)
+        rejected_idx = torch.tensor(rejected_pos, device=device, dtype=torch.long)
+        logp_chosen = avg_logp[chosen_idx]      # [n_pairs] — teacher-preferred branch
+        logp_rejected = avg_logp[rejected_idx]  # [n_pairs] — rejected branch
 
         # With-ref DPO: subtract frozen reference model logprobs for KL constraint
+        ref_chosen = ref_rejected = None
         if ref_log_prob is not None:
             ref_logp_sum = (ref_log_prob * suffix_mask).sum(dim=1)
             ref_avg_logp = ref_logp_sum / suffix_len
-            ref_stage2_avg_logp = ref_avg_logp[stage2_indices]
-            ref_paired = ref_stage2_avg_logp[:2 * n_pairs].reshape(n_pairs, 2)
-            ref_chosen = ref_paired[:, 0]
-            ref_rejected = ref_paired[:, 1]
+            ref_chosen = ref_avg_logp[chosen_idx]
+            ref_rejected = ref_avg_logp[rejected_idx]
             logp_chosen = logp_chosen - ref_chosen
             logp_rejected = logp_rejected - ref_rejected
 
-        # Teacher-Guided β: compute margin at branch point for each pair
-        # β_i = β_base · clamp(α · margin_i, β_min, β_max)
-        # where margin_i = teacher_logp(chosen_token) - teacher_logp(rejected_token)
+        # Teacher-Guided β: margin_i = teacher_logp(chosen_tok) - teacher_logp(rejected_tok),
+        # read from the CHOSEN leaf whose branch lp = chosen token and sibling lp
+        # = rejected token. β_i = β_base · clamp(α · margin_i, β_min, β_max).
         effective_beta = dpo_beta  # default: scalar β (fixed mode)
         teacher_margin = None
         if teacher_guided_beta and teacher_branch_logprob is not None and teacher_sibling_logprob is not None:
-            # Extract per-sample teacher logprobs for Stage 2
-            t_branch = teacher_branch_logprob[stage2_indices]  # [N_stage2]
-            t_sibling = teacher_sibling_logprob[stage2_indices]  # [N_stage2]
-
-            # Pair by consecutive positions: [0,1] = pair0, [2,3] = pair1, etc.
-            # Stage 2 ordering: [tree0_pos, tree0_neg, tree1_pos, tree1_neg, ...]
-            # teacher_branch_logprob = teacher's logprob for THIS sample's branch token
-            # teacher_sibling_logprob = teacher's logprob for the SIBLING's branch token
-            t_branch_paired = t_branch[:2 * n_pairs].reshape(n_pairs, 2)
-            t_sibling_paired = t_sibling[:2 * n_pairs].reshape(n_pairs, 2)
-
-            # margin_i = teacher_logp(chosen_token) - teacher_logp(rejected_token)
-            # For chosen (index 0): its branch token is the chosen token,
-            # so margin = t_branch[chosen] - t_sibling[chosen]
-            # But t_sibling[chosen] = teacher logprob for the REJECTED token
-            # (since sibling of chosen is rejected)
-            teacher_margin = (t_branch_paired[:, 0] - t_sibling_paired[:, 0]).detach()  # [n_pairs]
-
-            # Dynamic β: β_base · clamp(α · margin, β_min, β_max)
+            teacher_margin = (
+                teacher_branch_logprob[chosen_idx] - teacher_sibling_logprob[chosen_idx]
+            ).detach()  # [n_pairs]
             effective_beta = dpo_beta * torch.clamp(
                 teacher_beta_alpha * teacher_margin,
                 min=teacher_beta_min,
@@ -813,52 +834,33 @@ class DataParallelPPOActor(BasePPOActor):
                 ref_logp_sum_all = (ref_log_prob * suffix_mask).sum(dim=1)
                 all_ref_avg_logp = ref_logp_sum_all / suffix_len
 
-            # Group samples by prompt index
-            from collections import defaultdict
-            prompt_groups = defaultdict(lambda: {"stage1": [], "stage2": []})
+            # First Stage 1 rollout per prompt = the "middle" ranking anchor.
+            stage1_rep: dict = {}
             for i in range(len(sample_index)):
-                idx = int(sample_index[i].item())
-                if is_two_stage_stage1[i].item() == 1:
-                    prompt_groups[idx]["stage1"].append(i)
-                else:
-                    prompt_groups[idx]["stage2"].append(i)
+                if int(is_two_stage_stage1[i].item()) == 1:
+                    key = _as_int(sample_index[i])
+                    if key not in stage1_rep:
+                        stage1_rep[key] = i
 
-            # Construct Stage 1 pairs for each prompt group
+            # Reuse the robust (chosen, rejected) pairs built above; anchor each
+            # to its prompt's Stage 1 representative for the 3-way ranking
+            # (argmax > stage1) and (stage1 > argmin).
             s1_logp_best_list = []  # "best > middle" pairs
             s1_logp_worst_list = []  # "middle > worst" pairs
-
-            for pid, group in prompt_groups.items():
-                s1_indices = group["stage1"]
-                s2_indices = group["stage2"]
-
-                if not s1_indices or len(s2_indices) < 2:
+            for c_i, r_i in zip(chosen_pos, rejected_pos):
+                key = _as_int(sample_index[c_i])
+                if key not in stage1_rep:
                     continue
-
-                # Use the first Stage 1 output as "middle"
-                s1_idx = s1_indices[0]
-                s1_logp = all_avg_logp[s1_idx]
-                s1_ref_logp = all_ref_avg_logp[s1_idx] if all_ref_avg_logp is not None else None
-
-                # Stage 2 pairs: consecutive [argmax, argmin]
-                for p in range(len(s2_indices) // 2):
-                    argmax_idx = s2_indices[2 * p]
-                    argmin_idx = s2_indices[2 * p + 1]
-                    argmax_logp = all_avg_logp[argmax_idx]
-                    argmin_logp = all_avg_logp[argmin_idx]
-
-                    # With-ref adjustment
-                    if ref_log_prob is not None:
-                        argmax_ref = all_ref_avg_logp[argmax_idx]
-                        argmin_ref = all_ref_avg_logp[argmin_idx]
-                        argmax_logp = argmax_logp - argmax_ref
-                        argmin_logp = argmin_logp - argmin_ref
-                        s1_logp_adj = s1_logp - s1_ref_logp
-                    else:
-                        s1_logp_adj = s1_logp
-
-                    # 3-way pairs: (argmax > stage1) and (stage1 > argmin)
-                    s1_logp_best_list.append(argmax_logp - s1_logp_adj)
-                    s1_logp_worst_list.append(s1_logp_adj - argmin_logp)
+                s1_idx = stage1_rep[key]
+                argmax_logp = all_avg_logp[c_i]
+                argmin_logp = all_avg_logp[r_i]
+                s1_logp_adj = all_avg_logp[s1_idx]
+                if all_ref_avg_logp is not None:
+                    argmax_logp = argmax_logp - all_ref_avg_logp[c_i]
+                    argmin_logp = argmin_logp - all_ref_avg_logp[r_i]
+                    s1_logp_adj = s1_logp_adj - all_ref_avg_logp[s1_idx]
+                s1_logp_best_list.append(argmax_logp - s1_logp_adj)
+                s1_logp_worst_list.append(s1_logp_adj - argmin_logp)
 
             if s1_logp_best_list:
                 n_s1_pairs = len(s1_logp_best_list)
@@ -1079,13 +1081,22 @@ class DataParallelPPOActor(BasePPOActor):
         # DPO: is_two_stage_stage1 identifies Stage 2 samples for DPO loss
         if "is_two_stage_stage1" in data.batch.keys():
             select_keys.append("is_two_stage_stage1")
+        # DPO pairing: (dpo_pair_id, dpo_role) is a stable chosen/rejected key
+        # that survives batch reordering; teacher_*_logprob feed teacher-guided β.
+        dpo_active = float(self.config.policy_loss.get("dpo_coefficient", 0.0)) > 0
+        for _k in ("dpo_pair_id", "dpo_role", "teacher_branch_logprob", "teacher_sibling_logprob"):
+            if _k in data.batch.keys():
+                select_keys.append(_k)
 
         has_multi_modal_inputs = self._has_non_empty_multi_modal_inputs(
             data.non_tensor_batch.get("multi_modal_inputs")
         )
         non_tensor_select_keys = []
-        # DPO Stage 1 pairing: pass sample index for prompt grouping
-        if self.config.policy_loss.get("dpo_stage1_pair", False) and "index" in data.non_tensor_batch:
+        # DPO prompt grouping: "index" (dataset row id, shared by a prompt's
+        # rollouts) is the outer key that makes (index, dpo_pair_id) globally
+        # unique. Needed both for Stage 1 3-way pairing AND for regrouping
+        # micro-batches so a (chosen, rejected) pair lands in one forward.
+        if (self.config.policy_loss.get("dpo_stage1_pair", False) or dpo_active) and "index" in data.non_tensor_batch:
             non_tensor_select_keys.append("index")
         if has_multi_modal_inputs:
             non_tensor_select_keys.append("multi_modal_inputs")
@@ -1093,6 +1104,23 @@ class DataParallelPPOActor(BasePPOActor):
             non_tensor_select_keys.append("uid")
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
+
+        # On-policy DPO needs each prompt's (chosen, rejected) sibling pairs to
+        # stay inside a single mini-batch (and later a single micro-batch) so
+        # the pairwise loss can be formed. balance_batch (trainer-side) reorders
+        # rows to balance token load and can scatter a prompt's rollouts across
+        # mini-batch boundaries. Regroup rows by "index" (dataset row id shared
+        # by a prompt's rollouts) so each prompt is contiguous; with
+        # ppo_mini_batch_size a multiple of rollout.n each mini-batch then holds
+        # whole prompts. No-op for non-DPO runs.
+        if (dpo_active and "index" in data.non_tensor_batch
+                and "is_two_stage_stage1" in data.batch.keys()):
+            _idx_arr = data.non_tensor_batch["index"]
+            _groups: dict = {}
+            for _i in range(len(_idx_arr)):
+                _groups.setdefault(_idx_arr[_i], []).append(_i)
+            _order = [i for g in _groups.values() for i in g]
+            data.reorder(torch.tensor(_order, dtype=torch.long))
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
@@ -1107,9 +1135,32 @@ class DataParallelPPOActor(BasePPOActor):
         did_update = False
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
+                # On-policy DPO needs a (chosen, rejected) sibling pair in the
+                # SAME forward pass to form the pairwise loss. With the default
+                # ppo_micro_batch_size_per_gpu=1 the two siblings land in
+                # separate size-1 micro-batches, so the loss never saw >=2
+                # Stage 2 samples and silently fell back to pg_loss (GRPO) —
+                # dpo_n_pairs was 0 in every run. When DPO is active we instead
+                # group each prompt's samples (keyed by "index") into one
+                # micro-batch so all its pairs are co-located. use_remove_padding
+                # packs to real tokens, so a per-prompt group stays cheap.
+                dpo_regroup = (
+                    dpo_active
+                    and not self.config.use_dynamic_bsz
+                    and "is_two_stage_stage1" in mini_batch.batch.keys()
+                    and "index" in mini_batch.non_tensor_batch
+                )
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
+                elif dpo_regroup:
+                    index_arr = mini_batch.non_tensor_batch["index"]
+                    groups: dict = {}
+                    for i in range(len(index_arr)):
+                        groups.setdefault(index_arr[i], []).append(i)
+                    micro_batches = [mini_batch.select_idxs(idxs) for idxs in groups.values()]
+                    # Average the per-prompt losses across the mini-batch.
+                    self.gradient_accumulation = max(1, len(micro_batches))
                 else:
                     self.gradient_accumulation = (
                         self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
@@ -1301,6 +1352,8 @@ class DataParallelPPOActor(BasePPOActor):
                                 dpo_stage1_pair=self.config.policy_loss.get("dpo_stage1_pair", False),
                                 stage1_pair_weight=self.config.policy_loss.get("dpo_stage1_pair_weight", 1.0),
                                 sample_index=model_inputs.get("index", None),
+                                dpo_pair_id=model_inputs.get("dpo_pair_id", None),
+                                dpo_role=model_inputs.get("dpo_role", None),
                             )
                             policy_loss = dpo_loss
                             micro_batch_metrics.update(dpo_metrics)

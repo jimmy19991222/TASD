@@ -670,6 +670,47 @@ class BranchingAgentLoop(AgentLoopBase):
 
         # Combine: [stage1_outputs..., branched_outputs...]
         all_outputs = stage1_outputs + branched_outputs
+
+        # --- DPO pairing metadata -------------------------------------------
+        # The on-policy DPO loss needs each teacher-branched (chosen, rejected)
+        # sibling pair identified by a STABLE key that survives batch reordering
+        # (balance_batch) and size-1 micro-batching in dp_actor. Without this,
+        # the loss fell back to the fragile "consecutive order" assumption and,
+        # combined with ppo_micro_batch_size_per_gpu=1, never found >=2 Stage 2
+        # samples in a single forward — so DPO never engaged (dpo_n_pairs=0).
+        #
+        # We tag here, at rollout time, where the leaf ordering is still clean:
+        #   dpo_pair_id : per-prompt-local pair index shared by the two siblings
+        #                 (-1 for Stage 1 / fallback / unpaired leaves).
+        #   dpo_role    : 0 = chosen (teacher-preferred), 1 = rejected, -1 else.
+        # (uid, dpo_pair_id) is globally unique across the training batch.
+        #
+        # A leaf is a valid pair member iff it carries teacher branch logprobs
+        # (set only by a real split in _flatten_tree_to_leaves) and is not a
+        # padding/fallback rollout. Role is derived from the leaf's own teacher
+        # logprobs (branch vs sibling), so it is independent of list order.
+        for o in all_outputs:
+            o.extra_fields.setdefault("dpo_pair_id", -1)
+            o.extra_fields.setdefault("dpo_role", -1)
+        valid_stage2 = [
+            o for o in branched_outputs
+            if o.extra_fields.get("teacher_branch_logprob") is not None
+            and int(o.extra_fields.get("is_branching_fallback", 0)) == 0
+            and int(o.extra_fields.get("is_two_stage_stage1", 0)) == 0
+        ]
+        for pair_idx in range(len(valid_stage2) // 2):
+            a = valid_stage2[2 * pair_idx]
+            b = valid_stage2[2 * pair_idx + 1]
+            for o in (a, b):
+                tb = o.extra_fields.get("teacher_branch_logprob")
+                ts = o.extra_fields.get("teacher_sibling_logprob")
+                o.extra_fields["dpo_pair_id"] = pair_idx
+                o.extra_fields["dpo_role"] = 0 if (ts is None or tb >= ts) else 1
+            # Guard: if teacher logprobs made both siblings the same role
+            # (degenerate/tied margin), force the second to the opposite role so
+            # the pair still has exactly one chosen + one rejected.
+            if a.extra_fields["dpo_role"] == b.extra_fields["dpo_role"]:
+                b.extra_fields["dpo_role"] = 1 - a.extra_fields["dpo_role"]
         return all_outputs
 
     async def _generate_one_stage1_rollout(
