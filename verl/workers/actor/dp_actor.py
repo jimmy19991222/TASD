@@ -1053,8 +1053,27 @@ class DataParallelPPOActor(BasePPOActor):
                     # per-micro-batch averaged.
                     dpo_coeff = model_inputs.get("dpo_coeff", None)
                     if dpo_coeff is not None and "branch_token_mask" in model_inputs:
+                        # Apply the same branch_token_loss_mode mask to DPO's
+                        # suffix_avg_logp so PG loss and DPO loss are consistent
+                        # about which tokens carry gradient.
+                        btm = self.config.policy_loss.get("branch_token_loss_mode", "all")
+                        btm_mask = model_inputs["branch_token_mask"]
+                        if btm == "mask" and btm_mask is not None:
+                            dpo_eff_mask = response_mask * (1 - btm_mask.to(response_mask.dtype))
+                        elif btm == "only" and btm_mask is not None:
+                            dpo_eff_mask = response_mask * btm_mask.to(response_mask.dtype)
+                        else:
+                            dpo_eff_mask = response_mask
+                        # For branching-fallback rows, override to full response_mask
+                        # (same logic as _apply_branch_loss_mode for PG loss).
+                        is_branching_fallback = model_inputs.get("is_branching_fallback", None)
+                        if is_branching_fallback is not None and is_branching_fallback.numel() > 0 and btm != "all":
+                            ifb = is_branching_fallback.to(response_mask.device).to(response_mask.dtype)
+                            ifb_row = ifb.view(-1, *([1] * (response_mask.dim() - 1)))
+                            dpo_eff_mask = ifb_row * response_mask + (1.0 - ifb_row) * dpo_eff_mask
+
                         avg_logp_cur, _ = suffix_avg_logp(
-                            log_prob, model_inputs["branch_token_mask"], response_mask
+                            log_prob, model_inputs["branch_token_mask"], dpo_eff_mask
                         )
                         dpo_term = (dpo_coeff * avg_logp_cur).sum()
                         n_pairs = dpo_pairs_in_mini if dpo_pairs_in_mini is not None else 1.0

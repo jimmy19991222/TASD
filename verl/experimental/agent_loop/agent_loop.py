@@ -206,6 +206,10 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     dpo_role: Optional[torch.Tensor] = None
     """Per-row LongTensor [1]; 0 = chosen (teacher-preferred), 1 = rejected,
     -1 = not a DPO pair member."""
+    tree_idx: Optional[torch.Tensor] = None
+    """Per-row LongTensor [1]; which tree this rollout belongs to in two-stage
+    branching. Stage1[i] and all Stage2 leaves of tree[i] share tree_idx=i.
+    Used by DPO stage1_pair to match stage1 mid-anchor per tree."""
     multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None
     """Multi-modal inputs for processors (e.g., pixel_values, image_grid_thw)."""
     extra_fields: dict[str, Any] = {}
@@ -759,6 +763,7 @@ class AgentLoopWorker:
         teacher_sibling_logprob = None
         dpo_pair_id = None
         dpo_role = None
+        tree_idx = None
         if output.extra_fields:
             _is_s1 = output.extra_fields.get("is_two_stage_stage1", None)
             if _is_s1 is not None:
@@ -769,6 +774,9 @@ class AgentLoopWorker:
             _role = output.extra_fields.get("dpo_role", None)
             if _role is not None:
                 dpo_role = torch.tensor([int(_role)], dtype=torch.long)
+            _tree_idx = output.extra_fields.get("tree_idx", None)
+            if _tree_idx is not None:
+                tree_idx = torch.tensor([int(_tree_idx)], dtype=torch.long)
             _leaf_id = output.extra_fields.get("leaf_id", None)
             if _leaf_id is not None:
                 leaf_id = torch.tensor([int(_leaf_id)], dtype=torch.long)
@@ -836,6 +844,7 @@ class AgentLoopWorker:
             teacher_sibling_logprob=teacher_sibling_logprob,
             dpo_pair_id=dpo_pair_id,
             dpo_role=dpo_role,
+            tree_idx=tree_idx,
             multi_modal_inputs=multi_modal_inputs,
             multi_modal_data=output.multi_modal_data,
             reward_score=output.reward_score,
@@ -965,6 +974,7 @@ class AgentLoopWorker:
             tslp_chunks = []
             pid_chunks = []
             role_chunks = []
+            tidx_chunks = []
             for input in inputs:
                 if input.branch_token_mask is not None:
                     btm_chunks.append(input.branch_token_mask)
@@ -1003,6 +1013,11 @@ class AgentLoopWorker:
                     role_chunks.append(input.dpo_role)
                 else:
                     role_chunks.append(torch.full((1,), -1, dtype=torch.long))
+                # tree_idx: -1 sentinel for non-two-stage rows
+                if getattr(input, "tree_idx", None) is not None:
+                    tidx_chunks.append(input.tree_idx)
+                else:
+                    tidx_chunks.append(torch.full((1,), -1, dtype=torch.long))
             optional_outputs["branch_token_mask"] = torch.cat(btm_chunks, dim=0)
             optional_outputs["is_branching_fallback"] = torch.cat(ifb_chunks, dim=0)
             optional_outputs["is_two_stage_stage1"] = torch.cat(s1_chunks, dim=0)
@@ -1011,6 +1026,7 @@ class AgentLoopWorker:
             optional_outputs["teacher_sibling_logprob"] = torch.cat(tslp_chunks, dim=0)
             optional_outputs["dpo_pair_id"] = torch.cat(pid_chunks, dim=0)
             optional_outputs["dpo_role"] = torch.cat(role_chunks, dim=0)
+            optional_outputs["tree_idx"] = torch.cat(tidx_chunks, dim=0)
 
         batch = TensorDict(
             {

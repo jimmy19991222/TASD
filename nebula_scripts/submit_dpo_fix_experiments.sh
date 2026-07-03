@@ -71,7 +71,7 @@ _branch() {
     echo "--env=BRANCHING_ENABLED=True --env=TOP_K=${TK} --env=TEACHER_TOP_K=${TTK} --env=ENTROPY_WINDOW=${EW} --env=ENTROPY_SIGMA_START=${ESS} --env=ENTROPY_SIGMA_FLOOR=${ESF} --env=ENTROPY_SIGMA_STEP=${EST} --env=TEACHER_CONTEXT_MODE=${TCM} --env=ADV_STD_FLOOR=${ASF}"
 }
 _dpo() {
-    echo "--env=TWO_STAGE=True --env=STAGE1_N=4 --env=N_SPLITS=1 --env=N_TREES=2 --env=BRANCH_TOKEN_LOSS_MODE=suffix --env=TWO_STAGE_TEACHER_MODE=ref_or_marker --env=SUCCESS_THRESHOLD=0.3 --env=DPO_COEFFICIENT=${BETA} --env=DPO_USE_REF=True --env=ENTROPY_COEFF=0 --env=DPO_STAGE1_PAIR=$1 --env=STAGE1_PAIR_WEIGHT=1.0"
+    echo "--env=TWO_STAGE=True --env=STAGE1_N=4 --env=N_SPLITS=1 --env=N_TREES=4 --env=BRANCH_TOKEN_LOSS_MODE=suffix --env=TWO_STAGE_TEACHER_MODE=ref_or_marker --env=SUCCESS_THRESHOLD=0.3 --env=DPO_COEFFICIENT=${BETA} --env=DPO_USE_REF=True --env=ENTROPY_COEFF=0 --env=DPO_STAGE1_PAIR=$1 --env=STAGE1_PAIR_WEIGHT=1.0"
 }
 
 DS="nebula_scripts/grpo/grpo_branching_sciknoweval_parametric.sh"

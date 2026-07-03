@@ -200,9 +200,26 @@ def compute_dpo_sample_coeffs(batch, policy_loss_cfg):
 
     # avg logprob over suffix (ref-adjusted) for ALL samples, from behavior policy.
     avg_logp, suffix_mask = suffix_avg_logp(old_log_probs, branch_token_mask, response_mask)
+
+    # Fix: Stage-1 samples have no meaningful branch point; their suffix_mask
+    # should cover the full response. When branch_token_mask is all-zero for a
+    # Stage-1 row, suffix_avg_logp happens to give the correct result (last_branch_pos
+    # = -1 → suffix covers everything). But if a Stage-1 row carries any residual
+    # branch_token_mask bits (e.g., from padding reuse), we explicitly override with
+    # the full response_mask to guarantee correctness.
+    is_s1 = is_two_stage_stage1.bool()
+    if is_s1.any():
+        s1_logp = (old_log_probs * response_mask).sum(dim=1) / response_mask.sum(dim=1).clamp_min(1.0)
+        avg_logp = torch.where(is_s1, s1_logp, avg_logp)
+
     ref_avg_logp = None
     if ref_log_prob is not None:
-        ref_avg_logp = (ref_log_prob * suffix_mask).sum(dim=1) / suffix_mask.sum(dim=1).clamp_min(1.0)
+        ref_avg_logp_base = (ref_log_prob * suffix_mask).sum(dim=1) / suffix_mask.sum(dim=1).clamp_min(1.0)
+        if is_s1.any():
+            ref_s1_logp = (ref_log_prob * response_mask).sum(dim=1) / response_mask.sum(dim=1).clamp_min(1.0)
+            ref_avg_logp = torch.where(is_s1, ref_s1_logp, ref_avg_logp_base)
+        else:
+            ref_avg_logp = ref_avg_logp_base
 
     def adj(i):
         # ref-adjusted suffix-avg logp of sample i (scalar tensor)
@@ -237,6 +254,12 @@ def compute_dpo_sample_coeffs(batch, policy_loss_cfg):
             c_i, r_i = roles[0], roles[1]
             if seq_reward is not None and float(seq_reward[c_i]) < float(seq_reward[r_i]):
                 n_reward_filtered += 1
+                # Explicitly zero coeff and pair_member for filtered pairs so that
+                # actor-side normalization (pair_member.sum()/2) is never inflated.
+                coeff[c_i] = 0.0
+                coeff[r_i] = 0.0
+                pair_member[c_i] = 0.0
+                pair_member[r_i] = 0.0
                 continue  # chosen scored worse than rejected -> drop this pair
             chosen_pos.append(c_i)
             rejected_pos.append(r_i)
@@ -280,18 +303,35 @@ def compute_dpo_sample_coeffs(batch, policy_loss_cfg):
     # ---- Stage-1 3-way ranking (argmax > mid > argmin), same per-sample treatment ----
     # In two-stage branching every prompt has Stage-1 rollouts, so n_s1 == P and the
     # actor's /pairs normalization reproduces the original per-term means.
+    # Bug-fix (2026-07-03): stage1_rep is now a (uid, tree_idx) → i mapping so each
+    # DPO pair uses the stage1 mid-anchor from its OWN tree, not a shared first-seen.
     if stage1_pair and uid is not None:
-        stage1_rep: dict = {}
+        batch_tree_idx = tb.get("tree_idx")  # [B] LongTensor, -1 if absent
+        stage1_rep: dict = {}  # (uid_str, tree_idx_int) -> batch index i
         for i in range(B):
             if int(is_two_stage_stage1[i].item()) == 1:
-                key = str(uid[i])
-                if key not in stage1_rep:
-                    stage1_rep[key] = i  # first Stage-1 rollout = "middle" anchor
+                uid_key = str(uid[i])
+                ti = int(batch_tree_idx[i].item()) if batch_tree_idx is not None else 0
+                rep_key = (uid_key, ti)
+                if rep_key not in stage1_rep:
+                    stage1_rep[rep_key] = i
         s1_units = []  # (argmax_i, mid_i, argmin_i)
         for c_i, r_i in zip(chosen_pos, rejected_pos):
-            key = str(uid[c_i])
-            if key in stage1_rep:
-                s1_units.append((c_i, stage1_rep[key], r_i))
+            uid_key = str(uid[c_i])
+            # Determine tree_idx for this DPO pair from chosen sample
+            ti = int(batch_tree_idx[c_i].item()) if batch_tree_idx is not None else 0
+            rep_key = (uid_key, ti)
+            if rep_key in stage1_rep:
+                s1_units.append((c_i, stage1_rep[rep_key], r_i))
+            else:
+                # Fallback: try any stage1 for this uid (backward compat)
+                fallback_mid = None
+                for k, v in stage1_rep.items():
+                    if k[0] == uid_key:
+                        fallback_mid = v
+                        break
+                if fallback_mid is not None:
+                    s1_units.append((c_i, fallback_mid, r_i))
         n_s1 = len(s1_units)
         if n_s1 > 0:
             for amax, mid, amin in s1_units:

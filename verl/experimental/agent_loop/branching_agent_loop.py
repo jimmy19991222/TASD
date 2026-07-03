@@ -180,7 +180,17 @@ class BranchingAgentLoop(AgentLoopBase):
     @property
     def n_trees(self) -> int:
         n = int(self.branching_cfg.get("n_trees", 1) or 1)
-        return max(1, n)
+        n = max(1, n)
+        # In two-stage mode, n_trees must equal stage1_n so each tree gets
+        # its own stage1 rollout as privileged context. Warn + auto-correct.
+        if self._two_stage and n != self._stage1_n:
+            logger.warning(
+                "n_trees=%d != stage1_n=%d in two-stage mode. "
+                "Forcing n_trees = stage1_n = %d to avoid wasted rollouts.",
+                n, self._stage1_n, self._stage1_n,
+            )
+            n = self._stage1_n
+        return n
 
     @property
     def n_leaves_total(self) -> int:
@@ -552,6 +562,11 @@ class BranchingAgentLoop(AgentLoopBase):
         Stage 2: build teacher context (ref or marker) → branching
         Returns stage1_n + n_trees*n_leaves outputs.
 
+        Bug-fix (2026-07-03): Each tree[i] now uses stage1[i] as its own
+        privileged context (1:1 mapping) instead of all trees sharing the
+        first successful stage1. If stage1[i] fails (below threshold), the
+        tree falls back to any successful stage1, or static marker.
+
         Streaming optimisation (2026-07-02): Stage 1 rollouts are processed as
         they complete (``asyncio.as_completed``). Each rollout is scored
         immediately upon arrival; the FIRST rollout that meets the success
@@ -562,6 +577,7 @@ class BranchingAgentLoop(AgentLoopBase):
         """
         cfg = self.branching_cfg
         stage1_n = self._stage1_n
+        n_trees = self.n_trees  # == stage1_n after the property auto-correction
         two_stage_teacher_mode = str(cfg.get("two_stage_teacher_mode", "ref_or_marker"))
 
         # --- Stage 1: Normal student rollouts (streaming) ---
@@ -582,21 +598,24 @@ class BranchingAgentLoop(AgentLoopBase):
 
         score_fn = kwargs.get("score_fn")
         threshold = float(cfg.get("success_reward_threshold", 1.0))
-        successful_response_text: Optional[str] = None
-        stage1_outputs: list[AgentLoopOutput] = []
+        # Per-stage1 scoring: track which indices succeeded
+        stage1_outputs: list[AgentLoopOutput] = [None] * stage1_n  # type: ignore[list-item]
+        stage1_scores: list[Optional[float]] = [None] * stage1_n
+        stage1_response_texts: list[Optional[str]] = [None] * stage1_n
+        first_success_event = asyncio.Event()
+        first_success_idx: Optional[int] = None
 
-        # Score each rollout as it completes. Once the FIRST rollout meets
-        # the success threshold, break immediately and start Stage 2 —
-        # remaining Stage 1 tasks continue running in the background.
+        # Score each rollout as it completes. Track per-index results so we
+        # can map tree[i] -> stage1[i] later.
         for done in asyncio.as_completed(stage1_tasks):
             try:
                 out = await done
             except Exception:  # noqa: BLE001
                 continue
-            stage1_outputs.append(out)
+            idx = int(out.extra_fields.get("leaf_id", 0))
+            stage1_outputs[idx] = out
             if (
-                successful_response_text is None
-                and two_stage_teacher_mode == "ref_or_marker"
+                two_stage_teacher_mode == "ref_or_marker"
                 and score_fn is not None
             ):
                 s = await score_fn(
@@ -604,51 +623,18 @@ class BranchingAgentLoop(AgentLoopBase):
                     response_ids=out.response_ids,
                     raw_prompt=kwargs.get("raw_prompt", []),
                 )
+                stage1_scores[idx] = s
                 if s >= threshold:
-                    successful_response_text = self.tokenizer.decode(
+                    stage1_response_texts[idx] = self.tokenizer.decode(
                         out.response_ids, skip_special_tokens=True,
                     )
-                    # Success found — stop waiting for remaining Stage 1
-                    # rollouts. They continue running as background tasks
-                    # and are collected via asyncio.gather below.
-                    break
-
-        # --- Build privileged context for branching ---
-        if successful_response_text:
-            priv_ctx_ids, priv_ctx_meta = await self._build_ref_privileged_context(
-                prompt_ids=prompt_ids,
-                successful_response_text=successful_response_text,
-                kwargs=kwargs,
-                images=images,
-                videos=videos,
-            )
-        else:
-            # Fallback to static marker (no ground_truth dependency)
-            priv_ctx_ids, priv_ctx_meta = await self._build_privileged_context(
-                prompt_ids=prompt_ids, kwargs=kwargs, images=images, videos=videos,
-            )
-
-        # --- Stage 2: Branching (overlaps with remaining Stage 1 tail) ---
-        # Stage 2 starts immediately while any not-yet-completed Stage 1
-        # tasks finish in the background. vLLM's continuous batching handles
-        # concurrent requests without deadlock.
-        stage2_coros = [
-            self._run_branching_with_priv_ctx(
-                prompt_ids=prompt_ids,
-                sampling_params=sampling_params,
-                images=images,
-                videos=videos,
-                multi_modal_data=multi_modal_data,
-                kwargs=kwargs,
-                tree_idx=tree_idx,
-                priv_ctx_ids=priv_ctx_ids,
-                priv_ctx_meta=priv_ctx_meta,
-            )
-            for tree_idx in range(self.n_trees)
-        ]
-        stage2_task = asyncio.ensure_future(
-            asyncio.gather(*stage2_coros, return_exceptions=True)
-        )
+                    if first_success_idx is None:
+                        first_success_idx = idx
+                        first_success_event.set()
+                        # Don't break — continue scoring remaining to get
+                        # per-tree privileged context, but start Stage 2 early
+                        # via the event.
+                        break
 
         # Collect remaining Stage 1 outputs that were still running when we
         # broke out of the as_completed loop.
@@ -656,20 +642,88 @@ class BranchingAgentLoop(AgentLoopBase):
         if remaining:
             remaining_results = await asyncio.gather(*remaining, return_exceptions=True)
             for r in remaining_results:
-                if not isinstance(r, BaseException):
-                    stage1_outputs.append(r)
+                if isinstance(r, BaseException):
+                    continue
+                idx = int(r.extra_fields.get("leaf_id", 0))
+                stage1_outputs[idx] = r
+                # Score remaining if we need per-tree contexts
+                if (
+                    two_stage_teacher_mode == "ref_or_marker"
+                    and score_fn is not None
+                    and stage1_scores[idx] is None
+                ):
+                    s = await score_fn(
+                        prompt_ids=r.prompt_ids,
+                        response_ids=r.response_ids,
+                        raw_prompt=kwargs.get("raw_prompt", []),
+                    )
+                    stage1_scores[idx] = s
+                    if s >= threshold:
+                        stage1_response_texts[idx] = self.tokenizer.decode(
+                            r.response_ids, skip_special_tokens=True,
+                        )
+                        if first_success_idx is None:
+                            first_success_idx = idx
 
-        # Await Stage 2 branching results (may already be done if Stage 1
-        # tail was slower than Stage 2).
+        # --- Build per-tree privileged contexts ---
+        # Each tree[i] uses stage1[i] if it succeeded, else falls back to any
+        # successful stage1 (preferring first_success_idx), else static marker.
+        fallback_success_text: Optional[str] = None
+        if first_success_idx is not None:
+            fallback_success_text = stage1_response_texts[first_success_idx]
+
+        async def _build_priv_ctx_for_tree(tree_i: int):
+            """Build privileged context for tree_i using stage1[tree_i] if successful."""
+            text = stage1_response_texts[tree_i] if tree_i < len(stage1_response_texts) else None
+            if text is None:
+                text = fallback_success_text  # fallback to any success
+            if text is not None:
+                return await self._build_ref_privileged_context(
+                    prompt_ids=prompt_ids,
+                    successful_response_text=text,
+                    kwargs=kwargs,
+                    images=images,
+                    videos=videos,
+                )
+            else:
+                # No successful stage1 at all — fallback to static marker
+                return await self._build_privileged_context(
+                    prompt_ids=prompt_ids, kwargs=kwargs, images=images, videos=videos,
+                )
+
+        # --- Stage 2: Branching with per-tree privileged context ---
+        async def _stage2_for_tree(tree_i: int) -> list[AgentLoopOutput]:
+            priv_ctx_ids, priv_ctx_meta = await _build_priv_ctx_for_tree(tree_i)
+            leaves = await self._run_branching_with_priv_ctx(
+                prompt_ids=prompt_ids,
+                sampling_params=sampling_params,
+                images=images,
+                videos=videos,
+                multi_modal_data=multi_modal_data,
+                kwargs=kwargs,
+                tree_idx=tree_i,
+                priv_ctx_ids=priv_ctx_ids,
+                priv_ctx_meta=priv_ctx_meta,
+            )
+            return leaves
+
+        stage2_coros = [_stage2_for_tree(ti) for ti in range(n_trees)]
+        stage2_task = asyncio.ensure_future(
+            asyncio.gather(*stage2_coros, return_exceptions=True)
+        )
+
+        # Await Stage 2 branching results.
         branched_trees = await stage2_task
         branched_outputs: list[AgentLoopOutput] = []
-        for tree_leaves in branched_trees:
+        for tree_idx, tree_leaves in enumerate(branched_trees):
             if isinstance(tree_leaves, BaseException):
                 continue
             branched_outputs.extend(tree_leaves)
 
         # Combine: [stage1_outputs..., branched_outputs...]
-        all_outputs = stage1_outputs + branched_outputs
+        # Filter out None entries (failed stage1 rollouts).
+        valid_stage1 = [o for o in stage1_outputs if o is not None]
+        all_outputs = valid_stage1 + branched_outputs
 
         # --- DPO pairing metadata -------------------------------------------
         # The on-policy DPO loss needs each teacher-branched (chosen, rejected)
@@ -698,19 +752,38 @@ class BranchingAgentLoop(AgentLoopBase):
             and int(o.extra_fields.get("is_branching_fallback", 0)) == 0
             and int(o.extra_fields.get("is_two_stage_stage1", 0)) == 0
         ]
-        for pair_idx in range(len(valid_stage2) // 2):
-            a = valid_stage2[2 * pair_idx]
-            b = valid_stage2[2 * pair_idx + 1]
-            for o in (a, b):
-                tb = o.extra_fields.get("teacher_branch_logprob")
-                ts = o.extra_fields.get("teacher_sibling_logprob")
-                o.extra_fields["dpo_pair_id"] = pair_idx
-                o.extra_fields["dpo_role"] = 0 if (ts is None or tb >= ts) else 1
-            # Guard: if teacher logprobs made both siblings the same role
-            # (degenerate/tied margin), force the second to the opposite role so
-            # the pair still has exactly one chosen + one rejected.
-            if a.extra_fields["dpo_role"] == b.extra_fields["dpo_role"]:
-                b.extra_fields["dpo_role"] = 1 - a.extra_fields["dpo_role"]
+        # Group by tree_idx before pairing to avoid cross-tree mismatch when
+        # n_trees > 1. Without this, flat iteration pairs tree_0 leaves with
+        # tree_1 leaves — completely wrong chosen/rejected labels.
+        from collections import defaultdict as _defaultdict
+        by_tree: dict[int, list] = _defaultdict(list)
+        for o in valid_stage2:
+            tree_idx_val = int(o.extra_fields.get("tree_idx", 0))
+            by_tree[tree_idx_val].append(o)
+
+        global_pair_id = 0
+        for _ti in sorted(by_tree.keys()):
+            leaves = by_tree[_ti]
+            if len(leaves) % 2 != 0:
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"tree_idx={_ti}: odd number of valid stage2 leaves ({len(leaves)}), "
+                    f"last leaf will be unpaired."
+                )
+            for pair_idx in range(len(leaves) // 2):
+                a = leaves[2 * pair_idx]
+                b = leaves[2 * pair_idx + 1]
+                for o in (a, b):
+                    tb = o.extra_fields.get("teacher_branch_logprob")
+                    ts = o.extra_fields.get("teacher_sibling_logprob")
+                    o.extra_fields["dpo_pair_id"] = global_pair_id
+                    o.extra_fields["dpo_role"] = 0 if (ts is None or tb >= ts) else 1
+                # Guard: if teacher logprobs made both siblings the same role
+                # (degenerate/tied margin), force the second to the opposite role so
+                # the pair still has exactly one chosen + one rejected.
+                if a.extra_fields["dpo_role"] == b.extra_fields["dpo_role"]:
+                    b.extra_fields["dpo_role"] = 1 - a.extra_fields["dpo_role"]
+                global_pair_id += 1
         return all_outputs
 
     async def _generate_one_stage1_rollout(
@@ -785,6 +858,7 @@ class BranchingAgentLoop(AgentLoopBase):
                 "is_two_stage_stage1": 1,
                 "leaf_id": idx,
                 "leaf_depth": 0,
+                "tree_idx": idx,  # stage1[i] maps to tree[i]
                 "branching_diag": {},
                 "priv_ctx_meta": {},
                 "branching_fallback": "",
@@ -1014,6 +1088,9 @@ class BranchingAgentLoop(AgentLoopBase):
             videos=videos,
             tree_idx=int(tree_idx),
         )
+        # Tag tree_idx on each leaf so trainer can match stage1[i] <-> tree[i]
+        for leaf in leaves:
+            leaf.extra_fields["tree_idx"] = int(tree_idx)
         return leaves
 
     # ------------------------------------------------------------------
