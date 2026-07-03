@@ -54,7 +54,14 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
-from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
+from verl.trainer.ppo.utils import (
+    Role,
+    WorkerType,
+    compute_dpo_sample_coeffs,
+    need_critic,
+    need_reference_policy,
+    need_reward_model,
+)
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
@@ -2092,6 +2099,22 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+
+                    # Branching DPO: pair on the full driver-side batch and emit a
+                    # per-sample coefficient, so the actor's DPO loss becomes a
+                    # per-sample weighted-logp sum (no cross-rank pair co-location
+                    # needed). See compute_dpo_sample_coeffs for the derivation.
+                    dpo_coefficient = float(
+                        self.config.actor_rollout_ref.actor.policy_loss.get("dpo_coefficient", 0.0)
+                    )
+                    if dpo_coefficient > 0 and "is_two_stage_stage1" in batch.batch:
+                        dpo_coeff, dpo_pair_member, dpo_coeff_metrics = compute_dpo_sample_coeffs(
+                            batch, self.config.actor_rollout_ref.actor.policy_loss
+                        )
+                        if dpo_coeff is not None:
+                            batch.batch["dpo_coeff"] = dpo_coeff
+                            batch.batch["dpo_pair_member"] = dpo_pair_member
+                            metrics.update(dpo_coeff_metrics)
 
                     # update critic
                     if self.use_critic:

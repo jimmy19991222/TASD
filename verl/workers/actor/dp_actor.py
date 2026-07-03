@@ -30,6 +30,7 @@ from torch.distributed.tensor import DTensor
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, compute_self_distillation_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.utils import suffix_avg_logp
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -654,259 +655,6 @@ class DataParallelPPOActor(BasePPOActor):
                 metrics["branching/fallback_row_count"] = int(ifb.sum().item())
         return effective, metrics
 
-    def _compute_on_policy_dpo_loss(
-        self,
-        log_prob: torch.Tensor,
-        response_mask: torch.Tensor,
-        branch_token_mask: torch.Tensor,
-        is_two_stage_stage1: torch.Tensor,
-        dpo_beta: float,
-        ref_log_prob: torch.Tensor | None = None,
-        teacher_branch_logprob: torch.Tensor | None = None,
-        teacher_sibling_logprob: torch.Tensor | None = None,
-        teacher_guided_beta: bool = False,
-        teacher_beta_alpha: float = 1.0,
-        teacher_beta_min: float = 0.1,
-        teacher_beta_max: float = 3.0,
-        dpo_stage1_pair: bool = False,
-        stage1_pair_weight: float = 1.0,
-        sample_index: torch.Tensor | None = None,
-        dpo_pair_id: torch.Tensor | None = None,
-        dpo_role: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
-        """On-policy DPO loss for Stage 2 pos/neg branch pairs.
-
-        For each pair of samples from the same branch point, computes:
-            L_DPO = -log σ(β × (avg_logp_chosen - avg_logp_rejected))
-
-        where avg_logp is the mean logprob over suffix tokens (after branch point).
-
-        When dpo_stage1_pair is True, also constructs 3-way ranking pairs using
-        Stage 1 student chains as the "middle" version:
-            L_S1 = -log σ(β × (avg_logp_argmax - avg_logp_stage1))
-                 + -log σ(β × (avg_logp_stage1 - avg_logp_argmin))
-
-        Stage 2 (chosen, rejected) siblings are paired via the stable
-        (sample_index, dpo_pair_id) key + dpo_role (0=chosen, 1=rejected), which
-        is robust to batch reordering. If that metadata is absent we fall back to
-        the legacy assumption that Stage 2 samples are consecutive [pos, neg].
-
-        Args:
-            log_prob: [B, T] current policy logprobs
-            response_mask: [B, T] valid token mask
-            branch_token_mask: [B, T] marks branch positions
-            is_two_stage_stage1: [B] 1 for Stage 1, 0 for Stage 2
-            dpo_beta: temperature parameter β
-            ref_log_prob: [B, T] reference model logprobs (for with-ref DPO)
-            teacher_branch_logprob: [B] teacher logprob of this sample's branch token
-            teacher_sibling_logprob: [B] teacher logprob of the sibling's branch token
-            teacher_guided_beta: whether to use teacher margin for adaptive β
-            teacher_beta_alpha: scaling factor for margin → β mapping
-            teacher_beta_min: minimum β multiplier (clamp lower bound)
-            teacher_beta_max: maximum β multiplier (clamp upper bound)
-            dpo_stage1_pair: whether to construct Stage 1 3-way pairs
-            stage1_pair_weight: weight for Stage 1 pair loss
-            sample_index: [B] prompt index for grouping Stage 1/Stage 2 samples
-            dpo_pair_id: [B] per-prompt-local id shared by a (chosen, rejected)
-                sibling pair; -1 for non-pair rows. With sample_index this keys
-                pairs robustly regardless of batch order.
-            dpo_role: [B] 0=chosen, 1=rejected, -1=not a pair member.
-
-        Returns:
-            (loss, metrics) tuple
-        """
-        T = log_prob.shape[1]
-        device = log_prob.device
-
-        # Identify Stage 2 samples (where DPO applies)
-        is_stage2 = (is_two_stage_stage1 == 0)
-        stage2_indices = torch.where(is_stage2)[0]
-
-        if len(stage2_indices) < 2:
-            # Not enough Stage 2 samples for pairing
-            return torch.tensor(0.0, device=device, requires_grad=True), {"actor/dpo_loss": 0.0, "actor/dpo_n_pairs": 0.0}
-
-        # Build suffix mask for each sample (tokens after last branch point)
-        # Suffix mask: 1 for positions > last_branch_pos, 0 otherwise
-        positions = torch.arange(T, device=device).unsqueeze(0)  # [1, T]
-        has_branch = branch_token_mask.any(dim=1)  # [B]
-        weighted = branch_token_mask * positions  # [B, T]
-        last_branch_pos = weighted.max(dim=1).values.long()  # [B]
-        last_branch_pos = torch.where(
-            has_branch, last_branch_pos,
-            torch.tensor(-1, device=device, dtype=last_branch_pos.dtype),
-        )
-        suffix_mask = (positions > last_branch_pos.unsqueeze(1)).to(log_prob.dtype)  # [B, T]
-
-        # Combine suffix mask with response mask
-        suffix_mask = suffix_mask * response_mask
-
-        # Compute average logprob over suffix for each Stage 2 sample
-        # avg_logp = sum(log_prob * suffix_mask) / sum(suffix_mask)
-        logp_sum = (log_prob * suffix_mask).sum(dim=1)  # [B]
-        suffix_len = suffix_mask.sum(dim=1).clamp_min(1.0)  # [B]
-        avg_logp = logp_sum / suffix_len  # [B]
-
-        # ---- Build (chosen, rejected) pairs from STABLE metadata ----------
-        # Each Stage 2 sibling pair shares a dpo_pair_id; dpo_role marks
-        # 0=chosen (teacher-preferred) / 1=rejected. This does NOT rely on the
-        # two siblings being consecutive in the batch (the old assumption, which
-        # broke once balance_batch shuffled rows and size-1 micro-batching split
-        # the pair apart). We also key by prompt (sample_index, a uid string)
-        # so per-prompt-local pair ids never collide if a micro-batch holds
-        # >1 prompt.
-        chosen_pos: list[int] = []
-        rejected_pos: list[int] = []
-        if dpo_pair_id is not None and dpo_role is not None:
-            from collections import defaultdict
-            pair_map: dict = defaultdict(dict)
-            for i in stage2_indices.tolist():
-                pid = int(dpo_pair_id[i].item())
-                role = int(dpo_role[i].item())
-                if pid < 0 or role < 0:
-                    continue
-                pkey = (str(sample_index[i]) if sample_index is not None else "0", pid)
-                pair_map[pkey][role] = i
-            for _pkey, roles in pair_map.items():
-                if 0 in roles and 1 in roles:
-                    chosen_pos.append(roles[0])
-                    rejected_pos.append(roles[1])
-        else:
-            # Legacy fallback: assume consecutive [chosen, rejected] ordering.
-            s2 = stage2_indices.tolist()
-            for p in range(len(s2) // 2):
-                chosen_pos.append(int(s2[2 * p]))
-                rejected_pos.append(int(s2[2 * p + 1]))
-
-        n_pairs = len(chosen_pos)
-        if n_pairs == 0:
-            return torch.tensor(0.0, device=device, requires_grad=True), {"actor/dpo_loss": 0.0, "actor/dpo_n_pairs": 0.0}
-
-        chosen_idx = torch.tensor(chosen_pos, device=device, dtype=torch.long)
-        rejected_idx = torch.tensor(rejected_pos, device=device, dtype=torch.long)
-        logp_chosen = avg_logp[chosen_idx]      # [n_pairs] — teacher-preferred branch
-        logp_rejected = avg_logp[rejected_idx]  # [n_pairs] — rejected branch
-
-        # With-ref DPO: subtract frozen reference model logprobs for KL constraint
-        ref_chosen = ref_rejected = None
-        if ref_log_prob is not None:
-            ref_logp_sum = (ref_log_prob * suffix_mask).sum(dim=1)
-            ref_avg_logp = ref_logp_sum / suffix_len
-            ref_chosen = ref_avg_logp[chosen_idx]
-            ref_rejected = ref_avg_logp[rejected_idx]
-            logp_chosen = logp_chosen - ref_chosen
-            logp_rejected = logp_rejected - ref_rejected
-
-        # Teacher-Guided β: margin_i = teacher_logp(chosen_tok) - teacher_logp(rejected_tok),
-        # read from the CHOSEN leaf whose branch lp = chosen token and sibling lp
-        # = rejected token. β_i = β_base · clamp(α · margin_i, β_min, β_max).
-        effective_beta = dpo_beta  # default: scalar β (fixed mode)
-        teacher_margin = None
-        if teacher_guided_beta and teacher_branch_logprob is not None and teacher_sibling_logprob is not None:
-            teacher_margin = (
-                teacher_branch_logprob[chosen_idx] - teacher_sibling_logprob[chosen_idx]
-            ).detach()  # [n_pairs]
-            effective_beta = dpo_beta * torch.clamp(
-                teacher_beta_alpha * teacher_margin,
-                min=teacher_beta_min,
-                max=teacher_beta_max,
-            )  # [n_pairs]
-
-        # DPO loss: -log σ(β * (logp_chosen - logp_rejected))
-        # effective_beta is either scalar (fixed mode) or [n_pairs] tensor (adaptive mode)
-        logits = effective_beta * (logp_chosen - logp_rejected)
-        dpo_loss = -torch.nn.functional.logsigmoid(logits).mean()
-
-        # Stage 1 middle-version DPO pairing: construct 3-way ranking pairs
-        # using Stage 1 student chains as the "middle" version between
-        # argmax (best) and argmin (worst).
-        stage1_pair_loss = None
-        n_s1_pairs = 0
-        if dpo_stage1_pair and sample_index is not None:
-            # Compute avg_logp for ALL samples (including Stage 1)
-            all_avg_logp = avg_logp  # already computed above for all B samples
-
-            # With-ref: compute ref avg_logp for all samples
-            all_ref_avg_logp = None
-            if ref_log_prob is not None:
-                ref_logp_sum_all = (ref_log_prob * suffix_mask).sum(dim=1)
-                all_ref_avg_logp = ref_logp_sum_all / suffix_len
-
-            # First Stage 1 rollout per prompt = the "middle" ranking anchor.
-            stage1_rep: dict = {}
-            for i in range(len(sample_index)):
-                if int(is_two_stage_stage1[i].item()) == 1:
-                    key = str(sample_index[i])
-                    if key not in stage1_rep:
-                        stage1_rep[key] = i
-
-            # Reuse the robust (chosen, rejected) pairs built above; anchor each
-            # to its prompt's Stage 1 representative for the 3-way ranking
-            # (argmax > stage1) and (stage1 > argmin).
-            s1_logp_best_list = []  # "best > middle" pairs
-            s1_logp_worst_list = []  # "middle > worst" pairs
-            for c_i, r_i in zip(chosen_pos, rejected_pos):
-                key = str(sample_index[c_i])
-                if key not in stage1_rep:
-                    continue
-                s1_idx = stage1_rep[key]
-                argmax_logp = all_avg_logp[c_i]
-                argmin_logp = all_avg_logp[r_i]
-                s1_logp_adj = all_avg_logp[s1_idx]
-                if all_ref_avg_logp is not None:
-                    argmax_logp = argmax_logp - all_ref_avg_logp[c_i]
-                    argmin_logp = argmin_logp - all_ref_avg_logp[r_i]
-                    s1_logp_adj = s1_logp_adj - all_ref_avg_logp[s1_idx]
-                s1_logp_best_list.append(argmax_logp - s1_logp_adj)
-                s1_logp_worst_list.append(s1_logp_adj - argmin_logp)
-
-            if s1_logp_best_list:
-                n_s1_pairs = len(s1_logp_best_list)
-                s1_logp_best = torch.stack(s1_logp_best_list)
-                s1_logp_worst = torch.stack(s1_logp_worst_list)
-
-                # Stage 1 pairs always use fixed β (no teacher margin available)
-                s1_logits_best = dpo_beta * s1_logp_best
-                s1_logits_worst = dpo_beta * s1_logp_worst
-
-                s1_loss_best = -torch.nn.functional.logsigmoid(s1_logits_best).mean()
-                s1_loss_worst = -torch.nn.functional.logsigmoid(s1_logits_worst).mean()
-                stage1_pair_loss = s1_loss_best + s1_loss_worst
-
-        # Total loss
-        total_loss = dpo_loss
-        if stage1_pair_loss is not None:
-            total_loss = dpo_loss + stage1_pair_weight * stage1_pair_loss
-
-        metrics = {
-            "actor/dpo_loss": dpo_loss.detach().item(),
-            "actor/dpo_n_pairs": float(n_pairs),
-            "actor/dpo_logp_chosen": logp_chosen.mean().detach().item(),
-            "actor/dpo_logp_rejected": logp_rejected.mean().detach().item(),
-            "actor/dpo_margin": (logp_chosen - logp_rejected).mean().detach().item(),
-        }
-        if ref_log_prob is not None:
-            metrics["actor/dpo_ref_chosen"] = ref_chosen.mean().detach().item()
-            metrics["actor/dpo_ref_rejected"] = ref_rejected.mean().detach().item()
-
-        # Stage 1 pairing metrics
-        if stage1_pair_loss is not None:
-            metrics["actor/dpo_stage1_pairs"] = float(n_s1_pairs)
-            metrics["actor/dpo_stage1_loss"] = stage1_pair_loss.detach().item()
-            metrics["actor/dpo_total_loss"] = total_loss.detach().item()
-
-        # Teacher-Guided β metrics
-        if teacher_guided_beta and teacher_margin is not None:
-            metrics["actor/dpo_teacher_margin_mean"] = teacher_margin.mean().item()
-            metrics["actor/dpo_teacher_margin_std"] = teacher_margin.std().item()
-            metrics["actor/dpo_beta_effective_mean"] = effective_beta.mean().item()
-            metrics["actor/dpo_beta_effective_min"] = effective_beta.min().item()
-            metrics["actor/dpo_beta_effective_max"] = effective_beta.max().item()
-        else:
-            metrics["actor/dpo_beta_effective_mean"] = float(dpo_beta)
-
-        return total_loss, metrics
-
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
         if self.scaler is not None:
@@ -1079,10 +827,11 @@ class DataParallelPPOActor(BasePPOActor):
         # DPO: is_two_stage_stage1 identifies Stage 2 samples for DPO loss
         if "is_two_stage_stage1" in data.batch.keys():
             select_keys.append("is_two_stage_stage1")
-        # DPO pairing: (dpo_pair_id, dpo_role) is a stable chosen/rejected key
-        # that survives batch reordering; teacher_*_logprob feed teacher-guided β.
+        # DPO loss is now a per-sample weighted-logp sum: pairing + the per-sample
+        # coefficient (dpo_coeff) are computed centrally in the trainer, so the
+        # actor no longer needs the raw pairing metadata or cross-rank co-location.
         dpo_active = float(self.config.policy_loss.get("dpo_coefficient", 0.0)) > 0
-        for _k in ("dpo_pair_id", "dpo_role", "teacher_branch_logprob", "teacher_sibling_logprob"):
+        for _k in ("dpo_coeff", "dpo_pair_member"):
             if _k in data.batch.keys():
                 select_keys.append(_k)
 
@@ -1103,23 +852,6 @@ class DataParallelPPOActor(BasePPOActor):
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
-        # On-policy DPO needs each prompt's (chosen, rejected) sibling pairs to
-        # stay inside a single mini-batch (and later a single micro-batch) so
-        # the pairwise loss can be formed. balance_batch (trainer-side) reorders
-        # rows to balance token load and can scatter a prompt's rollouts across
-        # mini-batch boundaries. Regroup rows by "uid" (unique per prompt,
-        # shared by a prompt's rollouts) so each prompt is contiguous; with
-        # ppo_mini_batch_size a multiple of rollout.n each mini-batch then holds
-        # whole prompts. No-op for non-DPO runs.
-        if (dpo_active and "uid" in data.non_tensor_batch
-                and "is_two_stage_stage1" in data.batch.keys()):
-            _idx_arr = data.non_tensor_batch["uid"]
-            _groups: dict = {}
-            for _i in range(len(_idx_arr)):
-                _groups.setdefault(_idx_arr[_i], []).append(_i)
-            _order = [i for g in _groups.values() for i in g]
-            data.reorder(torch.tensor(_order, dtype=torch.long))
-
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         mini_batches = data.split(self.config.ppo_mini_batch_size)
@@ -1133,37 +865,27 @@ class DataParallelPPOActor(BasePPOActor):
         did_update = False
         for _ in range(self.config.ppo_epochs):
             for _batch_idx, mini_batch in enumerate(mini_batches):
-                # On-policy DPO needs a (chosen, rejected) sibling pair in the
-                # SAME forward pass to form the pairwise loss. With the default
-                # ppo_micro_batch_size_per_gpu=1 the two siblings land in
-                # separate size-1 micro-batches, so the loss never saw >=2
-                # Stage 2 samples and silently fell back to pg_loss (GRPO) —
-                # dpo_n_pairs was 0 in every run. When DPO is active we instead
-                # group each prompt's samples (keyed by "index") into one
-                # micro-batch so all its pairs are co-located. use_remove_padding
-                # packs to real tokens, so a per-prompt group stays cheap.
-                dpo_regroup = (
-                    dpo_active
-                    and not self.config.use_dynamic_bsz
-                    and "is_two_stage_stage1" in mini_batch.batch.keys()
-                    and "uid" in mini_batch.non_tensor_batch
-                )
+                # DPO no longer needs (chosen, rejected) siblings co-located in one
+                # micro-batch: pairing is done trainer-side and the pairwise loss is
+                # replaced by a per-sample weighted-logp sum (see dpo_coeff). So
+                # micro-batching is uniform fixed-size on every path, which keeps the
+                # backward / FSDP reduce_scatter count identical across DP ranks (no
+                # uid-based regrouping, no NCCL collective-count desync).
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
-                elif dpo_regroup:
-                    uid_arr = mini_batch.non_tensor_batch["uid"]
-                    groups: dict = {}
-                    for i in range(len(uid_arr)):
-                        groups.setdefault(uid_arr[i], []).append(i)
-                    micro_batches = [mini_batch.select_idxs(idxs) for idxs in groups.values()]
-                    # Average the per-prompt losses across the mini-batch.
-                    self.gradient_accumulation = max(1, len(micro_batches))
                 else:
                     self.gradient_accumulation = (
                         self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
                     )
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+
+                # Number of DPO pairs in this rank's mini-batch, used to turn the
+                # summed per-sample DPO surrogate into a per-mini-batch mean (FSDP
+                # then averages across ranks -> global pair-mean). >=1 to avoid /0.
+                dpo_pairs_in_mini = None
+                if "dpo_pair_member" in mini_batch.batch.keys():
+                    dpo_pairs_in_mini = max(1.0, float(mini_batch.batch["dpo_pair_member"].sum().item()) / 2.0)
 
                 self.actor_optimizer.zero_grad()
 
@@ -1313,52 +1035,31 @@ class DataParallelPPOActor(BasePPOActor):
 
                     policy_loss = pg_loss
 
-                    # Pure on-policy DPO: when dpo_coefficient > 0 and this is
-                    # a two-stage batch, replace pg_loss with DPO loss on
-                    # Stage 2 pos/neg pairs. Stage 1 samples contribute zero
-                    # gradient (exploration only).
-                    dpo_coefficient = float(self.config.policy_loss.get("dpo_coefficient", 0.0))
-                    is_two_stage_stage1 = model_inputs.get("is_two_stage_stage1", None)
-                    if dpo_coefficient > 0 and is_two_stage_stage1 is not None and "branch_token_mask" in model_inputs:
-                        # Count Stage 2 samples for pairing
-                        is_stage2_mask = (is_two_stage_stage1 == 0).float()  # [B]
-                        n_stage2 = is_stage2_mask.sum().item()
-
-                        if n_stage2 >= 2:
-                            # Replace pg_loss entirely with DPO loss
-                            dpo_use_ref = self.config.policy_loss.get("dpo_use_ref", False)
-                            dpo_ref = model_inputs.get("ref_log_prob") if dpo_use_ref else None
-
-                            # Teacher-Guided β: extract teacher logprobs from batch
-                            teacher_guided_beta = self.config.policy_loss.get("dpo_teacher_guided_beta", False)
-                            teacher_branch_lp = model_inputs.get("teacher_branch_logprob") if teacher_guided_beta else None
-                            teacher_sibling_lp = model_inputs.get("teacher_sibling_logprob") if teacher_guided_beta else None
-
-                            dpo_loss, dpo_metrics = self._compute_on_policy_dpo_loss(
-                                log_prob=log_prob,
-                                response_mask=response_mask,
-                                branch_token_mask=model_inputs["branch_token_mask"],
-                                is_two_stage_stage1=is_two_stage_stage1,
-                                dpo_beta=dpo_coefficient,
-                                ref_log_prob=dpo_ref,
-                                teacher_branch_logprob=teacher_branch_lp,
-                                teacher_sibling_logprob=teacher_sibling_lp,
-                                teacher_guided_beta=teacher_guided_beta,
-                                teacher_beta_alpha=self.config.policy_loss.get("dpo_teacher_beta_alpha", 1.0),
-                                teacher_beta_min=self.config.policy_loss.get("dpo_teacher_beta_min", 0.1),
-                                teacher_beta_max=self.config.policy_loss.get("dpo_teacher_beta_max", 3.0),
-                                dpo_stage1_pair=self.config.policy_loss.get("dpo_stage1_pair", False),
-                                stage1_pair_weight=self.config.policy_loss.get("dpo_stage1_pair_weight", 1.0),
-                                sample_index=model_inputs.get("uid", None),
-                                dpo_pair_id=model_inputs.get("dpo_pair_id", None),
-                                dpo_role=model_inputs.get("dpo_role", None),
-                            )
-                            policy_loss = dpo_loss
-                            micro_batch_metrics.update(dpo_metrics)
-                        else:
-                            # Not enough Stage 2 samples — fall back to pg_loss
-                            # but only for Stage 1 (no Stage 2 pairs to train)
-                            micro_batch_metrics["actor/dpo_n_pairs"] = 0.0
+                    # On-policy DPO (branching): the coupled pairwise loss is
+                    # replaced by a per-sample weighted-logp sum. Pairing and the
+                    # per-sample coefficient `dpo_coeff` (= ±β·w_i, un-normalized)
+                    # are computed trainer-side, so here we only need each sample's
+                    # CURRENT-policy suffix-avg logp. dpo_coeff is 0 for Stage-1
+                    # non-anchor / unpaired rows, so those contribute no gradient
+                    # (Stage-1 = exploration only). The DPO loss is a per-mini-batch
+                    # MEAN over pairs: sum coeff·avg_logp across the mini-batch (via
+                    # accumulation over micro-batches) and divide by the pair count;
+                    # FSDP then averages across ranks -> global pair-mean, matching
+                    # the original .mean() convention and pg_loss's behavior. The
+                    # surrogate is a sum (pairs may span micro-batches), so we divide
+                    # out loss_scale_factor — the shared `loss = policy_loss *
+                    # loss_scale_factor` below re-applies it, leaving the DPO term
+                    # summed-not-averaged across micro-batches while entropy/kl stay
+                    # per-micro-batch averaged.
+                    dpo_coeff = model_inputs.get("dpo_coeff", None)
+                    if dpo_coeff is not None and "branch_token_mask" in model_inputs:
+                        avg_logp_cur, _ = suffix_avg_logp(
+                            log_prob, model_inputs["branch_token_mask"], response_mask
+                        )
+                        dpo_term = (dpo_coeff * avg_logp_cur).sum()
+                        n_pairs = dpo_pairs_in_mini if dpo_pairs_in_mini is not None else 1.0
+                        policy_loss = dpo_term / (n_pairs * loss_scale_factor)
+                        micro_batch_metrics["actor/dpo_term"] = dpo_term.detach().item()
 
                     if calculate_entropy and entropy is not None:
                         entropy_agg = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
