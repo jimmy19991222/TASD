@@ -153,9 +153,11 @@ def compute_dpo_sample_coeffs(batch, policy_loss_cfg):
         batch: DataProto whose ``.batch`` holds ``old_log_probs``, ``response_mask``,
             ``branch_token_mask``, ``is_two_stage_stage1``, ``dpo_pair_id``,
             ``dpo_role`` (and optionally ``ref_log_prob``, ``teacher_branch_logprob``,
-            ``teacher_sibling_logprob``); ``.non_tensor_batch`` holds ``uid``.
+            ``teacher_sibling_logprob``, ``token_level_scores`` for the reward
+            filter); ``.non_tensor_batch`` holds ``uid``.
         policy_loss_cfg: the ``actor.policy_loss`` config (``.get`` access) with the
-            ``dpo_*`` keys.
+            ``dpo_*`` keys. ``dpo_reward_filter`` (default True) drops any pair whose
+            chosen leaf scored a lower sequence reward than its rejected leaf.
 
     Returns:
         (coeff[B] float tensor, pair_member[B] float tensor, metrics dict), or
@@ -206,6 +208,17 @@ def compute_dpo_sample_coeffs(batch, policy_loss_cfg):
         # ref-adjusted suffix-avg logp of sample i (scalar tensor)
         return avg_logp[i] - ref_avg_logp[i] if ref_avg_logp is not None else avg_logp[i]
 
+    # Reward-consistency filter: the teacher picks chosen/rejected from its own
+    # branch logprobs, but that preference can disagree with the actual rollout
+    # outcome. Drop any pair whose chosen leaf scored a LOWER sequence reward than
+    # its rejected leaf, so we never train the policy to prefer a branch the
+    # environment rated worse. Uses token_level_scores (raw outcome reward, before
+    # KL), available on the driver batch by the time this runs.
+    reward_filter = bool(policy_loss_cfg.get("dpo_reward_filter", True))
+    seq_reward = None
+    if reward_filter and "token_level_scores" in tb:
+        seq_reward = tb["token_level_scores"].sum(dim=-1)  # [B]
+
     # ---- Build (chosen, rejected) Stage-2 pairs from stable (uid, pair_id, role) ----
     is_stage2 = (is_two_stage_stage1 == 0)
     stage2_indices = torch.where(is_stage2)[0].tolist()
@@ -218,14 +231,21 @@ def compute_dpo_sample_coeffs(batch, policy_loss_cfg):
         pkey = (str(uid[i]) if uid is not None else "0", pid)
         pair_map[pkey][role] = i
     chosen_pos, rejected_pos = [], []
+    n_reward_filtered = 0
     for _pkey, roles in pair_map.items():
         if 0 in roles and 1 in roles:
-            chosen_pos.append(roles[0])
-            rejected_pos.append(roles[1])
+            c_i, r_i = roles[0], roles[1]
+            if seq_reward is not None and float(seq_reward[c_i]) < float(seq_reward[r_i]):
+                n_reward_filtered += 1
+                continue  # chosen scored worse than rejected -> drop this pair
+            chosen_pos.append(c_i)
+            rejected_pos.append(r_i)
 
     P = len(chosen_pos)
     if P == 0:
-        return coeff, pair_member, empty_metrics
+        empty = dict(empty_metrics)
+        empty["actor/dpo_pairs_filtered"] = float(n_reward_filtered)
+        return coeff, pair_member, empty
 
     margins, betas, zs = [], [], []
     for c_i, r_i in zip(chosen_pos, rejected_pos):
@@ -250,6 +270,7 @@ def compute_dpo_sample_coeffs(batch, policy_loss_cfg):
     metrics = {
         "actor/dpo_loss": dpo_loss_val,
         "actor/dpo_n_pairs": float(P),
+        "actor/dpo_pairs_filtered": float(n_reward_filtered),
         "actor/dpo_margin": float(sum(zs) / len(zs)),
         "actor/dpo_beta_effective_mean": float(sum(betas) / len(betas)),
     }

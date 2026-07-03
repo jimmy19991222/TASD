@@ -83,6 +83,8 @@ DPO_TEACHER_BETA_MAX="${DPO_TEACHER_BETA_MAX:-3.0}"
 # version in 3-way ranking (argmax > stage1 > argmin), turning 1 pair into 2
 DPO_STAGE1_PAIR="${DPO_STAGE1_PAIR:-False}"
 STAGE1_PAIR_WEIGHT="${STAGE1_PAIR_WEIGHT:-1.0}"
+# Reward-consistency filter: drop pairs where chosen leaf's reward < rejected's
+DPO_REWARD_FILTER="${DPO_REWARD_FILTER:-True}"
 
 # Validation metric — derived from DATASET by default
 # sciknoweval/biology → data_source=sciknoweval → val-core/sciknoweval/acc/mean@16
@@ -167,6 +169,7 @@ python -m verl.trainer.main_ppo \
     +actor_rollout_ref.actor.policy_loss.dpo_teacher_beta_max=${DPO_TEACHER_BETA_MAX} \
     +actor_rollout_ref.actor.policy_loss.dpo_stage1_pair=${DPO_STAGE1_PAIR} \
     +actor_rollout_ref.actor.policy_loss.dpo_stage1_pair_weight=${STAGE1_PAIR_WEIGHT} \
+    +actor_rollout_ref.actor.policy_loss.dpo_reward_filter=${DPO_REWARD_FILTER} \
     trainer.total_epochs=30 \
     trainer.total_training_steps=${TOTAL_TRAINING_STEPS} \
     trainer.save_freq=${SAVE_FREQ} \
@@ -178,6 +181,6 @@ python -m verl.trainer.main_ppo \
     trainer.default_local_dir="${save_path}" \
     trainer.project_name="${PROJECT_NAME:-TG-Branching}" \
     trainer.experiment_name="${JOB_NAME:-tg_branching_sweep}" \
-    trainer.group_name="TG-Branching-${DATASET//\//-}" \
+    trainer.group_name="${GROUP_NAME:-TG-Branching-${DATASET//\//-}}" \
     "trainer.logger=[console,swanlab]" \
     ${ENTROPY_HYDRA_ARGS}

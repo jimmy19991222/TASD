@@ -179,6 +179,45 @@ def test_pair_member_counts_pairs():
     assert metrics["actor/dpo_n_pairs"] == 3.0  # trainer-global count
 
 
+def _cfg(**over):
+    c = {"dpo_coefficient": 2.0, "dpo_use_ref": False, "dpo_teacher_guided_beta": False,
+         "dpo_teacher_beta_alpha": 1.0, "dpo_teacher_beta_min": 0.1, "dpo_teacher_beta_max": 3.0,
+         "dpo_stage1_pair": False, "dpo_stage1_pair_weight": 1.0}
+    c.update(over)
+    return c
+
+
+def test_reward_filter_drops_inconsistent_pair():
+    # Layout per prompt: [stage1, stage1, chosen@base+2, rejected@base+3]; 3 prompts.
+    batch, logp = _make_batch(12, 5, seed=0)
+    B, T = logp.shape
+    tls = torch.full((B, T), 0.5, dtype=torch.float64)  # equal reward by default -> keep
+    tls[2] = 0.0   # prompt 0 chosen: low reward
+    tls[3] = 1.0   # prompt 0 rejected: high reward  => chosen < rejected -> drop
+    batch.batch["token_level_scores"] = tls
+
+    coeff, pair_member, metrics = compute_dpo_sample_coeffs(batch, _cfg(dpo_reward_filter=True))
+    assert metrics["actor/dpo_n_pairs"] == 2.0
+    assert metrics["actor/dpo_pairs_filtered"] == 1.0
+    # dropped pair contributes nothing
+    assert coeff[2].item() == 0.0 and coeff[3].item() == 0.0
+    assert pair_member[2].item() == 0.0 and pair_member[3].item() == 0.0
+    # a kept pair still active
+    assert pair_member[6].item() == 1.0 and pair_member[7].item() == 1.0
+
+
+def test_reward_filter_off_keeps_all():
+    batch, logp = _make_batch(12, 5, seed=0)
+    B, T = logp.shape
+    tls = torch.full((B, T), 0.5, dtype=torch.float64)
+    tls[2] = 0.0
+    tls[3] = 1.0
+    batch.batch["token_level_scores"] = tls
+    coeff, pair_member, metrics = compute_dpo_sample_coeffs(batch, _cfg(dpo_reward_filter=False))
+    assert metrics["actor/dpo_n_pairs"] == 3.0
+    assert metrics["actor/dpo_pairs_filtered"] == 0.0
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
