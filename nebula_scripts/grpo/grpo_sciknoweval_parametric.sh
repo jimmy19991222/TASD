@@ -89,5 +89,5 @@ python -m verl.trainer.main_ppo \
     trainer.default_local_dir="${save_path}" \
     trainer.project_name="${PROJECT_NAME:-Baselines}" \
     trainer.experiment_name="${JOB_NAME:-grpo_sweep}" \
-    trainer.group_name="GRPO-baseline" \
+    trainer.group_name="${GROUP_NAME:-GRPO-baseline}" \
     "trainer.logger=[console,swanlab]"

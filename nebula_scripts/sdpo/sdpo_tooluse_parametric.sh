@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# SDPO Baseline 参数化训练脚本（lcb_v6 数据集，供 Nebula sweep 调用）
+# SDPO Baseline 参数化训练脚本（tooluse 数据集，供 Nebula sweep 调用）
 # 所有超参通过 nebulactl --env 注入
 # =============================================================================
 set +xo pipefail
@@ -29,10 +29,10 @@ else
     SAVE_CONTENTS_HYDRA="[model,optimizer,extra,hf_model]"
 fi
 
-train_data_path="${OSS_ROOT}/datasets/lcb_v6/train.parquet"
-val_data_path="${OSS_ROOT}/datasets/lcb_v6/test.parquet"
+train_data_path="${OSS_ROOT}/datasets/tooluse/train.parquet"
+val_data_path="${OSS_ROOT}/datasets/tooluse/test.parquet"
 model_path="${OSS_ROOT}/base_models/${MODEL_NAME}"
-save_path="${OSS_ROOT}/rl_models/${JOB_NAME:-sdpo_lcb_sweep}"
+save_path="${OSS_ROOT}/rl_models/${JOB_NAME:-sdpo_tooluse_sweep}"
 
 # ── 环境 ──────────────────────────────────────────────────────────────
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
@@ -59,17 +59,16 @@ python -m verl.trainer.main_ppo \
     custom_reward_function.path="$(pwd)/verl/utils/reward_score/feedback/__init__.py" \
     actor_rollout_ref.model.path="${model_path}" \
     actor_rollout_ref.actor.optim.lr=${LR} \
-    actor_rollout_ref.actor.optim.lr_warmup_steps=0 \
-    actor_rollout_ref.actor.ppo_mini_batch_size=1 \
-    actor_rollout_ref.actor.self_distillation.distillation_topk=20 \
+    actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=32 \
+    actor_rollout_ref.actor.self_distillation.distillation_topk=100 \
     actor_rollout_ref.actor.self_distillation.alpha=${ALPHA} \
     actor_rollout_ref.actor.self_distillation.dont_reprompt_on_self_success=${DONT_REPROMPT_ON_SELF_SUCCESS} \
     actor_rollout_ref.actor.self_distillation.include_environment_feedback=False \
-    actor_rollout_ref.actor.self_distillation.teacher_update_rate=0.01 \
     actor_rollout_ref.actor.checkpoint.save_contents=${SAVE_CONTENTS_HYDRA} \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.rollout.n=${ROLLOUT_N} \
-    actor_rollout_ref.rollout.val_kwargs.n=4 \
+    actor_rollout_ref.rollout.val_kwargs.n=16 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
     algorithm.rollout_correction.rollout_is=token \
@@ -78,11 +77,11 @@ python -m verl.trainer.main_ppo \
     trainer.save_freq=${SAVE_FREQ} \
     trainer.max_actor_ckpt_to_keep=null \
     trainer.test_freq=${TEST_FREQ} \
-    trainer.save_best_metric="val-core/livecodebench/acc/mean@16" \
+    trainer.save_best_metric="val-core/tooluse/acc/mean@16" \
     trainer.n_gpus_per_node=4 \
     trainer.val_before_train=${VAL_BEFORE_TRAIN} \
     trainer.default_local_dir="${save_path}" \
-    trainer.project_name="${PROJECT_NAME:-Baselines_clean}" \
-    trainer.experiment_name="${JOB_NAME:-sdpo_lcb_sweep}" \
-    trainer.group_name="${GROUP_NAME:-SDPO-lcb}" \
+    trainer.project_name="${PROJECT_NAME:-DPO-Comparison-4B}" \
+    trainer.experiment_name="${JOB_NAME:-sdpo_tooluse_sweep}" \
+    trainer.group_name="SDPO-tooluse" \
     "trainer.logger=[console,swanlab]"

@@ -78,5 +78,5 @@ python -m verl.trainer.main_ppo \
     trainer.default_local_dir="${save_path}" \
     trainer.project_name="${PROJECT_NAME:-Baselines_clean}" \
     trainer.experiment_name="${JOB_NAME:-grpo_lcb_sweep}" \
-    trainer.group_name="GRPO-lcb" \
+    trainer.group_name="${GROUP_NAME:-GRPO-lcb}" \
     "trainer.logger=[console,swanlab]"

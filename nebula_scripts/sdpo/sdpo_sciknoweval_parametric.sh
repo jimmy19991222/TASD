@@ -96,5 +96,5 @@ python -m verl.trainer.main_ppo \
     trainer.default_local_dir="${save_path}" \
     trainer.project_name="${PROJECT_NAME:-Baselines}" \
     trainer.experiment_name="${JOB_NAME:-sdpo_sweep}" \
-    trainer.group_name="SDPO-baseline" \
+    trainer.group_name="${GROUP_NAME:-SDPO-baseline}" \
     "trainer.logger=[console,swanlab]"

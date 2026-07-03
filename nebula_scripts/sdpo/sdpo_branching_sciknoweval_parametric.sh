@@ -166,6 +166,6 @@ python -m verl.trainer.main_ppo \
     trainer.default_local_dir="${save_path}" \
     trainer.project_name="${PROJECT_NAME:-TG-Branching}" \
     trainer.experiment_name="${JOB_NAME:-tg_branching_sdpo_sweep}" \
-    trainer.group_name="TG-Branching-SDPO-${DATASET//\//-}" \
+    trainer.group_name="${GROUP_NAME:-TG-Branching-SDPO-${DATASET//\//-}}" \
     "trainer.logger=[console,swanlab]" \
     ${ENTROPY_HYDRA_ARGS}
