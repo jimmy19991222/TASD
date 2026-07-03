@@ -765,7 +765,7 @@ class DataParallelPPOActor(BasePPOActor):
                 role = int(dpo_role[i].item())
                 if pid < 0 or role < 0:
                     continue
-                pkey = (str(sample_index[i].item()) if sample_index is not None else "0", pid)
+                pkey = (str(sample_index[i]) if sample_index is not None else "0", pid)
                 pair_map[pkey][role] = i
             for _pkey, roles in pair_map.items():
                 if 0 in roles and 1 in roles:
