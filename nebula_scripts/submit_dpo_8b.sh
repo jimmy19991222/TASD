@@ -66,7 +66,7 @@ _submit_job() {
 
 # Common (matched to 8B baselines)
 MODEL="Qwen3-8B"; SEED=42; LR="1e-5"; TBS=32; RN=8; MBS=32
-TF=10; SF=10; TP=1; BETA="2.0"
+TF=10; SF=10; TP=1; BETA="${BETA:-2.0}"
 TK=10; TTK=100; EW=20; ESS=2.0; ESF=0.5; EST=0.5; TCM=marker; ASF=0.05
 
 _base() {  # $1=JN $2=DATASET $3=STEPS
@@ -76,7 +76,11 @@ _branch() {
     echo "--env=BRANCHING_ENABLED=True --env=TOP_K=${TK} --env=TEACHER_TOP_K=${TTK} --env=ENTROPY_WINDOW=${EW} --env=ENTROPY_SIGMA_START=${ESS} --env=ENTROPY_SIGMA_FLOOR=${ESF} --env=ENTROPY_SIGMA_STEP=${EST} --env=TEACHER_CONTEXT_MODE=${TCM} --env=ADV_STD_FLOOR=${ASF}"
 }
 _dpo() {  # stage1pair + withref + reward filter ON
-    echo "--env=TWO_STAGE=True --env=STAGE1_N=4 --env=N_SPLITS=1 --env=N_TREES=2 --env=BRANCH_TOKEN_LOSS_MODE=suffix --env=TWO_STAGE_TEACHER_MODE=ref_or_marker --env=SUCCESS_THRESHOLD=0.3 --env=DPO_COEFFICIENT=${BETA} --env=DPO_USE_REF=True --env=ENTROPY_COEFF=0 --env=DPO_STAGE1_PAIR=True --env=STAGE1_PAIR_WEIGHT=1.0 --env=DPO_REWARD_FILTER=True"
+    local TG="${DPO_TEACHER_GUIDED_BETA:-False}"
+    local TGA="${DPO_TEACHER_BETA_ALPHA:-1.0}"
+    local TGM="${DPO_TEACHER_BETA_MIN:-0.1}"
+    local TGX="${DPO_TEACHER_BETA_MAX:-3.0}"
+    echo "--env=TWO_STAGE=True --env=STAGE1_N=4 --env=N_SPLITS=1 --env=N_TREES=2 --env=BRANCH_TOKEN_LOSS_MODE=suffix --env=TWO_STAGE_TEACHER_MODE=ref_or_marker --env=SUCCESS_THRESHOLD=0.3 --env=DPO_COEFFICIENT=${BETA} --env=DPO_USE_REF=True --env=ENTROPY_COEFF=0 --env=DPO_STAGE1_PAIR=True --env=STAGE1_PAIR_WEIGHT=1.0 --env=DPO_REWARD_FILTER=True --env=DPO_TEACHER_GUIDED_BETA=${TG} --env=DPO_TEACHER_BETA_ALPHA=${TGA} --env=DPO_TEACHER_BETA_MIN=${TGM} --env=DPO_TEACHER_BETA_MAX=${TGX}"
 }
 
 DS="nebula_scripts/grpo/grpo_branching_sciknoweval_parametric.sh"
