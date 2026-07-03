@@ -133,3 +133,6 @@ outputs
 other_implementation
 Dockerfile.gh200-ofi
 DOCKER_PLAN_GH200.md
+# Local virtual environments (not needed for training — container has its own)
+nebula_env/
+sdpo_env/
