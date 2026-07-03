@@ -47,6 +47,7 @@ _submit_job() {
     else
         echo "提交 Job #${TOTAL}: ${JOB_NAME}"
         nebulactl run mdl --force --engine=xdl --queue=${QUEUE} \
+            ${NEBULA_WORK_DIR:+--nebula_work_dir ${NEBULA_WORK_DIR}} \
             --entry=nebula_scripts/entry.py \
             --user_params="--script_path=${SCRIPT_PATH} --world_size=${WORLD_SIZE} --job_name=${JOB_NAME} ${USER_PARAMS}" \
             --worker_count=${WORLD_SIZE} --file.cluster_file=${CLUSTER_FILE} \
@@ -82,7 +83,9 @@ DS="nebula_scripts/grpo/grpo_branching_sciknoweval_parametric.sh"
 
 # dataset -> steps
 echo "=== DPO-2S-8B stage1pair (β=${BETA}, reward-filter ON) ==="
+INCLUDE="${INCLUDE:-all}"   # comma list of tags to submit, or "all"
 _one() {  # $1=DATASET $2=TAG $3=STEPS
+    if [ "$INCLUDE" != "all" ] && [[ ",$INCLUDE," != *",$2,"* ]]; then return; fi
     T=$(date +%Y%m%d_%H%M%S)
     JN="DPO-2S-8B-stage1pair-beta${BETA}-$2-${T}"
     _submit_job "$DS" "$JN" "$(_base "$JN" "$1" "$3") $(_branch) $(_dpo)"
