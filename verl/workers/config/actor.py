@@ -218,6 +218,9 @@ class PolicyLossConfig(BaseConfig):
     # 1 DPO pair into 2 pairs per branch point.
     dpo_stage1_pair: bool = False
     dpo_stage1_pair_weight: float = 1.0  # weight for Stage 1 pair loss
+    # Drop (chosen, rejected) pairs whose chosen leaf scored a lower sequence
+    # reward than its rejected leaf (teacher preference contradicts the outcome).
+    dpo_reward_filter: bool = True
 
     def __post_init__(self):
         valid = {"all", "mask", "only", "suffix"}
