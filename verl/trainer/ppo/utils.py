@@ -278,7 +278,7 @@ def compute_dpo_sample_coeffs(batch, policy_loss_cfg):
             margin = (teacher_branch[c_i] - teacher_sibling[c_i]).detach()
             if torch.isfinite(margin):
                 beta_i = dpo_beta * float(torch.clamp(beta_alpha * margin, min=beta_min, max=beta_max))
-            margins.append(float(margin))
+                margins.append(float(margin))
         w = torch.sigmoid(-beta_i * z).detach()  # difficulty weight, detached
         # un-normalized DPO gradient coefficient, mirrors -w β (∂a - ∂b)
         coeff[c_i] += -beta_i * w

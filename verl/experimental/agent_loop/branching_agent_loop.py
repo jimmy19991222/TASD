@@ -567,13 +567,9 @@ class BranchingAgentLoop(AgentLoopBase):
         first successful stage1. If stage1[i] fails (below threshold), the
         tree falls back to any successful stage1, or static marker.
 
-        Streaming optimisation (2026-07-02): Stage 1 rollouts are processed as
-        they complete (``asyncio.as_completed``). Each rollout is scored
-        immediately upon arrival; the FIRST rollout that meets the success
-        threshold triggers Stage 2 branching — remaining Stage 1 rollouts
-        continue generating in the background and are collected before
-        returning. This overlaps Stage 2 start with tail Stage 1 generation,
-        saving ~50-100 s per training step on long-CoT tasks (math, GSM8K).
+        Stage 1 rollouts are processed as they complete
+        (``asyncio.as_completed``) and scored immediately. Stage 2 starts
+        only after ALL Stage 1 rollouts complete and are scored.
         """
         cfg = self.branching_cfg
         stage1_n = self._stage1_n
@@ -602,7 +598,6 @@ class BranchingAgentLoop(AgentLoopBase):
         stage1_outputs: list[AgentLoopOutput] = [None] * stage1_n  # type: ignore[list-item]
         stage1_scores: list[Optional[float]] = [None] * stage1_n
         stage1_response_texts: list[Optional[str]] = [None] * stage1_n
-        first_success_event = asyncio.Event()
         first_success_idx: Optional[int] = None
 
         # Score each rollout as it completes. Track per-index results so we
@@ -630,14 +625,9 @@ class BranchingAgentLoop(AgentLoopBase):
                     )
                     if first_success_idx is None:
                         first_success_idx = idx
-                        first_success_event.set()
-                        # Don't break — continue scoring remaining to get
-                        # per-tree privileged context, but start Stage 2 early
-                        # via the event.
-                        break
 
-        # Collect remaining Stage 1 outputs that were still running when we
-        # broke out of the as_completed loop.
+        # Safety net: collect any remaining Stage 1 outputs that were not
+        # processed by the as_completed loop (normally all are done by now).
         remaining = [t for t in stage1_tasks if not t.done()]
         if remaining:
             remaining_results = await asyncio.gather(*remaining, return_exceptions=True)

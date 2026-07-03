@@ -48,6 +48,9 @@ __all__ = ["DataParallelPPOActor"]
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+# Module-level flag to warn once about btm=only silently zeroing DPO loss.
+_warned_btm_only_dpo = False
+
 
 class TrustRegionTeacher(nn.Module):
     def __init__(self, ref_module: nn.Module, student_module: nn.Module, mix_coef: float) -> None:
@@ -1057,6 +1060,16 @@ class DataParallelPPOActor(BasePPOActor):
                         # suffix_avg_logp so PG loss and DPO loss are consistent
                         # about which tokens carry gradient.
                         btm = self.config.policy_loss.get("branch_token_loss_mode", "all")
+                        # Guard: warn once if btm=only will silently zero DPO loss
+                        # (suffix positions and branch positions are disjoint).
+                        global _warned_btm_only_dpo
+                        if not _warned_btm_only_dpo and btm == "only":
+                            _warned_btm_only_dpo = True
+                            logger.warning(
+                                "DPO loss will be zero under branch_token_loss_mode=only "
+                                "(suffix and branch positions are disjoint). "
+                                "Consider using btm=suffix or btm=mask instead."
+                            )
                         btm_mask = model_inputs["branch_token_mask"]
                         if btm == "mask" and btm_mask is not None:
                             dpo_eff_mask = response_mask * (1 - btm_mask.to(response_mask.dtype))

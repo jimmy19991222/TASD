@@ -22,13 +22,13 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
 # Use project venv if available
-if [ -f "${PROJECT_DIR}/sdpo_env/bin/python" ]; then
-    export PATH="${PROJECT_DIR}/sdpo_env/bin:${PATH}"
+if [ -f "${HOME}/venvs/sdpo_env/bin/python" ]; then
+    export PATH="${HOME}/venvs/sdpo_env/bin:${PATH}"
 fi
 
 export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH:-}"
 
-DATASET="${1:?用法: $0 <math500|gsm8k|livecodebench|all>}"
+DATASET="${1:?用法: $0 <math500|gsm8k|competition_math|livecodebench|all>}"
 
 prepare_dataset() {
     local name="$1"
@@ -72,17 +72,21 @@ case "$DATASET" in
     gsm8k)
         prepare_dataset "gsm8k" "openai/gsm8k"
         ;;
+    competition_math)
+        prepare_dataset "competition_math" "EleutherAI/hendrycks_math"
+        ;;
     livecodebench)
         prepare_dataset "livecodebench" "livecodebench/code_generation_lite-v6"
         ;;
     all)
         prepare_dataset "math500" "math-ai/math500"
         prepare_dataset "gsm8k" "openai/gsm8k"
+        prepare_dataset "competition_math" "EleutherAI/hendrycks_math"
         prepare_dataset "livecodebench" "livecodebench/code_generation_lite-v6"
         ;;
     *)
         echo "不支持的数据集: ${DATASET}"
-        echo "可选: math500, gsm8k, livecodebench, all"
+        echo "可选: math500, gsm8k, competition_math, livecodebench, all"
         exit 1
         ;;
 esac
