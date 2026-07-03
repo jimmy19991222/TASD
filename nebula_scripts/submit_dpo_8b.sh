@@ -91,7 +91,9 @@ INCLUDE="${INCLUDE:-all}"   # comma list of tags to submit, or "all"
 _one() {  # $1=DATASET $2=TAG $3=STEPS
     if [ "$INCLUDE" != "all" ] && [[ ",$INCLUDE," != *",$2,"* ]]; then return; fi
     T=$(date +%Y%m%d_%H%M%S)
-    JN="DPO-2S-8B-stage1pair-beta${BETA}-$2-${T}"
+    TG="${DPO_TEACHER_GUIDED_BETA:-False}"
+    TG_TAG=$([ "$TG" = "True" ] && echo "-tg" || echo "")
+    JN="DPO-2S-8B-stage1pair${TG_TAG}-beta${BETA}-$2-${T}"
     _submit_job "$DS" "$JN" "$(_base "$JN" "$1" "$3") $(_branch) $(_dpo)"
     sleep 1
 }
