@@ -758,7 +758,10 @@ class BranchingAgentLoop(AgentLoopBase):
         from collections import defaultdict as _defaultdict
         by_tree: dict[int, list] = _defaultdict(list)
         for o in valid_stage2:
-            tree_idx_val = int(o.extra_fields.get("tree_idx", 0))
+            tree_idx_val = int(o.extra_fields.get("tree_idx", -1))
+            if tree_idx_val < 0:
+                logger.warning(f"Missing tree_idx for leaf {o.extra_fields.get('leaf_id')}; skipping DPO pairing")
+                continue
             by_tree[tree_idx_val].append(o)
 
         global_pair_id = 0
@@ -952,6 +955,7 @@ class BranchingAgentLoop(AgentLoopBase):
                     "is_two_stage_stage1": 1,
                     "leaf_id": idx,
                     "leaf_depth": 0,
+                    "tree_idx": idx,  # stage1[i] maps to tree[i]
                     "branching_diag": {},
                     "priv_ctx_meta": {},
                     "branching_fallback": "",
@@ -1895,6 +1899,7 @@ class BranchingAgentLoop(AgentLoopBase):
                     "is_branching_fallback": 1,
                     "leaf_id": start_leaf_id + idx,
                     "leaf_depth": 0,
+                    "tree_idx": int(tree_idx),
                     "branching_diag": {},
                     "priv_ctx_meta": {},
                     "branching_fallback": reason,
@@ -2023,6 +2028,7 @@ class BranchingAgentLoop(AgentLoopBase):
                     "is_branching_fallback": 1,
                     "leaf_id": idx,
                     "leaf_depth": 0,
+                    "tree_idx": int(tree_idx),
                     "branching_diag": {},
                     "priv_ctx_meta": {},
                     "branching_fallback": reason,

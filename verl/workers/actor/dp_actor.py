@@ -1075,6 +1075,13 @@ class DataParallelPPOActor(BasePPOActor):
                         avg_logp_cur, _ = suffix_avg_logp(
                             log_prob, model_inputs["branch_token_mask"], dpo_eff_mask
                         )
+                        # Stage-1 samples use full response_mask for avg logp
+                        # (consistent with trainer-side utils.py logic).
+                        is_s1 = model_inputs.get("is_two_stage_stage1", None)
+                        if is_s1 is not None and is_s1.any():
+                            is_s1_bool = is_s1.bool().view(-1)
+                            s1_logp = (log_prob * response_mask).sum(dim=1) / response_mask.sum(dim=1).clamp_min(1.0)
+                            avg_logp_cur = torch.where(is_s1_bool, s1_logp, avg_logp_cur)
                         dpo_term = (dpo_coeff * avg_logp_cur).sum()
                         n_pairs = dpo_pairs_in_mini if dpo_pairs_in_mini is not None else 1.0
                         policy_loss = dpo_term / (n_pairs * loss_scale_factor)
