@@ -112,6 +112,7 @@ class SelfDistillationConfig(BaseConfig):
     token_dpo_coefficient: float = 0.1    # DPO loss weight α
     token_dpo_only: bool = False         # True = skip JSD loss, use only DPO loss
     token_dpo_use_ref: bool = False      # True = use teacher logprob as reference in DPO loss
+    token_dpo_entropy_filter: bool = False  # True = only compute DPO loss on tokens with entropy > per-seq median
 
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:

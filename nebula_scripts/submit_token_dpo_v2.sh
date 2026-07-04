@@ -2,13 +2,15 @@
 # =============================================================================
 # Token-level DPO v2 实验批量提交
 #
-# 实验矩阵：4 sciknoweval 数据集 × 2 β 值 × 2 熵过滤 = 16 个实验
+# 实验矩阵：4 sciknoweval 数据集 × 3 配置 = 12 个实验
 #   全部使用 reference-free DPO (TOKEN_DPO_USE_REF=False)
 #
 # 维度：
 #   数据集: biology, chemistry, material, physics
-#   β 值:   0.5, 0.1
-#   熵过滤: False, True (per-sequence median entropy filter)
+#   配置1: β=0.5, entropy_filter=False
+#   配置2: β=0.1, entropy_filter=False
+#   配置3: β=0.5, entropy_filter=True
+#   (去掉 β=0.1 + entropy_filter=True 最激进组合)
 #
 # 使用方式：
 #   bash nebula_scripts/submit_token_dpo_v2.sh [--dry-run]
@@ -65,7 +67,7 @@ ROLLOUT_N="8"
 TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-250}"
 DONT_REPROMPT_ON_SELF_SUCCESS="True"
 
-# 实验矩阵：4 数据集 × 2 β 值 × 2 熵过滤 = 16 个实验
+# 实验矩阵：4 数据集 × 3 配置 = 12 个实验
 DATASETS=(
     "sciknoweval/biology"
     "sciknoweval/chemistry"
@@ -73,8 +75,13 @@ DATASETS=(
     "sciknoweval/physics"
 )
 
-BETAS=("0.5" "0.1")
-ENTROPY_FILTERS=("False" "True")
+# 3 组配置：BETA|ENTROPY_FILTER|BETA_TAG|ENTROPY_TAG
+# (去掉 β=0.1 + entropy_filter=True 最激进组合)
+CONFIGS=(
+    "0.5|False|b05|off"
+    "0.1|False|b01|off"
+    "0.5|True|b05|on"
+)
 
 SCRIPT_PATH="nebula_scripts/sdpo/token_dpo_parametric.sh"
 
@@ -155,22 +162,19 @@ _entropy_tag() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 提交实验：4 数据集 × 2 β 值 × 2 熵过滤 = 16 个实验 (noref only)
+# 提交实验：4 数据集 × 3 配置 = 12 个实验 (noref only)
 # ─────────────────────────────────────────────────────────────────────────────
 GROUP_NAME="TokenDPO-v2"
 
 for DATASET in "${DATASETS[@]}"; do
-    for BETA in "${BETAS[@]}"; do
-        for ENTROPY_FILTER in "${ENTROPY_FILTERS[@]}"; do
-            DS_SHORT=$(_dataset_short "$DATASET")
-            BETA_TAG=$(_beta_tag "$BETA")
-            ENTROPY_TAG=$(_entropy_tag "$ENTROPY_FILTER")
-            CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
-            JOB_NAME="token-dpo-v2-${DS_SHORT}-${BETA_TAG}-ef${ENTROPY_TAG}-${MODEL_NAME}-${CURRENT_TIME}"
+    for CONFIG in "${CONFIGS[@]}"; do
+        IFS='|' read -r BETA ENTROPY_FILTER BETA_TAG ENTROPY_TAG <<< "$CONFIG"
+        DS_SHORT=$(_dataset_short "$DATASET")
+        CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
+        JOB_NAME="token-dpo-v2-${DS_SHORT}-${BETA_TAG}-ef${ENTROPY_TAG}-${MODEL_NAME}-${CURRENT_TIME}"
 
-            _submit_job "$JOB_NAME" \
-                "--env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=GROUP_NAME=${GROUP_NAME} --env=DATASET=${DATASET} --env=MODEL_NAME=${MODEL_NAME} --env=LR=${LR} --env=DONT_REPROMPT_ON_SELF_SUCCESS=${DONT_REPROMPT_ON_SELF_SUCCESS} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=SEED=${SEED} --env=TOKEN_DPO_USE_REF=False --env=TOKEN_DPO_BETA=${BETA} --env=TOKEN_DPO_ENTROPY_FILTER=${ENTROPY_FILTER} --env=TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS} --env=TEST_FREQ=${TEST_FREQ} --env=SAVE_FREQ=${SAVE_FREQ} --env=VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN} --env=SAVE_HF_ONLY=${SAVE_HF_ONLY} --env=GIT_BRANCH=${GIT_BRANCH} --env=GIT_COMMIT=${GIT_COMMIT}"
-        done
+        _submit_job "$JOB_NAME" \
+            "--env=PROJECT_NAME=${PROJECT_NAME} --env=JOB_NAME=${JOB_NAME} --env=GROUP_NAME=${GROUP_NAME} --env=DATASET=${DATASET} --env=MODEL_NAME=${MODEL_NAME} --env=LR=${LR} --env=DONT_REPROMPT_ON_SELF_SUCCESS=${DONT_REPROMPT_ON_SELF_SUCCESS} --env=TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} --env=ROLLOUT_N=${ROLLOUT_N} --env=SEED=${SEED} --env=TOKEN_DPO_USE_REF=False --env=TOKEN_DPO_BETA=${BETA} --env=TOKEN_DPO_ENTROPY_FILTER=${ENTROPY_FILTER} --env=TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS} --env=TEST_FREQ=${TEST_FREQ} --env=SAVE_FREQ=${SAVE_FREQ} --env=VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN} --env=SAVE_HF_ONLY=${SAVE_HF_ONLY} --env=GIT_BRANCH=${GIT_BRANCH} --env=GIT_COMMIT=${GIT_COMMIT}"
     done
 done
 
