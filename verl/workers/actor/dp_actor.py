@@ -766,7 +766,8 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
 
-                    calculate_entropy = self.config.calculate_entropy or (entropy_coeff != 0)
+                    token_dpo_entropy_filter = self_distillation_cfg.get("token_dpo_entropy_filter", False) if self_distillation_enabled else False
+                    calculate_entropy = self.config.calculate_entropy or (entropy_coeff != 0) or token_dpo_entropy_filter
                     self_distillation_mask = model_inputs.get("self_distillation_mask") if self_distillation_enabled else None
                     if self_distillation_enabled:
                         assert not has_multi_modal_inputs, "Multi-modal inputs are not supported for distillation"
@@ -871,6 +872,7 @@ class DataParallelPPOActor(BasePPOActor):
                         ):
                             token_dpo_beta = self_distillation_cfg.get("token_dpo_beta", 1.0)
                             token_dpo_coef = self_distillation_cfg.get("token_dpo_coefficient", 0.1)
+                            # token_dpo_entropy_filter already read above for calculate_entropy
                             # 构建 DPO 用的有效 mask（与 SDPO loss 保持一致）
                             dpo_mask = response_mask
                             if self_distillation_mask is not None:
@@ -882,6 +884,8 @@ class DataParallelPPOActor(BasePPOActor):
                                 response_mask=dpo_mask,
                                 beta=token_dpo_beta,
                                 use_ref=token_dpo_use_ref,
+                                entropy=entropy,
+                                entropy_filter=token_dpo_entropy_filter,
                             )
                             pg_loss = pg_loss + token_dpo_coef * token_dpo_loss
                             micro_batch_metrics["actor/token_dpo_loss"] = token_dpo_loss.detach().item()

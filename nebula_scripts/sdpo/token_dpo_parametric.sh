@@ -21,6 +21,8 @@ SEED="${SEED:-42}"
 TEACHER_CONTEXT_MODE="${TEACHER_CONTEXT_MODE:-}"
 TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-250}"
 TOKEN_DPO_USE_REF="${TOKEN_DPO_USE_REF:-False}"
+TOKEN_DPO_BETA="${TOKEN_DPO_BETA:-1.0}"
+TOKEN_DPO_ENTROPY_FILTER="${TOKEN_DPO_ENTROPY_FILTER:-False}"
 
 # Checkpoint / validation cadence (env-overridable)
 TEST_FREQ="${TEST_FREQ:-10}"
@@ -59,8 +61,10 @@ export SWANLAB_API_KEY="${SWANLAB_API_KEY:-M5oC00EEt8G1wC0XaHkal}"
 export SWANLAB_LOG_DIR="${OSS_ROOT}/logs/swanlab_logs"
 export TORCH_WARN_ACCUMULATE_GRAD_STREAM=0
 
-# Forward TOKEN_DPO_USE_REF to environment for Hydra oc.env resolver
+# Forward TOKEN_DPO_* to environment for Hydra oc.env resolver
 export TOKEN_DPO_USE_REF
+export TOKEN_DPO_BETA
+export TOKEN_DPO_ENTROPY_FILTER
 
 pip install -e . --no-deps --no-build-isolation --quiet 2>/dev/null || true
 
@@ -81,6 +85,8 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.self_distillation.dont_reprompt_on_self_success=${DONT_REPROMPT_ON_SELF_SUCCESS} \
     actor_rollout_ref.actor.self_distillation.include_environment_feedback=False \
     actor_rollout_ref.actor.self_distillation.token_dpo_use_ref=${TOKEN_DPO_USE_REF} \
+    actor_rollout_ref.actor.self_distillation.token_dpo_beta=${TOKEN_DPO_BETA} \
+    actor_rollout_ref.actor.self_distillation.token_dpo_entropy_filter=${TOKEN_DPO_ENTROPY_FILTER} \
     ${TEACHER_CONTEXT_MODE:+actor_rollout_ref.actor.self_distillation.teacher_context_mode=${TEACHER_CONTEXT_MODE}} \
     actor_rollout_ref.actor.checkpoint.save_contents=${SAVE_CONTENTS_HYDRA} \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \

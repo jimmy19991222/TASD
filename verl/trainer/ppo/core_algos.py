@@ -1202,6 +1202,8 @@ def compute_token_dpo_loss(
     response_mask: torch.Tensor,
     beta: float = 1.0,
     use_ref: bool = False,
+    entropy: torch.Tensor = None,
+    entropy_filter: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Token-level DPO loss.
 
@@ -1218,12 +1220,18 @@ def compute_token_dpo_loss(
         where margin = logπ(chosen) - logπ(rejected)
         Teacher provides implicit KL constraint without needing initial policy forward pass.
 
+    When entropy_filter=True and entropy is provided, only tokens with entropy above
+    the per-sequence median are retained for loss computation. This filters out
+    low-entropy (deterministic) tokens that carry little decision signal.
+
     Args:
         student_topk_log_probs: [batch, seq_len, K] — student log-probs aligned to student's top-K indices.
         teacher_topk_log_probs: [batch, seq_len, K] — teacher log-probs aligned to the *same* top-K indices.
         response_mask: [batch, seq_len] — mask for valid response tokens.
         beta: DPO temperature β.
         use_ref: If True, use teacher logprobs as reference (DPO with reference model).
+        entropy: [batch, seq_len] — per-token entropy from student. Required for entropy_filter.
+        entropy_filter: If True, apply per-sequence median entropy filter to mask.
 
     Returns:
         loss: scalar (mean over valid positions).
@@ -1256,6 +1264,21 @@ def compute_token_dpo_loss(
     dpo_loss = -F.logsigmoid(beta * log_ratio)  # [batch, seq_len]
 
     mask = response_mask.float()
+
+    if entropy_filter and entropy is not None:
+        # Per-sequence median entropy filter
+        # For each sequence, compute the median entropy of valid tokens,
+        # then only keep tokens whose entropy exceeds the median.
+        batch_size = entropy.shape[0]
+        for i in range(batch_size):
+            valid_mask = mask[i] > 0
+            valid_entropy = entropy[i][valid_mask]
+            if len(valid_entropy) > 1:
+                median_e = valid_entropy.median()
+                # Only keep entropy > median positions
+                keep = (entropy[i] > median_e).float() * mask[i]
+                mask[i] = keep
+
     valid_count = mask.sum().clamp(min=1.0)
     loss = (dpo_loss * mask).sum() / valid_count
     margin = (log_ratio * mask).sum() / valid_count

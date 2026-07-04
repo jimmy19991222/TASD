@@ -11,6 +11,12 @@
 #     Loss = -log σ(β · (logπ_s(chosen) - logπ_s(rejected)))
 # - True: teacher as reference
 #     Loss = -log σ(β · ((logπ_s - logπ_t)(chosen) - (logπ_s - logπ_t)(rejected)))
+#
+# TOKEN_DPO_BETA env var controls DPO temperature β (default: 1.0).
+#
+# TOKEN_DPO_ENTROPY_FILTER env var controls per-sequence median entropy filtering:
+# - False (default): all valid tokens participate in DPO loss
+# - True: only tokens with entropy > per-sequence median are retained
 
 defaults:
   - ppo_trainer
@@ -41,9 +47,10 @@ actor_rollout_ref:
       # Token-level DPO (DPO-only mode)
       token_dpo_enabled: True
       token_dpo_only: True
-      token_dpo_beta: 1.0
+      token_dpo_beta: ${oc.env:TOKEN_DPO_BETA,1.0}
       token_dpo_coefficient: 1.0
       token_dpo_use_ref: ${oc.env:TOKEN_DPO_USE_REF,False}
+      token_dpo_entropy_filter: ${oc.env:TOKEN_DPO_ENTROPY_FILTER,False}
     optim:
       lr: 1e-5
   rollout:
