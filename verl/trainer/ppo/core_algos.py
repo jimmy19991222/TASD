@@ -1196,6 +1196,73 @@ def compute_self_distillation_loss(
     return loss, metrics
 
 
+def compute_token_dpo_loss(
+    student_topk_log_probs: torch.Tensor,
+    teacher_topk_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    beta: float = 1.0,
+    use_ref: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Token-level DPO loss.
+
+    At each position, teacher ranks student's top-K candidates:
+    - chosen = argmax(teacher_topk)  → teacher's preferred token
+    - rejected = argmin(teacher_topk) → teacher's dispreferred token
+
+    use_ref=False (reference-free):
+        Loss = -log σ(β · (logπ_s(chosen) - logπ_s(rejected)))
+
+    use_ref=True (teacher as reference):
+        Loss = -log σ(β · ((logπ_s - logπ_t)(chosen) - (logπ_s - logπ_t)(rejected)))
+        = -log σ(β · (margin_s - margin_t))
+        where margin = logπ(chosen) - logπ(rejected)
+        Teacher provides implicit KL constraint without needing initial policy forward pass.
+
+    Args:
+        student_topk_log_probs: [batch, seq_len, K] — student log-probs aligned to student's top-K indices.
+        teacher_topk_log_probs: [batch, seq_len, K] — teacher log-probs aligned to the *same* top-K indices.
+        response_mask: [batch, seq_len] — mask for valid response tokens.
+        beta: DPO temperature β.
+        use_ref: If True, use teacher logprobs as reference (DPO with reference model).
+
+    Returns:
+        loss: scalar (mean over valid positions).
+        margin: scalar (mean log_ratio, for logging).
+    """
+    K = student_topk_log_probs.size(-1)
+    device = student_topk_log_probs.device
+
+    if K < 2:
+        return torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
+
+    # teacher's preferred / dispreferred candidate index among student's top-K
+    chosen_idx = teacher_topk_log_probs.argmax(dim=-1)   # [batch, seq_len]
+    rejected_idx = teacher_topk_log_probs.argmin(dim=-1)   # [batch, seq_len]
+
+    # gather student log-probs at chosen / rejected positions
+    chosen_logp_s = student_topk_log_probs.gather(-1, chosen_idx.unsqueeze(-1)).squeeze(-1)   # [batch, seq_len]
+    rejected_logp_s = student_topk_log_probs.gather(-1, rejected_idx.unsqueeze(-1)).squeeze(-1)  # [batch, seq_len]
+
+    if use_ref:
+        # Teacher log-probs at chosen / rejected positions (as reference)
+        chosen_logp_t = teacher_topk_log_probs.gather(-1, chosen_idx.unsqueeze(-1)).squeeze(-1)   # [batch, seq_len]
+        rejected_logp_t = teacher_topk_log_probs.gather(-1, rejected_idx.unsqueeze(-1)).squeeze(-1)  # [batch, seq_len]
+        # DPO with reference: (logp_s - logp_t)(chosen) - (logp_s - logp_t)(rejected) = margin_s - margin_t
+        log_ratio = (chosen_logp_s - chosen_logp_t) - (rejected_logp_s - rejected_logp_t)  # [batch, seq_len]
+    else:
+        # Reference-free: just student preference gap
+        log_ratio = chosen_logp_s - rejected_logp_s  # [batch, seq_len]
+
+    dpo_loss = -F.logsigmoid(beta * log_ratio)  # [batch, seq_len]
+
+    mask = response_mask.float()
+    valid_count = mask.sum().clamp(min=1.0)
+    loss = (dpo_loss * mask).sum() / valid_count
+    margin = (log_ratio * mask).sum() / valid_count
+
+    return loss, margin
+
+
 @deprecated("verl.trainer.ppo.core_algos.compute_policy_loss_vanilla")
 def compute_policy_loss(
     old_log_prob,

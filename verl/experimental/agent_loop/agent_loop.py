@@ -175,41 +175,6 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded log probabilities for the response tokens."""
     routed_experts: Optional[torch.Tensor] = None
     """Padded routed experts for the total tokens."""
-    branch_token_mask: Optional[torch.Tensor] = None
-    """Padded LongTensor [1, response_length]; 1 at positions where the
-    teacher-guided branching rollout injected a branch token, 0 elsewhere.
-    Only set when actor_rollout_ref.rollout.branching.enabled=True."""
-    is_branching_fallback: Optional[torch.Tensor] = None
-    """Per-row LongTensor [1]; 1 if this leaf came from a branching-fallback
-    path (owner pipeline raised, we used a plain student rollout instead),
-    else 0. Used by dp_actor to override branch_token_loss_mode='all' for
-    fallback rows so they don't get silently zero-gradient under btm=only."""
-    is_two_stage_stage1: Optional[torch.Tensor] = None
-    """Per-row LongTensor [1]; 1 if this rollout was generated in Stage 1 of
-    the two-stage pipeline (independent student rollouts), 0 if Stage 2
-    (teacher-guided branching). Used for DPO reward shaping."""
-    leaf_id: Optional[torch.Tensor] = None
-    """Per-row LongTensor [1]; leaf index within the branching tree.
-    Even = pos branch (teacher's preferred direction), odd = neg branch."""
-    teacher_branch_logprob: Optional[torch.Tensor] = None
-    """Per-row FloatTensor [1]; teacher's logprob of the branch token chosen
-    for this sample. Used for DPO reward shaping: sign depends on leaf_id
-    parity (pos vs neg branch)."""
-    teacher_sibling_logprob: Optional[torch.Tensor] = None
-    """Per-row FloatTensor [1]; teacher's logprob of the SIBLING's branch token.
-    DPO preference = teacher_branch_logprob - teacher_sibling_logprob."""
-    dpo_pair_id: Optional[torch.Tensor] = None
-    """Per-row LongTensor [1]; per-prompt-local id shared by a (chosen, rejected)
-    sibling pair; -1 for Stage 1 / fallback / unpaired leaves. Combined with
-    ``uid`` this uniquely identifies a DPO pair across the training batch and is
-    robust to batch reordering + size-1 micro-batching."""
-    dpo_role: Optional[torch.Tensor] = None
-    """Per-row LongTensor [1]; 0 = chosen (teacher-preferred), 1 = rejected,
-    -1 = not a DPO pair member."""
-    tree_idx: Optional[torch.Tensor] = None
-    """Per-row LongTensor [1]; which tree this rollout belongs to in two-stage
-    branching. Stage1[i] and all Stage2 leaves of tree[i] share tree_idx=i.
-    Used by DPO stage1_pair to match stage1 mid-anchor per tree."""
     multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None
     """Multi-modal inputs for processors (e.g., pixel_values, image_grid_thw)."""
     extra_fields: dict[str, Any] = {}
@@ -436,22 +401,6 @@ class AgentLoopWorker:
             trace_config.get("max_samples_per_step_per_worker", None),
         )
 
-    def clear_branching_cache(self) -> None:
-        """Drop the per-step coordination cache used by BranchingAgentLoop.
-
-        Called by AgentLoopManager before each generate_sequences dispatch so
-        sibling rows of step N don't pick up stale leaves cached during step
-        N-1. No-op when teacher-guided branching is disabled (the import is
-        cheap; the dicts are empty).
-        """
-        # Lazy import keeps the unrelated rollout paths free of branching deps.
-        from verl.experimental.agent_loop.branching_agent_loop import (
-            _branching_cache_clear,
-            _branching_index_counters_clear,
-        )
-        _branching_cache_clear()
-        _branching_index_counters_clear()
-
     @tqbridge()
     async def generate_sequences(self, batch: DataProto) -> DataProto:
         """Generate sequences from agent loop.
@@ -554,29 +503,8 @@ class AgentLoopWorker:
             )
 
             agent_loop_config = _agent_loop_registry[agent_name]
-            # Plumb the trainer's global step into kwargs so trajectory-aware
-            # agent loops (e.g. BranchingAgentLoop's per-step coordination
-            # cache key) can use it as a defense-in-depth signal alongside the
-            # explicit clear_branching_cache hook.
-            kwargs.setdefault("generation_step", int(trajectory.get("step", 0)))
             # Plumb the validate flag through so agent loops can branch on it.
-            # BranchingAgentLoop in particular needs this to disable its
-            # teacher-guided pipeline at val time and avoid GT leakage via
-            # priv-ctx (gt_marker / ref_gt modes inflate val reward by
-            # showing the teacher the ground-truth answer at evaluation, where
-            # deploy has neither teacher nor GT).
             kwargs.setdefault("validate", bool(trajectory.get("validate", False)))
-            # Two-stage branching: inject a scoring callback so the owner can
-            # evaluate Stage 1 responses to determine success before branching.
-            branching_cfg = self.config.actor_rollout_ref.rollout.get("branching", None)
-            if (
-                branching_cfg
-                and branching_cfg.get("two_stage", False)
-                and branching_cfg.get("two_stage_teacher_mode", "ref_or_marker") == "ref_or_marker"
-                and self.use_reward_loop
-                and not kwargs.get("validate", False)
-            ):
-                kwargs.setdefault("score_fn", self._build_two_stage_score_fn(kwargs))
             agent_loop = hydra.utils.instantiate(
                 config=agent_loop_config,
                 trainer_config=DictConfigWrap(config=self.config),
@@ -588,82 +516,6 @@ class AgentLoopWorker:
             )
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
             return await self._agent_loop_postprocess(output, **kwargs)
-
-    def _build_two_stage_score_fn(self, kwargs: dict[str, Any]):
-        """Build an async scoring callback for two-stage branching.
-
-        The returned coroutine accepts (prompt_ids, response_ids, raw_prompt)
-        and returns a float reward score. It constructs the minimal DataProto
-        needed by reward_loop_worker.compute_score and calls it remotely.
-        """
-        config = self.config.actor_rollout_ref.rollout
-        prompt_length = config.prompt_length
-        response_length = config.response_length
-
-        async def _score_fn(
-            prompt_ids: list[int],
-            response_ids: list[int],
-            raw_prompt: list[dict],
-            **extra,
-        ) -> float:
-            # Pad prompt (left) and response (right) to fixed lengths
-            self.tokenizer.padding_side = "left"
-            prompt_padded = self.tokenizer.pad(
-                {"input_ids": prompt_ids},
-                padding="max_length",
-                max_length=prompt_length,
-                return_tensors="pt",
-                return_attention_mask=True,
-            )
-            if prompt_padded["input_ids"].dim() == 1:
-                prompt_padded["input_ids"] = prompt_padded["input_ids"].unsqueeze(0)
-                prompt_padded["attention_mask"] = prompt_padded["attention_mask"].unsqueeze(0)
-
-            self.tokenizer.padding_side = "right"
-            response_padded = self.tokenizer.pad(
-                {"input_ids": response_ids[:response_length]},
-                padding="max_length",
-                max_length=response_length,
-                return_tensors="pt",
-                return_attention_mask=True,
-            )
-            if response_padded["input_ids"].dim() == 1:
-                response_padded["input_ids"] = response_padded["input_ids"].unsqueeze(0)
-                response_padded["attention_mask"] = response_padded["attention_mask"].unsqueeze(0)
-
-            prompts = prompt_padded["input_ids"]
-            responses = response_padded["input_ids"]
-            attention_mask = torch.cat([
-                prompt_padded["attention_mask"], response_padded["attention_mask"]
-            ], dim=1)
-            input_ids = torch.cat([prompts, responses], dim=1)
-            position_ids = compute_position_id_with_mask(attention_mask)
-
-            batch = TensorDict(
-                {
-                    "prompts": prompts,
-                    "responses": responses,
-                    "attention_mask": attention_mask,
-                    "input_ids": input_ids,
-                    "position_ids": position_ids,
-                },
-                batch_size=1,
-            )
-            # Build minimal non_tensor_batch with required fields
-            non_tensor_batch = {
-                "raw_prompt": np.array([raw_prompt], dtype=object),
-                "__num_turns__": np.array([2]),
-            }
-            # Pass through relevant fields from the original kwargs
-            for key in ("uid", "reward_model", "index"):
-                if key in kwargs:
-                    non_tensor_batch[key] = np.array([kwargs[key]], dtype=object)
-
-            data = DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
-            result = await self.reward_loop_worker.compute_score.remote(data)
-            return float(result.get("reward_score", 0.0) or 0.0)
-
-        return _score_fn
 
     async def _agent_loop_postprocess(self, output, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
@@ -729,64 +581,6 @@ class AgentLoopWorker:
             pad_size = self.config.actor_rollout_ref.rollout.response_length - len(output.response_logprobs)
             response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
 
-        branch_token_mask = None
-        is_branching_fallback = None
-        # Use .get(..., None) (NOT .pop) so siblings sharing an extra_fields dict
-        # via a shallow copy don't clobber each other. BranchingAgentLoop already
-        # builds fresh dicts per leaf, but this guard makes the postprocess
-        # idempotent and tolerant of future producers.
-        btm_raw = output.extra_fields.get("branch_token_mask") if output.extra_fields else None
-        if btm_raw is not None:
-            response_length = self.config.actor_rollout_ref.rollout.response_length
-            btm_list = list(btm_raw)[:response_length]
-            pad_size = response_length - len(btm_list)
-            branch_token_mask = torch.tensor(
-                btm_list + [0] * pad_size, dtype=torch.long
-            ).unsqueeze(0)
-            # Per-row scalar: 1 if this leaf came from a branching fallback
-            # path (BranchingAgentLoop's owner pipeline raised and we fell
-            # through to a plain student rollout), else 0. dp_actor uses this
-            # to override branch_token_loss_mode='all' for fallback rows so
-            # the mode×fallback interaction does NOT silently zero out the PG
-            # (e.g. btm=only on a row whose mask is all-zeros — see Phase 1c.2
-            # adversarial audit).
-            is_branching_fallback = torch.tensor(
-                [int(output.extra_fields.get("is_branching_fallback", 0) or 0)],
-                dtype=torch.long,
-            )
-
-        # DPO fields: is_two_stage_stage1, leaf_id, teacher_branch_logprob,
-        # dpo_pair_id / dpo_role (stable chosen/rejected pairing key).
-        is_two_stage_stage1 = None
-        leaf_id = None
-        teacher_branch_logprob = None
-        teacher_sibling_logprob = None
-        dpo_pair_id = None
-        dpo_role = None
-        tree_idx = None
-        if output.extra_fields:
-            _is_s1 = output.extra_fields.get("is_two_stage_stage1", None)
-            if _is_s1 is not None:
-                is_two_stage_stage1 = torch.tensor([int(_is_s1)], dtype=torch.long)
-            _pair_id = output.extra_fields.get("dpo_pair_id", None)
-            if _pair_id is not None:
-                dpo_pair_id = torch.tensor([int(_pair_id)], dtype=torch.long)
-            _role = output.extra_fields.get("dpo_role", None)
-            if _role is not None:
-                dpo_role = torch.tensor([int(_role)], dtype=torch.long)
-            _tree_idx = output.extra_fields.get("tree_idx", None)
-            if _tree_idx is not None:
-                tree_idx = torch.tensor([int(_tree_idx)], dtype=torch.long)
-            _leaf_id = output.extra_fields.get("leaf_id", None)
-            if _leaf_id is not None:
-                leaf_id = torch.tensor([int(_leaf_id)], dtype=torch.long)
-            _t_lp = output.extra_fields.get("teacher_branch_logprob", None)
-            if _t_lp is not None:
-                teacher_branch_logprob = torch.tensor([float(_t_lp)], dtype=torch.float32)
-            _t_sib_lp = output.extra_fields.get("teacher_sibling_logprob", None)
-            if _t_sib_lp is not None:
-                teacher_sibling_logprob = torch.tensor([float(_t_sib_lp)], dtype=torch.float32)
-
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
         attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
         input_ids = torch.cat([prompt_output["input_ids"], response_output["input_ids"]], dim=1)
@@ -836,15 +630,6 @@ class AgentLoopWorker:
             attention_mask=attention_mask,
             response_logprobs=response_logprobs,
             routed_experts=routed_experts,
-            branch_token_mask=branch_token_mask,
-            is_branching_fallback=is_branching_fallback,
-            is_two_stage_stage1=is_two_stage_stage1,
-            leaf_id=leaf_id,
-            teacher_branch_logprob=teacher_branch_logprob,
-            teacher_sibling_logprob=teacher_sibling_logprob,
-            dpo_pair_id=dpo_pair_id,
-            dpo_role=dpo_role,
-            tree_idx=tree_idx,
             multi_modal_inputs=multi_modal_inputs,
             multi_modal_data=output.multi_modal_data,
             reward_score=output.reward_score,
@@ -957,77 +742,6 @@ class AgentLoopWorker:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
         if inputs[0].routed_experts is not None:
             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
-        # branch_token_mask: opt-in field from BranchingAgentLoop. Treat absence
-        # as all-zeros for robustness — historically `inputs[0]` could be the
-        # only None among siblings (e.g., when a fallback leaf landed in the
-        # first position) and silently dropping the field would disable the
-        # downstream Phase-2 weighting. Now: aggregate iff ANY input carries
-        # the mask, zero-fill the missing entries.
-        any_btm = any(getattr(input, "branch_token_mask", None) is not None for input in inputs)
-        if any_btm:
-            response_length = inputs[0].response_ids.shape[-1]
-            btm_chunks = []
-            ifb_chunks = []
-            s1_chunks = []
-            lid_chunks = []
-            tlp_chunks = []
-            tslp_chunks = []
-            pid_chunks = []
-            role_chunks = []
-            tidx_chunks = []
-            for input in inputs:
-                if input.branch_token_mask is not None:
-                    btm_chunks.append(input.branch_token_mask)
-                else:
-                    btm_chunks.append(
-                        torch.zeros(1, response_length, dtype=torch.long)
-                    )
-                if getattr(input, "is_branching_fallback", None) is not None:
-                    ifb_chunks.append(input.is_branching_fallback)
-                else:
-                    ifb_chunks.append(torch.zeros(1, dtype=torch.long))
-                # DPO fields: zero-fill missing entries for robustness
-                if getattr(input, "is_two_stage_stage1", None) is not None:
-                    s1_chunks.append(input.is_two_stage_stage1)
-                else:
-                    s1_chunks.append(torch.zeros(1, dtype=torch.long))
-                if getattr(input, "leaf_id", None) is not None:
-                    lid_chunks.append(input.leaf_id)
-                else:
-                    lid_chunks.append(torch.zeros(1, dtype=torch.long))
-                if getattr(input, "teacher_branch_logprob", None) is not None:
-                    tlp_chunks.append(input.teacher_branch_logprob)
-                else:
-                    tlp_chunks.append(torch.full((1,), float("nan"), dtype=torch.float32))
-                if getattr(input, "teacher_sibling_logprob", None) is not None:
-                    tslp_chunks.append(input.teacher_sibling_logprob)
-                else:
-                    tslp_chunks.append(torch.full((1,), float("nan"), dtype=torch.float32))
-                # DPO pairing key: -1 (not 0) is the "unpaired" sentinel because
-                # 0 is a valid pair_id / role value.
-                if getattr(input, "dpo_pair_id", None) is not None:
-                    pid_chunks.append(input.dpo_pair_id)
-                else:
-                    pid_chunks.append(torch.full((1,), -1, dtype=torch.long))
-                if getattr(input, "dpo_role", None) is not None:
-                    role_chunks.append(input.dpo_role)
-                else:
-                    role_chunks.append(torch.full((1,), -1, dtype=torch.long))
-                # tree_idx: -1 sentinel for non-two-stage rows
-                if getattr(input, "tree_idx", None) is not None:
-                    tidx_chunks.append(input.tree_idx)
-                else:
-                    tidx_chunks.append(torch.full((1,), -1, dtype=torch.long))
-            optional_outputs["branch_token_mask"] = torch.cat(btm_chunks, dim=0)
-            optional_outputs["is_branching_fallback"] = torch.cat(ifb_chunks, dim=0)
-            optional_outputs["is_two_stage_stage1"] = torch.cat(s1_chunks, dim=0)
-            optional_outputs["leaf_id"] = torch.cat(lid_chunks, dim=0)
-            optional_outputs["teacher_branch_logprob"] = torch.cat(tlp_chunks, dim=0)
-            optional_outputs["teacher_sibling_logprob"] = torch.cat(tslp_chunks, dim=0)
-            optional_outputs["dpo_pair_id"] = torch.cat(pid_chunks, dim=0)
-            optional_outputs["dpo_role"] = torch.cat(role_chunks, dim=0)
-            optional_outputs["tree_idx"] = torch.cat(tidx_chunks, dim=0)
-
         batch = TensorDict(
             {
                 "prompts": prompt_ids,  # [bsz, prompt_length]
@@ -1076,15 +790,6 @@ class AgentLoopWorker:
 
         non_tensor_batch.update(extra_fields)
 
-        # NOTE: branching diagnostic aggregation is INTENTIONALLY NOT done here.
-        # If we wrote a per-worker dict into meta_info, DataProto.concat across
-        # AgentLoopWorker chunks asserts equality on meta_info values
-        # (verl/protocol.py:963 "Conflicting values for meta_info key
-        # 'branching_metrics'") — different workers produce different
-        # aggregates and the assertion fires.
-        # Per-leaf branching_diag and is_branching_fallback are still in
-        # non_tensor_batch (above), so AgentLoopManager.generate_sequences
-        # aggregates after the concat. See _aggregate_branching_diag_from_batch.
         return DataProto(
             batch=batch,
             non_tensor_batch=non_tensor_batch,
@@ -1105,70 +810,6 @@ class AgentLoopWorker:
             client_id=f"AgentLoopWorker_{client_name}",
             config=self.config.transfer_queue,
         )
-
-
-def _aggregate_branching_diag_from_batch(output: DataProto) -> dict:
-    """Aggregate teacher-guided branching diagnostics across the FULL post-concat batch.
-
-    Reads ``non_tensor_batch["branching_diag"]`` (per-leaf dict carrying
-    sigma_relaxations / teacher_intersect_misses / split_attempts /
-    splits_succeeded — written by BranchingAgentLoop._flatten_tree_to_leaves)
-    and ``non_tensor_batch["is_branching_fallback"]`` (per-leaf int 0/1).
-
-    Returns a flat ``{step_metric_name: float}`` dict suitable for SwanLab.
-    Empty dict when no leaves carry branching state (legacy non-branching
-    rollouts). Crucially, runs ONCE per step at the manager level — putting
-    this in the worker triggers a DataProto.concat meta_info conflict
-    (verl/protocol.py:963 'Conflicting values for meta_info key ...').
-    """
-    nt = getattr(output, "non_tensor_batch", None) or {}
-    diag_arr = nt.get("branching_diag")
-    fb_arr = nt.get("is_branching_fallback")
-    if diag_arr is None and fb_arr is None:
-        return {}
-
-    diag_keys = ("sigma_relaxations", "teacher_intersect_misses", "split_attempts", "splits_succeeded")
-    sums = {k: 0 for k in diag_keys}
-    seen_diag = 0
-    fallback_count = 0
-    n = 0
-    if diag_arr is not None:
-        for d in diag_arr:
-            n += 1
-            if isinstance(d, dict):
-                seen_diag += 1
-                for k in diag_keys:
-                    v = d.get(k)
-                    if isinstance(v, (int, float)):
-                        sums[k] += int(v)
-    if fb_arr is not None:
-        for f in fb_arr:
-            try:
-                if int(f or 0) > 0:
-                    fallback_count += 1
-            except (TypeError, ValueError):
-                pass
-        if n == 0:
-            n = len(fb_arr)
-
-    if seen_diag == 0 and fallback_count == 0:
-        return {}
-    out = {
-        "rollout/branching/owner_calls": float(seen_diag),
-        "rollout/branching/leaf_count": float(n),
-        "rollout/branching/fallback_leaves": float(fallback_count),
-        "rollout/branching/fallback_fraction": float(fallback_count) / max(n, 1),
-    }
-    if seen_diag > 0:
-        for k, v in sums.items():
-            out[f"rollout/branching/{k}_total"] = float(v)
-            out[f"rollout/branching/{k}_per_owner"] = float(v) / max(seen_diag, 1)
-        attempts = sums["split_attempts"]
-        succeeded = sums["splits_succeeded"]
-        out["rollout/branching/split_success_rate"] = (
-            float(succeeded) / max(attempts, 1)
-        )
-    return out
 
 
 async def get_trajectory_info(step, index, validate):
@@ -1301,16 +942,6 @@ class AgentLoopManager:
         if self.reward_model_manager:
             self.reward_model_manager.wake_up()
 
-        # Teacher-guided branching: clear the per-step coordination cache before
-        # dispatching this batch so sibling rows of step N don't pick up stale
-        # leaves cached during step N-1. Lives in workers, so dispatch a no-op
-        # method on each worker that calls _branching_cache_clear locally.
-        # Cheap (no-op) when branching is disabled.
-        ray.get([
-            worker.clear_branching_cache.remote()
-            for worker in self.agent_loop_workers
-        ])
-
         chunkes = prompts.chunk(len(self.agent_loop_workers))
         outputs = ray.get(
             [
@@ -1318,16 +949,9 @@ class AgentLoopManager:
                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
             ]
         )
-        # Branching rollout can produce different non_tensor_batch key sets
-        # across worker chunks (e.g. only some chunks contain padded duplicate
-        # leaves carrying ``is_padded_duplicate`` / ``pad_index``, or only some
-        # chunks hit a fallback path). DataProto.concat -> list_of_dict_to_dict_of_list
-        # uses outputs[0].keys() as the schema and asserts every later chunk's
-        # keys is a subset, so any drift triggers an AssertionError mid-training.
-        # Align the schemas to the union of keys here, filling missing slots
-        # with an object array of None so downstream consumers that already
-        # check ``isinstance(d, dict)`` (e.g. _aggregate_branching_diag_from_batch)
-        # remain safe.
+        # Align non_tensor_batch schemas across worker chunks to the union of
+        # keys, filling missing slots with None so DataProto.concat doesn't
+        # assert on key drift.
         if len(outputs) > 1:
             all_nt_keys: set = set()
             for _o in outputs:
@@ -1343,13 +967,6 @@ class AgentLoopManager:
                         _nt[_k] = _arr
         output = DataProto.concat(outputs)
 
-        # Aggregate teacher-guided branching diagnostics across the full batch
-        # AFTER the concat. We can't do this inside the worker because
-        # DataProto.concat asserts meta_info equality across chunks; per-worker
-        # aggregates would conflict. Instead read non_tensor_batch which IS
-        # concatenated row-wise, and produce one step-level aggregate here.
-        branching_metrics = _aggregate_branching_diag_from_batch(output)
-
         # Fix for Issue #4147: Always call sleep() to ensure proper cleanup
         self.sleep()
         if self.reward_model_manager:
@@ -1359,13 +976,7 @@ class AgentLoopManager:
         metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
         timing = self._performance_metrics(metrics, output)
 
-        # NOTE: this assignment fully REPLACES output.meta_info with timing +
-        # outputs[0].meta_info — any keys we set on output.meta_info BEFORE
-        # this line would be silently dropped. Stash branching_metrics here so
-        # the trainer hook (ray_trainer.py:1900-1908) can pick it up.
         output.meta_info = {"timing": timing, **outputs[0].meta_info}
-        if branching_metrics:
-            output.meta_info["branching_metrics"] = branching_metrics
         return output
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:

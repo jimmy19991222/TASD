@@ -1,0 +1,64 @@
+# Token-level DPO baseline (no GRPO PG, no JSD, only DPO loss)
+#
+# This config enables token-level DPO in "DPO-only" mode:
+# - policy_loss.loss_mode=sdpo triggers teacher forward pass
+# - token_dpo_only=True skips JSD loss, pg_loss set to zero
+# - token_dpo_enabled=True activates token-level DPO loss
+# - Total loss = token_dpo_coefficient * token_dpo_loss
+#
+# TOKEN_DPO_USE_REF env var controls reference model usage:
+# - False (default): reference-free DPO
+#     Loss = -log σ(β · (logπ_s(chosen) - logπ_s(rejected)))
+# - True: teacher as reference
+#     Loss = -log σ(β · ((logπ_s - logπ_t)(chosen) - (logπ_s - logπ_t)(rejected)))
+
+defaults:
+  - ppo_trainer
+  - user
+  - _self_
+
+# MAX_PROMPT_LENGTH=2048
+# MAX_RESPONSE_LENGTH=8192
+# MAX_FEEDBACK_LENGTH=8192
+# TEMPLATE_LENGTH=512
+# MAX_MODEL_LEN=$((TEMPLATE_LENGTH + MAX_PROMPT_LENGTH + MAX_FEEDBACK_LENGTH + MAX_RESPONSE_LENGTH))
+max_model_len: 18944
+
+seed: 42
+
+actor_rollout_ref:
+  actor:
+    ppo_mini_batch_size: 32
+    policy_loss:
+      loss_mode: sdpo
+    self_distillation:
+      max_reprompt_len: 10240
+      is_clip: 2.0
+      distillation_topk: 10
+      full_logit_distillation: True
+      teacher_regularization: ema
+      teacher_update_rate: 0.001
+      # Token-level DPO (DPO-only mode)
+      token_dpo_enabled: True
+      token_dpo_only: True
+      token_dpo_beta: 1.0
+      token_dpo_coefficient: 1.0
+      token_dpo_use_ref: ${oc.env:TOKEN_DPO_USE_REF,False}
+    optim:
+      lr: 1e-5
+  rollout:
+    n: 8
+    calculate_log_probs: True
+
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: False
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+
+data:
+  train_batch_size: 32
+
+trainer:
+  val_before_train: False

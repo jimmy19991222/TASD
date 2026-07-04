@@ -29,8 +29,13 @@ from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, compute_self_distillation_loss, get_policy_loss_fn, kl_penalty
-from verl.trainer.ppo.utils import suffix_avg_logp
+from verl.trainer.ppo.core_algos import (
+    agg_loss,
+    compute_self_distillation_loss,
+    compute_token_dpo_loss,
+    get_policy_loss_fn,
+    kl_penalty,
+)
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -47,9 +52,6 @@ __all__ = ["DataParallelPPOActor"]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
-
-# Module-level flag to warn once about btm=only silently zeroing DPO loss.
-_warned_btm_only_dpo = False
 
 
 class TrustRegionTeacher(nn.Module):
@@ -563,101 +565,6 @@ class DataParallelPPOActor(BasePPOActor):
                     outputs["topk_indices"] = topk_indices
             return outputs
 
-    def _apply_branch_loss_mode(
-        self,
-        *,
-        response_mask: torch.Tensor,
-        branch_token_mask: Optional[torch.Tensor],
-        branch_loss_mode: str,
-        is_branching_fallback: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, dict]:
-        """Apply the teacher-guided branching ablation to ``response_mask``.
-
-        Four modes:
-          ``all``    : default. mask is ignored; every response token contributes.
-          ``mask``   : zero-out branch tokens before aggregation
-                       (response_mask AND NOT branch_token_mask).
-          ``only``   : keep ONLY branch tokens (response_mask AND branch_token_mask).
-          ``suffix`` : keep only tokens AFTER the last branch token in each row.
-                       This isolates each leaf's unique student continuation,
-                       eliminating gradient cancellation on shared prefixes
-                       (where GRPO advantage sums to zero across siblings).
-
-        For rows where ``is_branching_fallback`` is True (BranchingAgentLoop's
-        owner pipeline raised, the row is a plain student rollout), the
-        configured mode is OVERRIDDEN to ``all`` for that row only — otherwise
-        ``btm=only``/``suffix`` would silently zero out every fallback row's
-        gradient (mask is all-zero on fallback leaves).
-
-        Returns ``(effective_response_mask, metrics)``. Diagnostic metrics
-        are emitted REGARDLESS of mode so btm=all runs are still observable
-        in SwanLab — without this, a run that silently degraded to 100%
-        fallback would be indistinguishable from healthy branching.
-        """
-        # Fast path: mask absent (non-branching rollout) — no telemetry needed.
-        if branch_token_mask is None:
-            return response_mask, {}
-        btm = branch_token_mask.to(response_mask.device).to(response_mask.dtype)
-
-        # Per-row mode application: fallback rows always run as "all".
-        if branch_loss_mode == "all":
-            effective = response_mask
-        elif branch_loss_mode in ("mask", "only", "suffix"):
-            if branch_loss_mode == "mask":
-                masked = response_mask * (1 - btm)
-            elif branch_loss_mode == "only":
-                masked = response_mask * btm
-            else:  # "suffix"
-                # Build a per-row suffix mask: 1 for positions strictly AFTER
-                # the last branch token, 0 elsewhere. This keeps only the
-                # leaf's unique continuation segment (on-policy, non-shared).
-                T = btm.shape[1]
-                positions = torch.arange(T, device=btm.device).unsqueeze(0)  # [1, T]
-                # Weighted positions: btm * pos → max gives rightmost branch token idx.
-                # For rows with NO branch tokens, max of all-zeros = 0; we fix below.
-                has_branch = btm.any(dim=1)  # [B]
-                weighted = btm * positions  # [B, T]
-                last_branch_pos = weighted.max(dim=1).values.long()  # [B]
-                # Rows without branch tokens → set last_branch_pos = -1 so
-                # suffix_mask covers the full response (all positions > -1).
-                last_branch_pos = torch.where(
-                    has_branch, last_branch_pos,
-                    torch.tensor(-1, device=btm.device, dtype=last_branch_pos.dtype),
-                )
-                suffix_mask = (positions > last_branch_pos.unsqueeze(1)).to(response_mask.dtype)
-                masked = response_mask * suffix_mask
-
-            if is_branching_fallback is not None and is_branching_fallback.numel() > 0:
-                # is_branching_fallback shape: [B]; broadcast to [B, T] selector.
-                ifb = is_branching_fallback.to(response_mask.device).to(response_mask.dtype)
-                ifb_row = ifb.view(-1, *([1] * (response_mask.dim() - 1)))
-                # Where ifb=1, use response_mask (all-tokens); where 0, use masked.
-                effective = ifb_row * response_mask + (1.0 - ifb_row) * masked
-            else:
-                effective = masked
-        else:
-            raise ValueError(
-                f"branch_token_loss_mode must be one of {{all, mask, only, suffix}}, "
-                f"got {branch_loss_mode!r}"
-            )
-
-        # Always-on diagnostics so btm=all and btm=mask runs are
-        # distinguishable, and silent-fallback runs are immediately visible.
-        with torch.no_grad():
-            base_active = response_mask.sum().clamp_min(1.0)
-            eff_active = effective.sum()
-            mode_id_map = {"all": 0, "mask": 1, "only": 2, "suffix": 3}
-            metrics = {
-                "branching/loss_mode_id": float(mode_id_map[branch_loss_mode]),
-                "branching/active_token_ratio": (eff_active / base_active).item(),
-                "branching/branch_token_count": btm.sum().item(),
-            }
-            if is_branching_fallback is not None and is_branching_fallback.numel() > 0:
-                ifb = is_branching_fallback.to(torch.float32)
-                metrics["branching/fallback_row_fraction"] = ifb.mean().item()
-                metrics["branching/fallback_row_count"] = int(ifb.sum().item())
-        return effective, metrics
-
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
         if self.scaler is not None:
@@ -804,10 +711,6 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("prompts")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
-        elif (float(self.config.policy_loss.get("dpo_coefficient", 0.0)) > 0
-              and self.config.policy_loss.get("dpo_use_ref", False)
-              and "ref_log_prob" in data.batch.keys()):
-            select_keys.append("ref_log_prob")
         if self_distillation_enabled:
             select_keys.extend(list(self_distillation_required_keys))
         # Include pre-computed IS weights if present in batch
@@ -817,40 +720,13 @@ class DataParallelPPOActor(BasePPOActor):
         # Include rollout_log_probs for computing rollout_corr metrics in bypass mode
         if "rollout_log_probs" in data.batch.keys():
             select_keys.append("rollout_log_probs")
-        # Include branch_token_mask for the teacher-guided branching rollout's
-        # GRPO loss-mode ablations (lands in Phase 2).
-        if "branch_token_mask" in data.batch.keys():
-            select_keys.append("branch_token_mask")
-        # is_branching_fallback travels alongside branch_token_mask: tells
-        # _apply_branch_loss_mode which rows came from a fallback path so it
-        # can override mode='all' for those rows (else btm=only silently zeros
-        # the gradient on the fallback rows).
-        if "is_branching_fallback" in data.batch.keys():
-            select_keys.append("is_branching_fallback")
-        # DPO: is_two_stage_stage1 identifies Stage 2 samples for DPO loss
-        if "is_two_stage_stage1" in data.batch.keys():
-            select_keys.append("is_two_stage_stage1")
-        # DPO loss is now a per-sample weighted-logp sum: pairing + the per-sample
-        # coefficient (dpo_coeff) are computed centrally in the trainer, so the
-        # actor no longer needs the raw pairing metadata or cross-rank co-location.
-        dpo_active = float(self.config.policy_loss.get("dpo_coefficient", 0.0)) > 0
-        for _k in ("dpo_coeff", "dpo_pair_member"):
-            if _k in data.batch.keys():
-                select_keys.append(_k)
-
         has_multi_modal_inputs = self._has_non_empty_multi_modal_inputs(
             data.non_tensor_batch.get("multi_modal_inputs")
         )
         non_tensor_select_keys = []
-        # DPO prompt grouping: "uid" (unique per prompt, shared by a prompt's
-        # rollouts) is the outer key that makes (uid, dpo_pair_id) globally
-        # unique. Needed both for Stage 1 3-way pairing AND for regrouping
-        # micro-batches so a (chosen, rejected) pair lands in one forward.
-        if (self.config.policy_loss.get("dpo_stage1_pair", False) or dpo_active) and "uid" in data.non_tensor_batch:
-            non_tensor_select_keys.append("uid")
         if has_multi_modal_inputs:
             non_tensor_select_keys.append("multi_modal_inputs")
-        if self.use_prefix_grouper and "uid" in data.non_tensor_batch.keys() and "uid" not in non_tensor_select_keys:
+        if self.use_prefix_grouper and "uid" in data.non_tensor_batch.keys():
             non_tensor_select_keys.append("uid")
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
@@ -868,12 +744,6 @@ class DataParallelPPOActor(BasePPOActor):
         did_update = False
         for _ in range(self.config.ppo_epochs):
             for _batch_idx, mini_batch in enumerate(mini_batches):
-                # DPO no longer needs (chosen, rejected) siblings co-located in one
-                # micro-batch: pairing is done trainer-side and the pairwise loss is
-                # replaced by a per-sample weighted-logp sum (see dpo_coeff). So
-                # micro-batching is uniform fixed-size on every path, which keeps the
-                # backward / FSDP reduce_scatter count identical across DP ranks (no
-                # uid-based regrouping, no NCCL collective-count desync).
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
@@ -882,13 +752,6 @@ class DataParallelPPOActor(BasePPOActor):
                         self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
                     )
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
-
-                # Number of DPO pairs in this rank's mini-batch, used to turn the
-                # summed per-sample DPO surrogate into a per-mini-batch mean (FSDP
-                # then averages across ranks -> global pair-mean). >=1 to avoid /0.
-                dpo_pairs_in_mini = None
-                if "dpo_pair_member" in mini_batch.batch.keys():
-                    dpo_pairs_in_mini = max(1.0, float(mini_batch.batch["dpo_pair_member"].sum().item()) / 2.0)
 
                 self.actor_optimizer.zero_grad()
 
@@ -947,22 +810,6 @@ class DataParallelPPOActor(BasePPOActor):
                     # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                     rollout_is_weights = model_inputs.get("rollout_is_weights", None)
 
-                    # Teacher-guided branching: derive an effective response_mask
-                    # from the teacher-injected branch_token_mask, applied to BOTH
-                    # the SDPO distill loss and the GRPO/PPO PG loss path so the
-                    # ablation modes (all/mask/only) compose consistently with
-                    # whichever loss is active. Fallback rows (where the owner
-                    # pipeline raised) are forced to mode='all' on a per-row
-                    # basis so btm=only doesn't silently zero them out.
-                    effective_response_mask, branch_metrics = self._apply_branch_loss_mode(
-                        response_mask=response_mask,
-                        branch_token_mask=model_inputs.get("branch_token_mask", None),
-                        branch_loss_mode=self.config.policy_loss.get("branch_token_loss_mode", "all"),
-                        is_branching_fallback=model_inputs.get("is_branching_fallback", None),
-                    )
-                    if branch_metrics:
-                        micro_batch_metrics.update(branch_metrics)
-
                     if self_distillation_enabled:
                         teacher_inputs = {
                             "responses": model_inputs["responses"],
@@ -988,23 +835,57 @@ class DataParallelPPOActor(BasePPOActor):
                         teacher_log_prob = teacher_outputs["log_probs"]
                         teacher_all_logps = teacher_outputs.get("all_logps") if return_all_logps else None
                         teacher_topk_logps = teacher_outputs.get("topk_logps") if distill_topk else None
-                        pg_loss, pg_metrics = compute_self_distillation_loss(
-                            student_log_probs=log_prob,
-                            teacher_log_probs=teacher_log_prob,
-                            response_mask=effective_response_mask,
-                            self_distillation_config=self_distillation_cfg,
-                            old_log_probs=old_log_prob,
-                            student_all_log_probs=student_all_logps,
-                            teacher_all_log_probs=teacher_all_logps,
-                            student_topk_log_probs=student_topk_logps,
-                            teacher_topk_log_probs=teacher_topk_logps,
-                            self_distillation_mask=self_distillation_mask,
-                            loss_agg_mode=loss_agg_mode,
-                            rollout_is_weights=rollout_is_weights,
-                        )
+                        # Read token DPO config
+                        token_dpo_enabled = self_distillation_cfg.get("token_dpo_enabled", False)
+                        token_dpo_only = self_distillation_cfg.get("token_dpo_only", False)
+                        token_dpo_use_ref = self_distillation_cfg.get("token_dpo_use_ref", False)
+
+                        if token_dpo_only:
+                            # DPO-only mode: skip JSD loss, use zero placeholder
+                            pg_loss = torch.tensor(0.0, device=log_prob.device, dtype=log_prob.dtype)
+                            pg_metrics = {}
+                        else:
+                            pg_loss, pg_metrics = compute_self_distillation_loss(
+                                student_log_probs=log_prob,
+                                teacher_log_probs=teacher_log_prob,
+                                response_mask=response_mask,
+                                self_distillation_config=self_distillation_cfg,
+                                old_log_probs=old_log_prob,
+                                student_all_log_probs=student_all_logps,
+                                teacher_all_log_probs=teacher_all_logps,
+                                student_topk_log_probs=student_topk_logps,
+                                teacher_topk_log_probs=teacher_topk_logps,
+                                self_distillation_mask=self_distillation_mask,
+                                loss_agg_mode=loss_agg_mode,
+                                rollout_is_weights=rollout_is_weights,
+                            )
 
                         pg_metrics["self_distillation/empty_target_batch"] = self_distillation_mask.sum().item() == 0
                         micro_batch_metrics.update(pg_metrics)
+
+                        # Token-level DPO (reuses teacher forward pass top-K logprobs)
+                        if (
+                            token_dpo_enabled
+                            and student_topk_logps is not None
+                            and teacher_topk_logps is not None
+                        ):
+                            token_dpo_beta = self_distillation_cfg.get("token_dpo_beta", 1.0)
+                            token_dpo_coef = self_distillation_cfg.get("token_dpo_coefficient", 0.1)
+                            # 构建 DPO 用的有效 mask（与 SDPO loss 保持一致）
+                            dpo_mask = response_mask
+                            if self_distillation_mask is not None:
+                                dpo_mask = dpo_mask * self_distillation_mask.unsqueeze(1)
+
+                            token_dpo_loss, token_dpo_margin = compute_token_dpo_loss(
+                                student_topk_log_probs=student_topk_logps,
+                                teacher_topk_log_probs=teacher_topk_logps,
+                                response_mask=dpo_mask,
+                                beta=token_dpo_beta,
+                                use_ref=token_dpo_use_ref,
+                            )
+                            pg_loss = pg_loss + token_dpo_coef * token_dpo_loss
+                            micro_batch_metrics["actor/token_dpo_loss"] = token_dpo_loss.detach().item()
+                            micro_batch_metrics["actor/token_dpo_margin"] = token_dpo_margin.detach().item()
                     else:
                         # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
                         # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
@@ -1015,7 +896,7 @@ class DataParallelPPOActor(BasePPOActor):
                             old_log_prob=old_log_prob,
                             log_prob=log_prob,
                             advantages=advantages,
-                            response_mask=effective_response_mask,
+                            response_mask=response_mask,
                             loss_agg_mode=loss_agg_mode,
                             config=self.config,
                             rollout_is_weights=rollout_is_weights,
@@ -1037,68 +918,6 @@ class DataParallelPPOActor(BasePPOActor):
                         micro_batch_metrics.update(rollout_corr_metrics)
 
                     policy_loss = pg_loss
-
-                    # On-policy DPO (branching): the coupled pairwise loss is
-                    # replaced by a per-sample weighted-logp sum. Pairing and the
-                    # per-sample coefficient `dpo_coeff` (= ±β·w_i, un-normalized)
-                    # are computed trainer-side, so here we only need each sample's
-                    # CURRENT-policy suffix-avg logp. dpo_coeff is 0 for Stage-1
-                    # non-anchor / unpaired rows, so those contribute no gradient
-                    # (Stage-1 = exploration only). The DPO loss is a per-mini-batch
-                    # MEAN over pairs: sum coeff·avg_logp across the mini-batch (via
-                    # accumulation over micro-batches) and divide by the pair count;
-                    # FSDP then averages across ranks -> global pair-mean, matching
-                    # the original .mean() convention and pg_loss's behavior. The
-                    # surrogate is a sum (pairs may span micro-batches), so we divide
-                    # out loss_scale_factor — the shared `loss = policy_loss *
-                    # loss_scale_factor` below re-applies it, leaving the DPO term
-                    # summed-not-averaged across micro-batches while entropy/kl stay
-                    # per-micro-batch averaged.
-                    dpo_coeff = model_inputs.get("dpo_coeff", None)
-                    if dpo_coeff is not None and "branch_token_mask" in model_inputs:
-                        # Apply the same branch_token_loss_mode mask to DPO's
-                        # suffix_avg_logp so PG loss and DPO loss are consistent
-                        # about which tokens carry gradient.
-                        btm = self.config.policy_loss.get("branch_token_loss_mode", "all")
-                        # Guard: warn once if btm=only will silently zero DPO loss
-                        # (suffix positions and branch positions are disjoint).
-                        global _warned_btm_only_dpo
-                        if not _warned_btm_only_dpo and btm == "only":
-                            _warned_btm_only_dpo = True
-                            logger.warning(
-                                "DPO loss will be zero under branch_token_loss_mode=only "
-                                "(suffix and branch positions are disjoint). "
-                                "Consider using btm=suffix or btm=mask instead."
-                            )
-                        btm_mask = model_inputs["branch_token_mask"]
-                        if btm == "mask" and btm_mask is not None:
-                            dpo_eff_mask = response_mask * (1 - btm_mask.to(response_mask.dtype))
-                        elif btm == "only" and btm_mask is not None:
-                            dpo_eff_mask = response_mask * btm_mask.to(response_mask.dtype)
-                        else:
-                            dpo_eff_mask = response_mask
-                        # For branching-fallback rows, override to full response_mask
-                        # (same logic as _apply_branch_loss_mode for PG loss).
-                        is_branching_fallback = model_inputs.get("is_branching_fallback", None)
-                        if is_branching_fallback is not None and is_branching_fallback.numel() > 0 and btm != "all":
-                            ifb = is_branching_fallback.to(response_mask.device).to(response_mask.dtype)
-                            ifb_row = ifb.view(-1, *([1] * (response_mask.dim() - 1)))
-                            dpo_eff_mask = ifb_row * response_mask + (1.0 - ifb_row) * dpo_eff_mask
-
-                        avg_logp_cur, _ = suffix_avg_logp(
-                            log_prob, model_inputs["branch_token_mask"], dpo_eff_mask
-                        )
-                        # Stage-1 samples use full response_mask for avg logp
-                        # (consistent with trainer-side utils.py logic).
-                        is_s1 = model_inputs.get("is_two_stage_stage1", None)
-                        if is_s1 is not None and is_s1.any():
-                            is_s1_bool = is_s1.bool().view(-1)
-                            s1_logp = (log_prob * response_mask).sum(dim=1) / response_mask.sum(dim=1).clamp_min(1.0)
-                            avg_logp_cur = torch.where(is_s1_bool, s1_logp, avg_logp_cur)
-                        dpo_term = (dpo_coeff * avg_logp_cur).sum()
-                        n_pairs = dpo_pairs_in_mini if dpo_pairs_in_mini is not None else 1.0
-                        policy_loss = dpo_term / (n_pairs * loss_scale_factor)
-                        micro_batch_metrics["actor/dpo_term"] = dpo_term.detach().item()
 
                     if calculate_entropy and entropy is not None:
                         entropy_agg = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)

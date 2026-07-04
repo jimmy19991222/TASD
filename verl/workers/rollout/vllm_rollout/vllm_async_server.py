@@ -548,8 +548,8 @@ class vLLMHttpServer:
             if sampling_params.logprobs >= 1:
                 # vLLM's logprobs[i] is a dict[token_id, Logprob(logprob=..., rank=..., decoded_token=...)]
                 # of length K+1 (the realized token plus its top-K alternatives, possibly overlapping).
-                # Surface as plain {token_id: float} dicts so downstream code (e.g. branching_utils
-                # entropy + teacher-pick) doesn't import vLLM's Logprob class.
+                # Surface as plain {token_id: float} dicts so downstream code
+                # doesn't import vLLM's Logprob class.
                 top_logprobs = [
                     {tok_id: lp.logprob for tok_id, lp in lp_dict.items()}
                     for lp_dict in raw_logprobs

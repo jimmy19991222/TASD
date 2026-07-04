@@ -57,7 +57,6 @@ from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.trainer.ppo.utils import (
     Role,
     WorkerType,
-    compute_dpo_sample_coeffs,
     need_critic,
     need_reference_policy,
     need_reward_model,
@@ -898,10 +897,9 @@ class RayPPOTrainer:
         teacher_prompt_ids = teacher_prompt["input_ids"].to(device)
         teacher_prompt_mask = teacher_prompt["attention_mask"].to(device)
 
-        # Build per-sample marker text via the shared helper so the rollout-time
-        # BranchingAgentLoop and this trainer-side builder agree on the exact
-        # string. The helper handles the gt-missing fallback and the trailing
-        # "\n\n" suffix uniformly.
+        # Build per-sample marker text via the shared helper so the
+        # trainer-side builder agrees on the exact string. The helper handles
+        # the gt-missing fallback and the trailing "\n\n" suffix uniformly.
         marker_texts: list[str] = []
         gt_found = 0
         for i in range(batch_size):
@@ -1906,14 +1904,6 @@ class RayPPOTrainer:
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
-                        # Surface teacher-guided branching aggregates from
-                        # AgentLoopWorker._postprocess into step metrics so SwanLab
-                        # shows whether branching actually fired (vs fell back).
-                        _branching_metrics = gen_batch_output.meta_info.pop(
-                            "branching_metrics", None
-                        )
-                        if _branching_metrics:
-                            metrics.update(_branching_metrics)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
@@ -2099,22 +2089,6 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
-
-                    # Branching DPO: pair on the full driver-side batch and emit a
-                    # per-sample coefficient, so the actor's DPO loss becomes a
-                    # per-sample weighted-logp sum (no cross-rank pair co-location
-                    # needed). See compute_dpo_sample_coeffs for the derivation.
-                    dpo_coefficient = float(
-                        self.config.actor_rollout_ref.actor.policy_loss.get("dpo_coefficient", 0.0)
-                    )
-                    if dpo_coefficient > 0 and "is_two_stage_stage1" in batch.batch:
-                        dpo_coeff, dpo_pair_member, dpo_coeff_metrics = compute_dpo_sample_coeffs(
-                            batch, self.config.actor_rollout_ref.actor.policy_loss
-                        )
-                        if dpo_coeff is not None:
-                            batch.batch["dpo_coeff"] = dpo_coeff
-                            batch.batch["dpo_pair_member"] = dpo_pair_member
-                            metrics.update(dpo_coeff_metrics)
 
                     # update critic
                     if self.use_critic:

@@ -106,6 +106,13 @@ class SelfDistillationConfig(BaseConfig):
         "Reference answer: {ground_truth}]"
     )
 
+    # Token-level DPO
+    token_dpo_enabled: bool = False
+    token_dpo_beta: float = 1.0          # DPO temperature β
+    token_dpo_coefficient: float = 0.1    # DPO loss weight α
+    token_dpo_only: bool = False         # True = skip JSD loss, use only DPO loss
+    token_dpo_use_ref: bool = False      # True = use teacher logprob as reference in DPO loss
+
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:
             raise ValueError(f"self_distillation.alpha must be in [0,1], got {self.alpha}")
@@ -125,6 +132,26 @@ class SelfDistillationConfig(BaseConfig):
             )
         if self.is_clip is not None and self.is_clip <= 0:
             raise ValueError(f"self_distillation.is_clip must be positive, got {self.is_clip}")
+        if self.token_dpo_enabled:
+            if not self.full_logit_distillation:
+                raise ValueError(
+                    "self_distillation.token_dpo_enabled requires full_logit_distillation=True"
+                )
+            if self.distillation_topk is None or self.distillation_topk < 2:
+                raise ValueError(
+                    "self_distillation.token_dpo_enabled requires distillation_topk >= 2 "
+                    f"(got distillation_topk={self.distillation_topk})"
+                )
+        if self.token_dpo_beta <= 0:
+            raise ValueError(f"self_distillation.token_dpo_beta must be positive, got {self.token_dpo_beta}")
+        if self.token_dpo_coefficient < 0:
+            raise ValueError(
+                f"self_distillation.token_dpo_coefficient must be non-negative, got {self.token_dpo_coefficient}"
+            )
+        if self.token_dpo_only and not self.token_dpo_enabled:
+            raise ValueError(
+                "self_distillation.token_dpo_only requires token_dpo_enabled=True"
+            )
         valid_teacher_context_modes = ["ref", "marker", "gt_marker", "ref_gt"]
         if self.teacher_context_mode not in valid_teacher_context_modes:
             raise ValueError(
@@ -175,23 +202,6 @@ class PolicyLossConfig(BaseConfig):
         clip_cov_ub (float): Upper bound for clip-cov loss.
         kl_cov_ratio (float): Ratio of tokens to be applied KL penalty for kl-cov loss.
         ppo_kl_coef (float): KL divergence penalty coefficient.
-        branch_token_loss_mode (str): How the teacher-guided branching rollout's
-            ``branch_token_mask`` weights the policy loss. Options:
-
-            - ``all`` (default): mask is ignored; every response token contributes
-              to the loss (response_mask only).
-            - ``mask``: zero-out the branch tokens before PG aggregation
-              (response_mask AND NOT branch_token_mask). Useful to remove
-              off-policy bias of teacher-injected tokens.
-            - ``only``: only branch tokens contribute (response_mask AND
-              branch_token_mask). The "decision-token-only" hypothesis ablation.
-            - ``suffix``: only tokens AFTER the last branch token in each leaf
-              contribute. This isolates the unique student continuation segment
-              (post-final-fork), eliminating gradient cancellation on shared
-              prefixes where GRPO advantage sums to zero across siblings.
-
-            No-op when ``branch_token_mask`` is absent from the data batch
-            (i.e., branching rollout is disabled).
     """
 
     loss_mode: str = "vanilla"
@@ -200,35 +210,6 @@ class PolicyLossConfig(BaseConfig):
     clip_cov_ub: float = 5.0
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
-    branch_token_loss_mode: str = "all"
-    # On-policy DPO loss for Stage 2 pos/neg branch pairs. When > 0, replaces
-    # pg_loss entirely with DPO loss on suffix tokens after branch points.
-    # Stage 1 samples contribute zero gradient (exploration only).
-    dpo_coefficient: float = 0.0
-    dpo_use_ref: bool = False
-    # Teacher-Guided β: adaptive β based on teacher margin at branch points
-    # β_i = β_base · clamp(α · margin_i, β_min, β_max)
-    # where margin_i = teacher_logp(chosen) - teacher_logp(rejected)
-    dpo_teacher_guided_beta: bool = False
-    dpo_teacher_beta_alpha: float = 1.0
-    dpo_teacher_beta_min: float = 0.1
-    dpo_teacher_beta_max: float = 3.0
-    # Stage 1 middle-version DPO pairing: use Stage 1 student chain as the
-    # "middle" version in a 3-way ranking (argmax > stage1 > argmin), turning
-    # 1 DPO pair into 2 pairs per branch point.
-    dpo_stage1_pair: bool = False
-    dpo_stage1_pair_weight: float = 1.0  # weight for Stage 1 pair loss
-    # Drop (chosen, rejected) pairs whose chosen leaf scored a lower sequence
-    # reward than its rejected leaf (teacher preference contradicts the outcome).
-    dpo_reward_filter: bool = True
-
-    def __post_init__(self):
-        valid = {"all", "mask", "only", "suffix"}
-        if self.branch_token_loss_mode not in valid:
-            raise ValueError(
-                f"policy_loss.branch_token_loss_mode must be one of {valid}, "
-                f"got {self.branch_token_loss_mode!r}"
-            )
 
 
 @dataclass

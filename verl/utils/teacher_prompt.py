@@ -10,8 +10,7 @@
 
 Both the trainer-side teacher prompt builder
 (``verl.trainer.ppo.ray_trainer._build_self_distillation_batch_marker`` /
-``_build_self_distillation_batch_ref``) and the rollout-time
-``verl.experimental.agent_loop.branching_agent_loop.BranchingAgentLoop`` need
+``_build_self_distillation_batch_ref``) and the rollout-time agent loops need
 to construct privileged-context teacher prompts in three modes:
 
     - marker    : prepend a static verdict marker between the assistant role-start
@@ -25,7 +24,7 @@ to construct privileged-context teacher prompts in three modes:
 The trainer operates on padded GPU tensors and a full DataProto; the agent
 loop operates on per-row token id lists. The two cannot share their tensor
 plumbing, but they MUST share the same string-formatting rules — otherwise the
-teacher distribution at branch points (rollout) and the teacher distribution
+teacher distribution at rollout time and the teacher distribution
 inside the SDPO loss (training) would drift apart, silently invalidating the
 on-policy assumption.
 
@@ -171,8 +170,8 @@ def build_ref_context_messages(
     rollout response text instead of ground_truth. The resulting teacher
     prompt is format-identical to what the training-side
     ``_build_self_distillation_batch_ref`` produces when solution_source is
-    ``"peer_rollout"``, ensuring the teacher distribution seen at branching
-    time (rollout) aligns with the teacher distribution used for the SDPO
+    ``"peer_rollout"``, ensuring the teacher distribution seen at rollout
+    time aligns with the teacher distribution used for the SDPO
     loss (training).
 
     Args:
